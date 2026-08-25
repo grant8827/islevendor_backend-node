@@ -24,9 +24,11 @@ export function verifyWiPayHash(payload) {
 /**
  * Atomically:
  *  1. Verifies the WiPay signature.
- *  2. Records four HELD_IN_ESCROW ledger legs (warehouse/reseller/driver/platform).
+ *  2. Records the HELD_IN_ESCROW ledger legs — four (warehouse/affiliate/
+ *     driver/platform) for an AFFILIATE order, three (shop/driver/platform)
+ *     for a STORE order, since a shop sells its own stock directly.
  *  3. Flips the order from AWAITING_PAYMENT -> PACKING.
- *  4. Notifies the warehouse over WebSocket.
+ *  4. Notifies the seller (warehouse or shop) over WebSocket.
  *
  * Idempotent: relies on `orders.wipay_transaction_id` UNIQUE and
  * `ledger_transactions (order_id, recipient_account_id)` UNIQUE so a retried
@@ -54,15 +56,7 @@ export async function processWiPayWebhook(payload) {
                 where: { id: order.id },
                 data: { status: 'PACKING', wipayTransactionId: payload.transaction_id },
             });
-            const [warehouseAccount, resellerAccount, platformAccount] = await Promise.all([
-                tx.ledgerAccount.findFirstOrThrow({
-                    where: { accountType: 'WAREHOUSE', user: { warehouses: { some: { id: order.warehouseId } } } },
-                }),
-                tx.ledgerAccount.findFirstOrThrow({
-                    where: { accountType: 'RESELLER', user: { resellerStore: { id: order.resellerStoreId } } },
-                }),
-                tx.ledgerAccount.findFirstOrThrow({ where: { accountType: 'PLATFORM' } }),
-            ]);
+            const platformAccount = await tx.ledgerAccount.findFirstOrThrow({ where: { accountType: 'PLATFORM' } });
             // No driver is assigned yet at payment time, so the driver's fee has
             // nowhere of its own to go — it's held on the platform account *combined
             // with* platform commission in a single leg (not two), because the
@@ -74,28 +68,62 @@ export async function processWiPayWebhook(payload) {
             // combined balance into the driver's own ledger account once a driver
             // accepts the job.
             const platformHeldAmount = new Decimal(order.driverFeeJmd.toString()).plus(order.platformCommissionJmd.toString());
-            await tx.ledgerTransaction.createMany({
-                data: [
-                    { orderId: order.id, recipientAccountId: warehouseAccount.id, amountJmd: order.wholesaleTotalJmd, escrowState: 'HELD_IN_ESCROW' },
-                    { orderId: order.id, recipientAccountId: resellerAccount.id, amountJmd: order.resellerMarginJmd, escrowState: 'HELD_IN_ESCROW' },
-                    { orderId: order.id, recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount.toFixed(2), escrowState: 'HELD_IN_ESCROW' },
-                ],
-                skipDuplicates: true, // guards against a retried webhook delivery re-inserting the same three rows
-            });
-            // Move pending -> available only happens on delivery confirmation
-            // (Domain D) — here we just move funds into pending_balance_jmd.
-            await tx.$executeRaw `
-        UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${order.wholesaleTotalJmd} WHERE id = ${warehouseAccount.id}::uuid;
-      `;
-            await tx.$executeRaw `
-        UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${order.resellerMarginJmd} WHERE id = ${resellerAccount.id}::uuid;
-      `;
-            await tx.$executeRaw `
-        UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${platformHeldAmount.toFixed(2)}::numeric WHERE id = ${platformAccount.id}::uuid;
-      `;
+            if (order.shopId) {
+                // STORE order: 3-way split — the shop keeps resellerMarginJmd in
+                // full (it's the full item revenue for a shop order, see
+                // orders.routes.ts), no separate wholesale/warehouse leg exists.
+                const shopAccount = await tx.ledgerAccount.findFirstOrThrow({
+                    where: { accountType: 'STORE', user: { shops: { some: { id: order.shopId } } } },
+                });
+                await tx.ledgerTransaction.createMany({
+                    data: [
+                        { orderId: order.id, recipientAccountId: shopAccount.id, amountJmd: order.resellerMarginJmd, escrowState: 'HELD_IN_ESCROW' },
+                        { orderId: order.id, recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount.toFixed(2), escrowState: 'HELD_IN_ESCROW' },
+                    ],
+                    skipDuplicates: true,
+                });
+                await tx.$executeRaw `
+          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${order.resellerMarginJmd} WHERE id = ${shopAccount.id}::uuid;
+        `;
+                await tx.$executeRaw `
+          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${platformHeldAmount.toFixed(2)}::numeric WHERE id = ${platformAccount.id}::uuid;
+        `;
+            }
+            else {
+                // AFFILIATE order: 4-way split — warehouse (wholesale) + affiliate
+                // (margin) + driver/platform combined.
+                const [warehouseAccount, resellerAccount] = await Promise.all([
+                    tx.ledgerAccount.findFirstOrThrow({
+                        where: { accountType: 'WAREHOUSE', user: { warehouses: { some: { id: order.warehouseId } } } },
+                    }),
+                    tx.ledgerAccount.findFirstOrThrow({
+                        where: { accountType: 'RESELLER', user: { resellerStore: { id: order.resellerStoreId } } },
+                    }),
+                ]);
+                await tx.ledgerTransaction.createMany({
+                    data: [
+                        { orderId: order.id, recipientAccountId: warehouseAccount.id, amountJmd: order.wholesaleTotalJmd, escrowState: 'HELD_IN_ESCROW' },
+                        { orderId: order.id, recipientAccountId: resellerAccount.id, amountJmd: order.resellerMarginJmd, escrowState: 'HELD_IN_ESCROW' },
+                        { orderId: order.id, recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount.toFixed(2), escrowState: 'HELD_IN_ESCROW' },
+                    ],
+                    skipDuplicates: true, // guards against a retried webhook delivery re-inserting the same rows
+                });
+                // Move pending -> available only happens on delivery confirmation
+                // (Domain D) — here we just move funds into pending_balance_jmd.
+                await tx.$executeRaw `
+          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${order.wholesaleTotalJmd} WHERE id = ${warehouseAccount.id}::uuid;
+        `;
+                await tx.$executeRaw `
+          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${order.resellerMarginJmd} WHERE id = ${resellerAccount.id}::uuid;
+        `;
+                await tx.$executeRaw `
+          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${platformHeldAmount.toFixed(2)}::numeric WHERE id = ${platformAccount.id}::uuid;
+        `;
+            }
             return updatedOrder;
         });
-        getSocketServer().to(`warehouse_${order.warehouseId}`).emit('NEW_ORDER_TO_PACK', { orderId: order.id });
+        const room = order.shopId ? `shop_${order.shopId}` : `warehouse_${order.warehouseId}`;
+        getSocketServer().to(room).emit('NEW_ORDER_TO_PACK', { orderId: order.id });
         return { order };
     }
     catch (err) {

@@ -1,4 +1,4 @@
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcryptjs';
 import { UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';

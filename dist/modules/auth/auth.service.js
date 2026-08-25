@@ -1,4 +1,4 @@
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcryptjs';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { signAuthToken } from '../../middleware/auth.js';
@@ -21,7 +21,7 @@ export async function registerUser(input) {
         });
         // Every role that can receive money gets a ledger account up front so
         // the ledger engine never has to conditionally create one mid-payout.
-        if (['WAREHOUSE', 'RESELLER', 'DRIVER'].includes(input.role)) {
+        if (['WAREHOUSE', 'RESELLER', 'STORE', 'DRIVER'].includes(input.role)) {
             await tx.ledgerAccount.create({
                 data: {
                     userId: created.id,

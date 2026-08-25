@@ -24,6 +24,9 @@ export function registerDispatchGateway(io) {
         if (user.role === 'WAREHOUSE' || user.role === 'ADMIN') {
             socket.on('warehouse:join', (warehouseId) => socket.join(`warehouse_${warehouseId}`));
         }
+        if (user.role === 'STORE' || user.role === 'ADMIN') {
+            socket.on('shop:join', (shopId) => socket.join(`shop_${shopId}`));
+        }
         // Spec: device transmits lat/lng every ~10s while online.
         socket.on('driver:heartbeat', async ({ lat, lng }) => {
             if (user.role !== 'DRIVER')

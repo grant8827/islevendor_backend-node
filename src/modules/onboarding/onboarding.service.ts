@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcryptjs';
 import type { Prisma, DriverAvailability, DriverVehicleType, FulfillmentStrategy, PayoutMethod, ResellerType, SalesChannel, VendorCategory } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
