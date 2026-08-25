@@ -1,0 +1,35 @@
+import http from 'node:http';
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import { Server } from 'socket.io';
+import { env } from './env.js';
+import { errorHandler } from './middleware/errorHandler.js';
+import { setSocketServer } from './lib/socket.js';
+import { authRouter } from './modules/auth/auth.routes.js';
+import { warehouseRouter } from './modules/warehouse/warehouse.routes.js';
+import { commerceRouter } from './modules/commerce/commerce.routes.js';
+import { ordersRouter } from './modules/orders/orders.routes.js';
+import { ledgerRouter } from './modules/ledger/ledger.routes.js';
+import { dispatchRouter } from './modules/dispatch/dispatch.routes.js';
+import { registerDispatchGateway } from './modules/dispatch/dispatch.gateway.js';
+const app = express();
+app.use(helmet());
+app.use(cors({ origin: env.CORS_ORIGIN, credentials: true }));
+app.use(express.json());
+app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'backend-node' }));
+app.use('/api/auth', authRouter);
+app.use('/api/warehouse', warehouseRouter);
+app.use('/api/commerce', commerceRouter);
+app.use('/api/orders', ordersRouter);
+app.use('/api/ledger', ledgerRouter);
+app.use('/api/dispatch', dispatchRouter);
+app.use(errorHandler);
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, { cors: { origin: env.CORS_ORIGIN, credentials: true } });
+setSocketServer(io);
+registerDispatchGateway(io);
+httpServer.listen(env.PORT, () => {
+    console.log(`IsleVendor API listening on http://localhost:${env.PORT} (${env.NODE_ENV})`);
+});
+//# sourceMappingURL=index.js.map
