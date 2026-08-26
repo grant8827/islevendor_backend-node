@@ -415,6 +415,7 @@ model ShopProduct {
   category      String
   priceJmd      Decimal  @map("price_jmd") @db.Decimal(12, 2)
   discountPercent Int    @default(0) @map("discount_percent")
+  isFeatured     Boolean  @default(false) @map("is_featured")
   stockQuantity Int      @default(0) @map("stock_quantity")
   // See MasterProduct.imageUrl/images for why both exist.
   imageUrl      String?  @map("image_url")

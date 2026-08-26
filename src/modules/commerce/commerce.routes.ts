@@ -47,6 +47,7 @@ function normalizeShopProduct(p: {
   priceJmd: unknown;
   isActive: boolean;
   discountPercent: number;
+  isFeatured: boolean;
   shop: { shopName: string; slug: string; parish: string };
   [key: string]: unknown;
 }) {
@@ -59,6 +60,7 @@ function normalizeShopProduct(p: {
     retailPriceJmd: salePrice.toFixed(2),
     originalPriceJmd: originalPrice.toFixed(2),
     discountPercent: p.discountPercent,
+    isFeatured: p.isFeatured,
     isActive: p.isActive,
     kind: 'STORE' as const,
     shipFromParish: p.shop.parish,
@@ -74,6 +76,7 @@ function normalizeAffiliateListing<T extends { storeId: string; masterProduct: {
     shipFromParish: l.masterProduct.warehouse.parish,
     originalPriceJmd: (l as T & { retailPriceJmd: unknown }).retailPriceJmd,
     discountPercent: 0,
+    isFeatured: false,
   };
 }
 
