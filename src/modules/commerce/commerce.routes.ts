@@ -46,7 +46,7 @@ function normalizeShopProduct(p: {
   shopId: string;
   priceJmd: unknown;
   isActive: boolean;
-  shop: { shopName: string; slug: string };
+  shop: { shopName: string; slug: string; parish: string };
   [key: string]: unknown;
 }) {
   return {
@@ -56,13 +56,14 @@ function normalizeShopProduct(p: {
     retailPriceJmd: p.priceJmd,
     isActive: p.isActive,
     kind: 'STORE' as const,
+    shipFromParish: p.shop.parish,
     masterProduct: { ...p, wholesalePriceJmd: p.priceJmd },
-    store: { storeName: p.shop.shopName, slug: p.shop.slug },
+    store: { storeName: p.shop.shopName, slug: p.shop.slug, parish: p.shop.parish },
   };
 }
 
-function normalizeAffiliateListing<T extends { storeId: string }>(l: T) {
-  return { ...l, kind: 'AFFILIATE' as const };
+function normalizeAffiliateListing<T extends { storeId: string; masterProduct: { warehouse: { parish: string } } }>(l: T) {
+  return { ...l, kind: 'AFFILIATE' as const, shipFromParish: l.masterProduct.warehouse.parish };
 }
 
 // Marketplace-wide browse: every active affiliate listing PLUS every active
@@ -87,7 +88,7 @@ commerceRouter.get('/listings', async (req, res, next) => {
           },
         },
         include: {
-          masterProduct: true,
+          masterProduct: { include: { warehouse: { select: { parish: true } } } },
           store: { select: { storeName: true, slug: true } },
         },
         orderBy: { masterProduct: { createdAt: 'desc' } },
@@ -98,7 +99,7 @@ commerceRouter.get('/listings', async (req, res, next) => {
           ...(category && category !== 'All' ? { category } : {}),
           ...(q ? { title: { contains: q, mode: 'insensitive' } } : {}),
         },
-        include: { shop: { select: { shopName: true, slug: true } } },
+        include: { shop: { select: { shopName: true, slug: true, parish: true } } },
         orderBy: { createdAt: 'desc' },
       }),
     ]);
@@ -119,7 +120,10 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
 
     const affiliateListing = await prisma.storeListing.findUnique({
       where: { id },
-      include: { masterProduct: true, store: { select: { storeName: true, slug: true } } },
+      include: {
+        masterProduct: { include: { warehouse: { select: { parish: true } } } },
+        store: { select: { storeName: true, slug: true } },
+      },
     });
 
     let listing: ReturnType<typeof normalizeAffiliateListing> | ReturnType<typeof normalizeShopProduct>;
@@ -134,7 +138,7 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
     } else {
       const shopProduct = await prisma.shopProduct.findUnique({
         where: { id },
-        include: { shop: { select: { shopName: true, slug: true } } },
+        include: { shop: { select: { shopName: true, slug: true, parish: true } } },
       });
       if (!shopProduct || !shopProduct.isActive) throw new HttpError(404, 'This item is no longer available');
       listing = normalizeShopProduct(shopProduct);
@@ -145,13 +149,16 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
     const [recommendedAffiliate, recommendedShop, sellerAffiliate, sellerShop, ratingRow] = await Promise.all([
       prisma.storeListing.findMany({
         where: { isActive: true, id: { not: id }, masterProduct: { isActive: true, category } },
-        include: { masterProduct: true, store: { select: { storeName: true, slug: true } } },
+        include: {
+          masterProduct: { include: { warehouse: { select: { parish: true } } } },
+          store: { select: { storeName: true, slug: true } },
+        },
         orderBy: { masterProduct: { createdAt: 'desc' } },
         take: RAIL_LIMIT,
       }),
       prisma.shopProduct.findMany({
         where: { isActive: true, id: { not: id }, category },
-        include: { shop: { select: { shopName: true, slug: true } } },
+        include: { shop: { select: { shopName: true, slug: true, parish: true } } },
         orderBy: { createdAt: 'desc' },
         take: RAIL_LIMIT,
       }),
@@ -162,7 +169,10 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
       listing.kind === 'AFFILIATE'
         ? prisma.storeListing.findMany({
             where: { isActive: true, id: { not: id }, storeId: listing.storeId, masterProduct: { isActive: true } },
-            include: { masterProduct: true, store: { select: { storeName: true, slug: true } } },
+            include: {
+              masterProduct: { include: { warehouse: { select: { parish: true } } } },
+              store: { select: { storeName: true, slug: true } },
+            },
             orderBy: { masterProduct: { createdAt: 'desc' } },
             take: RAIL_LIMIT,
           })
@@ -170,7 +180,7 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
       listing.kind === 'STORE'
         ? prisma.shopProduct.findMany({
             where: { isActive: true, id: { not: id }, shopId: listing.storeId },
-            include: { shop: { select: { shopName: true, slug: true } } },
+            include: { shop: { select: { shopName: true, slug: true, parish: true } } },
             orderBy: { createdAt: 'desc' },
             take: RAIL_LIMIT,
           })
