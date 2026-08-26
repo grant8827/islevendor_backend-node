@@ -205,6 +205,27 @@ warehouseRouter.get('/:warehouseId/authorizations', requireAuth, requireRole(Use
   }
 });
 
+// Driver applications to become a courier for this warehouse (see
+// delivery.routes.ts for the driver-side "apply" endpoint).
+warehouseRouter.get('/:warehouseId/delivery-applications', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const applications = await prisma.deliveryApplication.findMany({
+      where: {
+        warehouseId: String(req.params.warehouseId),
+        ...(status ? { status: status as 'PENDING' | 'APPROVED' | 'SUSPENDED' | 'REJECTED' } : {}),
+      },
+      include: { driver: { include: { user: { select: { fullName: true, phoneNumber: true } } } } },
+      orderBy: { requestedAt: 'desc' },
+    });
+    res.json(applications);
+  } catch (err) {
+    next(err);
+  }
+});
+
 async function assertResellerRelationship(warehouseId: string, storeId: string) {
   const authorization = await prisma.resellerAuthorization.findUnique({
     where: { storeId_warehouseId: { storeId, warehouseId } },

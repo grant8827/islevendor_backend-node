@@ -144,7 +144,8 @@ model DriverProfile {
   // (or seeded directly) never got one.
   referenceId       String?             @unique @map("reference_id")
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                 User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveryApplications DeliveryApplication[]
 
   @@map("driver_profiles")
 }
@@ -193,10 +194,11 @@ model Warehouse {
   applicantStatus   ApplicantStatus @default(APPROVED) @map("applicant_status")
   referenceId       String?         @unique @map("reference_id")
 
-  user           User                    @relation(fields: [userId], references: [id])
-  products       MasterProduct[]
-  orders         Order[]
-  authorizations ResellerAuthorization[]
+  user                 User                    @relation(fields: [userId], references: [id])
+  products             MasterProduct[]
+  orders               Order[]
+  authorizations       ResellerAuthorization[]
+  deliveryApplications DeliveryApplication[]
 
   @@map("warehouses")
 }
@@ -396,9 +398,10 @@ model Shop {
   applicantStatus        ApplicantStatus      @default(APPROVED) @map("applicant_status")
   referenceId            String?              @unique @map("reference_id")
 
-  user     User          @relation(fields: [userId], references: [id])
-  products ShopProduct[]
-  orders   Order[]
+  user                 User                  @relation(fields: [userId], references: [id])
+  products             ShopProduct[]
+  orders               Order[]
+  deliveryApplications DeliveryApplication[]
 
   @@map("shops")
 }
@@ -445,6 +448,43 @@ model StoreListing {
   // is a no-op / reactivation, not a duplicate row (see commerce.routes.ts).
   @@unique([storeId, masterProductId])
   @@map("store_listings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 4d. DELIVERY APPLICATIONS
+// A driver requests to become a regular courier for a specific warehouse or
+// shop. Approval doesn't gate dispatch itself (see dispatch.routes.ts, which
+// offers each order to any online nearby driver) — this is the seller's own
+// roster of couriers they've vetted and want working their pickups.
+// ─────────────────────────────────────────────────────────────────────────
+
+model DeliveryApplication {
+  id       String @id @default(uuid()) @db.Uuid
+  driverId String @map("driver_id") @db.Uuid
+
+  // Exactly one of these is set, same "exactly one seller side" pattern as
+  // Order.resellerStoreId/warehouseId vs. shopId — enforced in the service
+  // layer, since Postgres can't express it declaratively here.
+  warehouseId String? @map("warehouse_id") @db.Uuid
+  shopId      String? @map("shop_id") @db.Uuid
+
+  status      AuthorizationStatus @default(PENDING)
+  requestedAt DateTime            @default(now()) @map("requested_at") @db.Timestamptz
+  decidedAt   DateTime?           @map("decided_at") @db.Timestamptz
+
+  driver    DriverProfile @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  warehouse Warehouse?    @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  shop      Shop?         @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  // A driver can only have one active application per warehouse, and
+  // separately per shop — re-applying after a rejection updates that same
+  // row rather than piling up duplicates (mirrors ResellerAuthorization's
+  // @@unique([storeId, warehouseId])). Postgres treats NULL as distinct in a
+  // unique index, so each constraint only ever governs the rows where that
+  // particular side is actually set.
+  @@unique([driverId, warehouseId])
+  @@unique([driverId, shopId])
+  @@map("delivery_applications")
 }
 
 // ─────────────────────────────────────────────────────────────────────────

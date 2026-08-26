@@ -64,7 +64,11 @@ export const kycUpload = multer({
 uploadsRouter.post('/image', requireAuth, upload.single('image'), (req, res, next) => {
   try {
     if (!req.file) throw new HttpError(400, 'No image file provided');
-    res.status(201).json({ url: `/uploads/${req.file.filename}` });
+    // Absolute, not relative: frontend and backend-node are separate hosts in
+    // production (no reverse proxy between them, unlike vite.config.js's dev
+    // proxy), so a bare "/uploads/…" would resolve against the frontend's own
+    // domain wherever it's later rendered — build it from this request instead.
+    res.status(201).json({ url: `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}` });
   } catch (err) {
     next(err);
   }

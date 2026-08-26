@@ -24,6 +24,7 @@
     "@prisma/client": "^6.2.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
+    "db-migrate": "^0.11.14",
     "decimal.js": "^10.4.3",
     "dotenv": "^16.4.7",
     "express": "^5.2.1",

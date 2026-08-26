@@ -14,12 +14,18 @@ import { ledgerRouter } from './modules/ledger/ledger.routes.js';
 import { dispatchRouter } from './modules/dispatch/dispatch.routes.js';
 import { registerDispatchGateway } from './modules/dispatch/dispatch.gateway.js';
 import { authorizationRouter } from './modules/authorization/authorization.routes.js';
+import { deliveryRouter } from './modules/delivery/delivery.routes.js';
 import { uploadsRouter, UPLOADS_DIR } from './modules/uploads/uploads.routes.js';
 import { shopRouter } from './modules/shop/shop.routes.js';
 import { ratingsRouter } from './modules/ratings/ratings.routes.js';
 import { onboardingRouter } from './modules/onboarding/onboarding.routes.js';
 
 const app = express();
+
+// Railway terminates TLS at its edge and forwards over plain HTTP — without
+// this, req.protocol (used by uploads.routes.ts to build absolute image URLs)
+// would always read "http", producing mixed-content URLs on the https site.
+app.set('trust proxy', true);
 
 app.use(helmet());
 app.use(cors({ origin: env.CORS_ORIGIN, credentials: true }));
@@ -44,6 +50,7 @@ app.use('/api/orders', ordersRouter);
 app.use('/api/ledger', ledgerRouter);
 app.use('/api/dispatch', dispatchRouter);
 app.use('/api/authorizations', authorizationRouter);
+app.use('/api/delivery-applications', deliveryRouter);
 app.use('/api/uploads', uploadsRouter);
 app.use('/api/shop', shopRouter);
 app.use('/api/ratings', ratingsRouter);

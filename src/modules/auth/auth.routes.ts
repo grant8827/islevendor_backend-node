@@ -44,7 +44,18 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
   try {
     const user = await prisma.user.findUniqueOrThrow({
       where: { id: req.user!.sub },
-      select: { id: true, email: true, fullName: true, phoneNumber: true, role: true, createdAt: true },
+      select: {
+        id: true,
+        email: true,
+        fullName: true,
+        phoneNumber: true,
+        role: true,
+        createdAt: true,
+        // Only meaningful for DRIVER — lets the driver dashboard tell "no
+        // profile yet, go complete onboarding" apart from "profile exists,
+        // just no applications yet" without a second round-trip.
+        driverProfile: { select: { id: true, applicantStatus: true } },
+      },
     });
     res.json(user);
   } catch (err) {

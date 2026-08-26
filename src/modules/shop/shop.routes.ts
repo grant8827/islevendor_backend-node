@@ -56,6 +56,19 @@ shopRouter.post('/', requireAuth, requireRole(UserRole.STORE, UserRole.ADMIN), a
   }
 });
 
+// Browse all registered shops — used by drivers deciding who to apply to
+// deliver for (mirrors warehouseRouter's GET '/').
+shopRouter.get('/', async (req, res, next) => {
+  try {
+    const shops = await prisma.shop.findMany({
+      select: { id: true, shopName: true, addressLine: true, parish: true, _count: { select: { products: true } } },
+    });
+    res.json(shops);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // The shop dashboard's landing check: every shop this user owns (an owner
 // can run more than one), so the dashboard can offer a selector — or the
 // "create your first shop" form if this is empty.
@@ -172,6 +185,27 @@ shopRouter.delete('/products/:id', requireAuth, requireRole(UserRole.STORE, User
     const product = await assertOwnsProduct(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
     await prisma.shopProduct.delete({ where: { id: product.id } });
     res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Driver applications to become a courier for this shop (see
+// delivery.routes.ts for the driver-side "apply" endpoint).
+shopRouter.get('/:shopId/delivery-applications', requireAuth, requireRole(UserRole.STORE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    await assertOwnsShop(String(req.params.shopId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const applications = await prisma.deliveryApplication.findMany({
+      where: {
+        shopId: String(req.params.shopId),
+        ...(status ? { status: status as 'PENDING' | 'APPROVED' | 'SUSPENDED' | 'REJECTED' } : {}),
+      },
+      include: { driver: { include: { user: { select: { fullName: true, phoneNumber: true } } } } },
+      orderBy: { requestedAt: 'desc' },
+    });
+    res.json(applications);
   } catch (err) {
     next(err);
   }
