@@ -1,9 +1,11 @@
 import { Router } from 'express';
+import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { loginUser, registerUser } from './auth.service.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { prisma } from '../../lib/prisma.js';
+import { HttpError } from '../../middleware/errorHandler.js';
 
 export const authRouter = Router();
 
@@ -58,6 +60,29 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
       },
     });
     res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Current password is required'),
+  newPassword: z.string().min(8, 'New password must be at least 8 characters'),
+});
+
+authRouter.patch('/password', requireAuth, async (req, res, next) => {
+  try {
+    const input = changePasswordSchema.parse(req.body);
+    const user = await prisma.user.findUniqueOrThrow({ where: { id: req.user!.sub } });
+    const valid = await bcrypt.compare(input.currentPassword, user.passwordHash);
+    if (!valid) throw new HttpError(400, 'Current password is incorrect');
+    if (input.currentPassword === input.newPassword) {
+      throw new HttpError(400, 'New password must be different from the current password');
+    }
+
+    const passwordHash = await bcrypt.hash(input.newPassword, 12);
+    await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
+    res.json({ message: 'Password updated successfully' });
   } catch (err) {
     next(err);
   }
