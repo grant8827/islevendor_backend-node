@@ -97,7 +97,9 @@ async function checkoutStore(tx: Prisma.TransactionClient, customerId: string, i
   // No wholesale/margin split for a shop's own stock — it keeps the full
   // item price (via resellerMarginJmd, reused here as "seller's take" — see
   // the Order model comment). wholesaleTotalJmd is 0 for a STORE order.
-  const itemTotal = new Decimal(product.priceJmd.toString()).times(input.quantity);
+  const discountMultiplier = new Decimal(1).minus(new Decimal(product.discountPercent).dividedBy(100));
+  const discountedUnitPrice = new Decimal(product.priceJmd.toString()).times(discountMultiplier).toDecimalPlaces(2);
+  const itemTotal = discountedUnitPrice.times(input.quantity);
   const driverFee = FLAT_DRIVER_FEE_JMD;
   const platformCommission = itemTotal.times(PLATFORM_COMMISSION_RATE).toDecimalPlaces(2);
   const totalPaid = itemTotal.plus(driverFee).plus(platformCommission);

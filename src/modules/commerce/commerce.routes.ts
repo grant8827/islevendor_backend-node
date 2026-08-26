@@ -46,14 +46,19 @@ function normalizeShopProduct(p: {
   shopId: string;
   priceJmd: unknown;
   isActive: boolean;
+  discountPercent: number;
   shop: { shopName: string; slug: string; parish: string };
   [key: string]: unknown;
 }) {
+  const originalPrice = Number(p.priceJmd);
+  const salePrice = originalPrice * (1 - p.discountPercent / 100);
   return {
     id: p.id,
     storeId: p.shopId,
     masterProductId: p.id,
-    retailPriceJmd: p.priceJmd,
+    retailPriceJmd: salePrice.toFixed(2),
+    originalPriceJmd: originalPrice.toFixed(2),
+    discountPercent: p.discountPercent,
     isActive: p.isActive,
     kind: 'STORE' as const,
     shipFromParish: p.shop.parish,
@@ -63,7 +68,13 @@ function normalizeShopProduct(p: {
 }
 
 function normalizeAffiliateListing<T extends { storeId: string; masterProduct: { warehouse: { parish: string } } }>(l: T) {
-  return { ...l, kind: 'AFFILIATE' as const, shipFromParish: l.masterProduct.warehouse.parish };
+  return {
+    ...l,
+    kind: 'AFFILIATE' as const,
+    shipFromParish: l.masterProduct.warehouse.parish,
+    originalPriceJmd: (l as T & { retailPriceJmd: unknown }).retailPriceJmd,
+    discountPercent: 0,
+  };
 }
 
 // Marketplace-wide browse: every active affiliate listing PLUS every active

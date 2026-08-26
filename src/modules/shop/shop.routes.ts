@@ -97,6 +97,7 @@ const createProductSchema = z.object({
   description: z.string().optional(),
   category: z.string().min(1),
   priceJmd: z.number().positive(),
+  discountPercent: z.number().int().min(0).max(90).default(0),
   stockQuantity: z.number().int().min(0).default(0),
   // images[0] is the main photo; the rest are gallery-only. SKU is no
   // longer taken from the seller — it's generated server-side below.
@@ -117,6 +118,7 @@ shopRouter.post('/products', requireAuth, requireRole(UserRole.STORE, UserRole.A
           description: input.description,
           category: input.category,
           priceJmd: input.priceJmd,
+          discountPercent: input.discountPercent,
           stockQuantity: input.stockQuantity,
           imageUrl: input.images[0],
           images: input.images,
@@ -154,6 +156,7 @@ const updateProductSchema = z.object({
   description: z.string().nullable().optional(),
   category: z.string().min(1).optional(),
   priceJmd: z.number().positive().optional(),
+  discountPercent: z.number().int().min(0).max(90).optional(),
   stockQuantity: z.number().int().min(0).optional(),
   images: z.array(imageUrlSchema).min(1).optional(),
   isActive: z.boolean().optional(),
