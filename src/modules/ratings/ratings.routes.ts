@@ -30,6 +30,7 @@ ratingsRouter.get('/mine', requireAuth, async (req, res, next) => {
       eligible: !!order,
       orderId: order?.id ?? null,
       myRating: order?.rating?.rating ?? null,
+      myComment: order?.rating?.comment ?? null,
     });
   } catch (err) {
     next(err);
@@ -39,6 +40,8 @@ ratingsRouter.get('/mine', requireAuth, async (req, res, next) => {
 const rateSchema = z.object({
   orderId: z.string().uuid(),
   rating: z.number().int().min(1).max(5),
+  // Optional written half of the feedback — a buyer can leave just stars.
+  comment: z.string().trim().max(1000).optional(),
 });
 
 // One rating per delivered order — buying the same item twice (two orders)
@@ -55,6 +58,11 @@ ratingsRouter.post('/', requireAuth, async (req, res, next) => {
       throw new HttpError(409, 'This order has no rateable item');
     }
 
+    // Empty string means "clear the comment" on a re-submit, not "leave it
+    // unchanged" — undefined (the field omitted entirely) is what leaves it
+    // untouched on update, but create always wants null over undefined.
+    const comment = input.comment || null;
+
     const saved = await prisma.productRating.upsert({
       where: { orderId: order.id },
       create: {
@@ -63,8 +71,9 @@ ratingsRouter.post('/', requireAuth, async (req, res, next) => {
         storeListingId: order.storeListingId,
         shopProductId: order.shopProductId,
         rating: input.rating,
+        comment,
       },
-      update: { rating: input.rating },
+      update: { rating: input.rating, ...(input.comment !== undefined ? { comment } : {}) },
     });
 
     res.status(201).json(saved);

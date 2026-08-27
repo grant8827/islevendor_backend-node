@@ -575,6 +575,13 @@ model ProductRating {
   storeListingId String?  @map("store_listing_id") @db.Uuid
   shopProductId  String?  @map("shop_product_id") @db.Uuid
   rating         Int
+  // The written half of "feedback" — optional, a buyer can leave just stars.
+  // Visible to whichever seller(s) the purchase belongs to: an AFFILIATE
+  // order's feedback goes to both the warehouse (via storeListing.masterProduct)
+  // and the reseller (via storeListing.storeId); a STORE order's goes only to
+  // that shop (via shopProduct.shopId) — see warehouse/shop/commerce routes'
+  // GET .../feedback endpoints.
+  comment        String?
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   customer     User          @relation(fields: [customerId], references: [id], onDelete: Cascade)

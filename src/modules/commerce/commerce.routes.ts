@@ -353,6 +353,61 @@ commerceRouter.post('/stores/:storeId/listings', requireAuth, requireRole(UserRo
   }
 });
 
+async function assertOwnsStore(storeId: string, userId: string, isAdmin: boolean) {
+  const store = await prisma.resellerStore.findUnique({ where: { id: storeId } });
+  if (!store) throw new HttpError(404, 'Store not found');
+  if (store.userId !== userId && !isAdmin) throw new HttpError(403, 'You do not own this store');
+  return store;
+}
+
+// The "Orders" dashboard tab's full order history for this reseller store,
+// each row including its item title and rating/feedback if the customer has
+// left one — mirrors warehouse.routes.ts / shop.routes.ts's GET .../orders.
+commerceRouter.get('/stores/:storeId/orders', requireAuth, requireRole(UserRole.RESELLER, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    await assertOwnsStore(String(req.params.storeId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const orders = await prisma.order.findMany({
+      where: {
+        resellerStoreId: String(req.params.storeId),
+        ...(status ? { status: status as 'PACKING' | 'READY_FOR_PICKUP' | 'PICKED_UP' | 'DELIVERED' } : {}),
+      },
+      include: {
+        storeListing: { select: { masterProduct: { select: { title: true } } } },
+        rating: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(orders);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Feedback (rating + optional written comment) left on this reseller's
+// storefront — an AFFILIATE order's item is a StoreListing, which both the
+// reseller who sold it and the warehouse that supplied it can see feedback
+// for (see warehouse.routes.ts's GET /:warehouseId/feedback for the same
+// rows filtered from the warehouse's side).
+commerceRouter.get('/stores/:storeId/feedback', requireAuth, requireRole(UserRole.RESELLER, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    await assertOwnsStore(String(req.params.storeId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const feedback = await prisma.productRating.findMany({
+      where: { storeListing: { storeId: String(req.params.storeId) } },
+      include: {
+        customer: { select: { fullName: true } },
+        storeListing: { select: { masterProduct: { select: { title: true } } } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(feedback);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // A reseller removes an item from their storefront (soft delete — keeps the
 // row/history, just stops it showing in the marketplace or their own store page).
 commerceRouter.delete('/stores/:storeId/listings/:listingId', requireAuth, requireRole(UserRole.RESELLER, UserRole.ADMIN), async (req, res, next) => {

@@ -217,8 +217,10 @@ shopRouter.get('/:shopId/delivery-applications', requireAuth, requireRole(UserRo
   }
 });
 
-// The shop's packing queue — orders waiting to be boxed (see
-// dispatch.routes.ts for the "mark ready for pickup" transition).
+// The shop's packing queue when filtered to ?status=PACKING, or — called
+// with no status — the "Orders" dashboard tab's full order history, each
+// row including its item title and rating/feedback if the customer has left
+// one (see dispatch.routes.ts for the "mark ready for pickup" transition).
 shopRouter.get('/:shopId/orders', requireAuth, requireRole(UserRole.STORE, UserRole.ADMIN), async (req, res, next) => {
   try {
     await assertOwnsShop(String(req.params.shopId), req.user!.sub, req.user!.role === UserRole.ADMIN);
@@ -229,9 +231,35 @@ shopRouter.get('/:shopId/orders', requireAuth, requireRole(UserRole.STORE, UserR
         shopId: String(req.params.shopId),
         ...(status ? { status: status as 'PACKING' | 'READY_FOR_PICKUP' | 'PICKED_UP' | 'DELIVERED' } : {}),
       },
+      include: {
+        shopProduct: { select: { title: true } },
+        rating: true,
+      },
       orderBy: { createdAt: 'desc' },
     });
     res.json(orders);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Feedback (rating + optional written comment) left on this shop's own
+// products — a STORE order's feedback is only ever visible here, unlike an
+// AFFILIATE order's (see warehouse.routes.ts / commerce.routes.ts for that
+// warehouse+reseller pair).
+shopRouter.get('/:shopId/feedback', requireAuth, requireRole(UserRole.STORE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    await assertOwnsShop(String(req.params.shopId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const feedback = await prisma.productRating.findMany({
+      where: { shopProduct: { shopId: String(req.params.shopId) } },
+      include: {
+        customer: { select: { fullName: true } },
+        shopProduct: { select: { title: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(feedback);
   } catch (err) {
     next(err);
   }

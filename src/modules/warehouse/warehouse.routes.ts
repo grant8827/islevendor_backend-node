@@ -294,8 +294,10 @@ warehouseRouter.put('/:warehouseId/resellers/:storeId/grants', requireAuth, requ
   }
 });
 
-// The warehouse's packing queue — orders waiting to be boxed (see
-// dispatch.routes.ts for the "mark ready for pickup" transition).
+// The warehouse's packing queue when filtered to ?status=PACKING, or —
+// called with no status — the "Orders" dashboard tab's full order history,
+// each row including its item title and rating/feedback if the customer has
+// left one (see dispatch.routes.ts for the "mark ready for pickup" transition).
 warehouseRouter.get('/:warehouseId/orders', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
     await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
@@ -306,10 +308,43 @@ warehouseRouter.get('/:warehouseId/orders', requireAuth, requireRole(UserRole.WA
         warehouseId: String(req.params.warehouseId),
         ...(status ? { status: status as 'PACKING' | 'READY_FOR_PICKUP' | 'PICKED_UP' | 'DELIVERED' } : {}),
       },
-      include: { resellerStore: { select: { storeName: true } } },
+      include: {
+        resellerStore: { select: { storeName: true } },
+        storeListing: { select: { masterProduct: { select: { title: true } } } },
+        rating: true,
+      },
       orderBy: { createdAt: 'desc' },
     });
     res.json(orders);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Feedback (rating + optional written comment) left on this warehouse's
+// stock. An AFFILIATE order's item is a StoreListing, which both the
+// warehouse that supplied it and the reseller who sold it can see feedback
+// for — this query and commerce.routes.ts's GET /stores/:storeId/feedback
+// are the same rows filtered from each side's own relationship to that
+// listing. A STORE order's feedback never appears here — see shop.routes.ts.
+warehouseRouter.get('/:warehouseId/feedback', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const feedback = await prisma.productRating.findMany({
+      where: { storeListing: { masterProduct: { warehouseId: String(req.params.warehouseId) } } },
+      include: {
+        customer: { select: { fullName: true } },
+        storeListing: {
+          select: {
+            masterProduct: { select: { title: true } },
+            store: { select: { storeName: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(feedback);
   } catch (err) {
     next(err);
   }
