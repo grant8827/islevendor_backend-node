@@ -194,13 +194,52 @@ model Warehouse {
   applicantStatus   ApplicantStatus @default(APPROVED) @map("applicant_status")
   referenceId       String?         @unique @map("reference_id")
 
+  // The warehouse's own call, not a platform-wide constant: what percentage
+  // of their (post-discount) wholesale price a reseller earns for selling
+  // an item — added on top of the wholesale price to form the customer's
+  // retail price, alongside the platform's flat cut (see lib/pricing.ts).
+  // Surfaced to prospective resellers via this warehouse's Vacancy postings
+  // (see below).
+  resellerCommissionPercent Int @default(20) @map("reseller_commission_percent")
+
   user                 User                    @relation(fields: [userId], references: [id])
   products             MasterProduct[]
   orders               Order[]
   authorizations       ResellerAuthorization[]
   deliveryApplications DeliveryApplication[]
+  vacancies            Vacancy[]
 
   @@map("warehouses")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 3b. RESELLER VACANCIES
+// A warehouse's "we're recruiting" posting — what they're looking for in a
+// reseller. A warehouse can run several at once (e.g. one for social-media
+// sellers, another for retail partners). Only ACTIVE vacancies are surfaced
+// on the reseller-side Applications page (see warehouse.routes.ts's GET
+// /vacancies) — a warehouse with no active vacancy simply doesn't appear
+// there; applying still goes through the existing ResellerAuthorization
+// flow (authorization.routes.ts), a vacancy is discovery/marketing, not a
+// separate application record.
+// ─────────────────────────────────────────────────────────────────────────
+
+model Vacancy {
+  id          String   @id @default(uuid()) @db.Uuid
+  warehouseId String   @map("warehouse_id") @db.Uuid
+  title       String
+  description String
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@map("vacancies")
+}
+
+enum ProductCondition {
+  NEW
+  USED
 }
 
 model MasterProduct {
@@ -211,6 +250,17 @@ model MasterProduct {
   description       String?
   category          String
   wholesalePriceJmd Decimal  @map("wholesale_price_jmd") @db.Decimal(12, 2)
+  // The warehouse's own B2B discount off its wholesale price — see
+  // lib/pricing.ts: since the reseller's and platform's cuts are both
+  // computed as a percentage *of* this (post-discount) price, discounting
+  // it lowers everyone's take, not just the warehouse's, and also lowers
+  // what the customer ultimately pays.
+  discountPercent   Int      @default(0) @map("discount_percent")
+  condition         ProductCondition @default(NEW)
+  // Free-text shown to customers on the product page — return policy,
+  // warranty, care instructions, whatever's relevant. Deliberately one
+  // flexible field rather than several narrow ones.
+  productDetails    String?  @map("product_details")
   stockQuantity     Int      @default(0) @map("stock_quantity")
   // imageUrl is always images[0] — kept as its own column so every existing
   // read site (ProductCard, cart, etc.) can keep reading a single field

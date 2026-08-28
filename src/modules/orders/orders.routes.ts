@@ -5,13 +5,13 @@ import { Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
+import { computeAffiliatePricing, PLATFORM_COMMISSION_RATE } from '../../lib/pricing.js';
 
 export const ordersRouter = Router();
 
-// MVP flat/percentage config — will move to per-warehouse / distance-based
-// values once the FastAPI routing service is wired up (Domain D, Phase 4).
+// MVP flat driver fee — will move to per-warehouse / distance-based values
+// once the FastAPI routing service is wired up (Domain D, Phase 4).
 const FLAT_DRIVER_FEE_JMD = new Decimal(300);
-const PLATFORM_COMMISSION_RATE = new Decimal('0.10'); // 10% of retail total
 
 const checkoutSchema = z.object({
   // AFFILIATE: sellerId = ResellerStore.id, productId = MasterProduct.id (via that store's listing).
@@ -26,7 +26,7 @@ const checkoutSchema = z.object({
 async function checkoutAffiliate(tx: Prisma.TransactionClient, customerId: string, input: z.infer<typeof checkoutSchema>) {
   const listing = await tx.storeListing.findFirst({
     where: { storeId: input.storeId, masterProductId: input.masterProductId, isActive: true },
-    include: { masterProduct: true, store: true },
+    include: { masterProduct: { include: { warehouse: { select: { resellerCommissionPercent: true } } } }, store: true },
   });
   if (!listing) throw new HttpError(404, 'Listing not found or inactive');
 
@@ -46,12 +46,19 @@ async function checkoutAffiliate(tx: Prisma.TransactionClient, customerId: strin
   `;
   if (updated === 0) throw new HttpError(409, 'Not enough stock available');
 
-  const retailTotal = new Decimal(listing.retailPriceJmd.toString()).times(input.quantity);
-  const wholesaleTotal = new Decimal(listing.masterProduct.wholesalePriceJmd.toString()).times(input.quantity);
-  const resellerMargin = retailTotal.minus(wholesaleTotal);
+  // Priced live off the warehouse's current wholesale price/discount and
+  // reseller commission %, not the (informational-only) snapshot stored on
+  // the StoreListing at add-to-store time — see lib/pricing.ts and
+  // commerce.routes.ts's normalizeAffiliateListing, which computes the same
+  // way so what a customer is shown is always what they're charged.
+  const { wholesaleTotalJmd, resellerMarginJmd, platformCommissionJmd, retailTotalJmd } = computeAffiliatePricing({
+    wholesalePriceJmd: listing.masterProduct.wholesalePriceJmd.toString(),
+    discountPercent: listing.masterProduct.discountPercent,
+    resellerCommissionPercent: listing.masterProduct.warehouse.resellerCommissionPercent,
+    quantity: input.quantity,
+  });
   const driverFee = FLAT_DRIVER_FEE_JMD;
-  const platformCommission = retailTotal.times(PLATFORM_COMMISSION_RATE).toDecimalPlaces(2);
-  const totalPaid = retailTotal.plus(driverFee).plus(platformCommission);
+  const totalPaid = retailTotalJmd.plus(driverFee);
 
   return tx.order.create({
     data: {
@@ -63,10 +70,10 @@ async function checkoutAffiliate(tx: Prisma.TransactionClient, customerId: strin
       storeListingId: listing.id,
       quantity: input.quantity,
       totalPaidJmd: totalPaid.toFixed(2),
-      wholesaleTotalJmd: wholesaleTotal.toFixed(2),
-      resellerMarginJmd: resellerMargin.toFixed(2),
+      wholesaleTotalJmd: wholesaleTotalJmd.toFixed(2),
+      resellerMarginJmd: resellerMarginJmd.toFixed(2),
       driverFeeJmd: driverFee.toFixed(2),
-      platformCommissionJmd: platformCommission.toFixed(2),
+      platformCommissionJmd: platformCommissionJmd.toFixed(2),
       deliveryAddress: input.deliveryAddress,
       // status defaults to AWAITING_PAYMENT — flips to PACKING only once
       // the WiPay webhook confirms payment (see ledger.service.ts).

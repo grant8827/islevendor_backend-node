@@ -16,6 +16,10 @@ const createWarehouseSchema = z.object({
   parish: z.string().default('Kingston'),
   lat: z.number(),
   lng: z.number(),
+  // What resellers earn (as a % of this warehouse's own wholesale price) for
+  // selling a SKU — see Warehouse.resellerCommissionPercent's doc comment.
+  // Defaults to the schema's own default when omitted.
+  resellerCommissionPercent: z.number().int().min(0).max(100).optional(),
 });
 
 // A warehouse operator registers their depot, including its spatial point —
@@ -26,11 +30,14 @@ warehouseRouter.post('/', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.
 
     // Raw INSERT bypasses Prisma Client's id generation (its @default(uuid())
     // is applied client-side, not as a DB DEFAULT) — generate it ourselves.
+    // resellerCommissionPercent, when omitted, falls back to the column's own
+    // DB default (COALESCE) rather than a hardcoded literal here.
     const id = randomUUID();
     const [warehouse] = await prisma.$queryRaw<{ id: string }[]>`
-      INSERT INTO warehouses (id, user_id, name, address_line, parish, location)
+      INSERT INTO warehouses (id, user_id, name, address_line, parish, location, reseller_commission_percent)
       VALUES (${id}::uuid, ${req.user!.sub}::uuid, ${input.name}, ${input.addressLine}, ${input.parish},
-              ST_SetSRID(ST_MakePoint(${input.lng}, ${input.lat}), 4326))
+              ST_SetSRID(ST_MakePoint(${input.lng}, ${input.lat}), 4326),
+              COALESCE(${input.resellerCommissionPercent ?? null}, 20))
       RETURNING id
     `;
 
@@ -44,9 +51,45 @@ warehouseRouter.post('/', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.
 warehouseRouter.get('/', async (req, res, next) => {
   try {
     const warehouses = await prisma.warehouse.findMany({
-      select: { id: true, name: true, addressLine: true, parish: true, _count: { select: { products: true } } },
+      select: {
+        id: true,
+        name: true,
+        addressLine: true,
+        parish: true,
+        resellerCommissionPercent: true,
+        _count: { select: { products: true } },
+      },
     });
     res.json(warehouses);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// The reseller-side "job board": every ACTIVE vacancy, across every
+// warehouse, newest first — a warehouse with no active vacancy simply has
+// no rows here (see Vacancy's doc comment in schema.prisma). Public, same
+// openness as GET '/' above; applying still goes through the existing
+// POST /authorizations (authorization.routes.ts).
+warehouseRouter.get('/vacancies', async (req, res, next) => {
+  try {
+    const vacancies = await prisma.vacancy.findMany({
+      where: { isActive: true },
+      include: {
+        warehouse: {
+          select: {
+            id: true,
+            name: true,
+            addressLine: true,
+            parish: true,
+            resellerCommissionPercent: true,
+            _count: { select: { products: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(vacancies);
   } catch (err) {
     next(err);
   }
@@ -58,6 +101,14 @@ const createProductSchema = z.object({
   description: z.string().optional(),
   category: z.string().min(1),
   wholesalePriceJmd: z.number().positive(),
+  // This warehouse's own B2B discount off its wholesale price — see
+  // MasterProduct.discountPercent's doc comment for how it cascades into
+  // the reseller's and platform's cut, and the customer's final price.
+  discountPercent: z.number().int().min(0).max(90).default(0),
+  condition: z.enum(['NEW', 'USED']).default('NEW'),
+  // Free text shown to customers — return policy, warranty, care
+  // instructions, etc.
+  productDetails: z.string().max(4000).optional(),
   stockQuantity: z.number().int().min(0).default(0),
   // images[0] is the main photo; the rest are gallery-only. SKU is no
   // longer taken from the seller — it's generated server-side below.
@@ -68,6 +119,10 @@ warehouseRouter.post('/products', requireAuth, requireRole(UserRole.WAREHOUSE, U
   try {
     const input = createProductSchema.parse(req.body);
 
+    // Which of the owner's (possibly several) warehouses this product
+    // belongs to is an explicit choice on the add-product form, not
+    // implied by whichever warehouse happens to be selected in the
+    // dashboard's switcher — see warehouse/ProductsPanel.jsx.
     const warehouse = await prisma.warehouse.findUnique({ where: { id: input.warehouseId } });
     if (!warehouse) throw new HttpError(404, 'Warehouse not found');
     if (warehouse.userId !== req.user!.sub && req.user!.role !== UserRole.ADMIN) {
@@ -83,6 +138,9 @@ warehouseRouter.post('/products', requireAuth, requireRole(UserRole.WAREHOUSE, U
           description: input.description,
           category: input.category,
           wholesalePriceJmd: input.wholesalePriceJmd,
+          discountPercent: input.discountPercent,
+          condition: input.condition,
+          productDetails: input.productDetails,
           stockQuantity: input.stockQuantity,
           imageUrl: input.images[0],
           images: input.images,
@@ -108,6 +166,9 @@ const updateProductSchema = z.object({
   description: z.string().nullable().optional(),
   category: z.string().min(1).optional(),
   wholesalePriceJmd: z.number().positive().optional(),
+  discountPercent: z.number().int().min(0).max(90).optional(),
+  condition: z.enum(['NEW', 'USED']).optional(),
+  productDetails: z.string().max(4000).nullable().optional(),
   stockQuantity: z.number().int().min(0).optional(),
   images: z.array(imageUrlSchema).min(1).optional(),
   isActive: z.boolean().optional(),
@@ -183,6 +244,98 @@ async function assertOwnsWarehouse(warehouseId: string, userId: string, isAdmin:
   if (warehouse.userId !== userId && !isAdmin) throw new HttpError(403, 'You do not own this warehouse');
   return warehouse;
 }
+
+const updateWarehouseSchema = z.object({
+  resellerCommissionPercent: z.number().int().min(0).max(100).optional(),
+});
+
+// Edit warehouse settings — today just the reseller commission % that
+// Vacancy postings (below) advertise to prospective resellers.
+warehouseRouter.patch('/:warehouseId', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const input = updateWarehouseSchema.parse(req.body);
+    const warehouse = await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const updated = await prisma.warehouse.update({ where: { id: warehouse.id }, data: input });
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const vacancySchema = z.object({
+  title: z.string().min(1),
+  description: z.string().min(1),
+});
+
+// This warehouse's own vacancy postings (owner-side "Vacancies" tab) —
+// active or not, unlike the public GET /vacancies above which only ever
+// shows active ones to resellers.
+warehouseRouter.get('/:warehouseId/vacancies', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const vacancies = await prisma.vacancy.findMany({
+      where: { warehouseId: String(req.params.warehouseId) },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(vacancies);
+  } catch (err) {
+    next(err);
+  }
+});
+
+warehouseRouter.post('/:warehouseId/vacancies', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const input = vacancySchema.parse(req.body);
+    const warehouse = await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const vacancy = await prisma.vacancy.create({
+      data: { warehouseId: warehouse.id, title: input.title, description: input.description },
+    });
+    res.status(201).json(vacancy);
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function assertOwnsVacancy(vacancyId: string, userId: string, isAdmin: boolean) {
+  const vacancy = await prisma.vacancy.findUnique({ where: { id: vacancyId }, include: { warehouse: true } });
+  if (!vacancy) throw new HttpError(404, 'Vacancy not found');
+  if (vacancy.warehouse.userId !== userId && !isAdmin) throw new HttpError(403, 'You do not own this vacancy');
+  return vacancy;
+}
+
+const updateVacancySchema = z.object({
+  title: z.string().min(1).optional(),
+  description: z.string().min(1).optional(),
+  isActive: z.boolean().optional(),
+});
+
+// Edit a vacancy's fields, and/or toggle it active/inactive — one endpoint
+// for both, same "edit form and its suspend toggle are the same action"
+// pattern as PATCH /products/:id.
+warehouseRouter.patch('/vacancies/:id', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const input = updateVacancySchema.parse(req.body);
+    const vacancy = await assertOwnsVacancy(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const updated = await prisma.vacancy.update({ where: { id: vacancy.id }, data: input });
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+warehouseRouter.delete('/vacancies/:id', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const vacancy = await assertOwnsVacancy(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    await prisma.vacancy.delete({ where: { id: vacancy.id } });
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
 
 // Reseller applications to sell this warehouse's stock (see authorization.routes.ts
 // for the reseller-side "apply" endpoint).

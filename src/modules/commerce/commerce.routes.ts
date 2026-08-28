@@ -4,6 +4,7 @@ import { UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
+import { computeAffiliatePricing } from '../../lib/pricing.js';
 
 export const commerceRouter = Router();
 
@@ -69,13 +70,39 @@ function normalizeShopProduct(p: {
   };
 }
 
-function normalizeAffiliateListing<T extends { storeId: string; masterProduct: { warehouse: { parish: string } } }>(l: T) {
+// The customer-facing price is computed live from the warehouse's current
+// wholesale price/discount and reseller commission %, never trusted from
+// the (informational-only) retailPriceJmd snapshot stored on the
+// StoreListing — see lib/pricing.ts and orders.routes.ts's checkoutAffiliate,
+// which prices a purchase the exact same way so what's shown is what's charged.
+// originalPriceJmd (the "was" price for a discount badge) is the same
+// formula with the warehouse's own discount zeroed out, so a warehouse
+// discount lowers the reseller's and platform's cut too, not just the "now"
+// price — see MasterProduct.discountPercent's doc comment.
+function normalizeAffiliateListing<
+  T extends {
+    storeId: string;
+    masterProduct: { wholesalePriceJmd: unknown; discountPercent: number; warehouse: { parish: string; resellerCommissionPercent: number } };
+  },
+>(l: T) {
+  const { retailTotalJmd } = computeAffiliatePricing({
+    wholesalePriceJmd: String(l.masterProduct.wholesalePriceJmd),
+    discountPercent: l.masterProduct.discountPercent,
+    resellerCommissionPercent: l.masterProduct.warehouse.resellerCommissionPercent,
+  });
+  const { retailTotalJmd: originalRetailJmd } = computeAffiliatePricing({
+    wholesalePriceJmd: String(l.masterProduct.wholesalePriceJmd),
+    discountPercent: 0,
+    resellerCommissionPercent: l.masterProduct.warehouse.resellerCommissionPercent,
+  });
+
   return {
     ...l,
     kind: 'AFFILIATE' as const,
     shipFromParish: l.masterProduct.warehouse.parish,
-    originalPriceJmd: (l as T & { retailPriceJmd: unknown }).retailPriceJmd,
-    discountPercent: 0,
+    retailPriceJmd: retailTotalJmd.toFixed(2),
+    originalPriceJmd: originalRetailJmd.toFixed(2),
+    discountPercent: l.masterProduct.discountPercent,
     isFeatured: false,
   };
 }
@@ -102,7 +129,7 @@ commerceRouter.get('/listings', async (req, res, next) => {
           },
         },
         include: {
-          masterProduct: { include: { warehouse: { select: { parish: true } } } },
+          masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
           store: { select: { storeName: true, slug: true } },
         },
         orderBy: { masterProduct: { createdAt: 'desc' } },
@@ -135,7 +162,7 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
     const affiliateListing = await prisma.storeListing.findUnique({
       where: { id },
       include: {
-        masterProduct: { include: { warehouse: { select: { parish: true } } } },
+        masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
         store: { select: { storeName: true, slug: true } },
       },
     });
@@ -164,7 +191,7 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
       prisma.storeListing.findMany({
         where: { isActive: true, id: { not: id }, masterProduct: { isActive: true, category } },
         include: {
-          masterProduct: { include: { warehouse: { select: { parish: true } } } },
+          masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
           store: { select: { storeName: true, slug: true } },
         },
         orderBy: { masterProduct: { createdAt: 'desc' } },
@@ -184,7 +211,7 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
         ? prisma.storeListing.findMany({
             where: { isActive: true, id: { not: id }, storeId: listing.storeId, masterProduct: { isActive: true } },
             include: {
-              masterProduct: { include: { warehouse: { select: { parish: true } } } },
+              masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
               store: { select: { storeName: true, slug: true } },
             },
             orderBy: { masterProduct: { createdAt: 'desc' } },
@@ -287,7 +314,7 @@ commerceRouter.get('/grants/mine', requireAuth, requireRole(UserRole.RESELLER, U
 
     const grants = await prisma.resellerProductGrant.findMany({
       where: { storeId: store.id },
-      include: { masterProduct: { include: { warehouse: { select: { id: true, name: true } } } } },
+      include: { masterProduct: { include: { warehouse: { select: { id: true, name: true, resellerCommissionPercent: true } } } } },
       orderBy: { createdAt: 'desc' },
     });
     res.json(grants);
@@ -298,12 +325,14 @@ commerceRouter.get('/grants/mine', requireAuth, requireRole(UserRole.RESELLER, U
 
 const createListingSchema = z.object({
   masterProductId: z.string().uuid(),
-  retailPriceJmd: z.number().positive(),
 });
 
-// Reseller lists a master-warehouse SKU on their own storefront at their own
-// retail price. Margin is `retailPriceJmd - wholesalePriceJmd`, enforced here
-// and by the DB CHECK constraint (see prisma/migrations trigger).
+// Reseller adds a master-warehouse SKU to their storefront — the retail
+// price is no longer something a reseller sets: it's the warehouse's
+// (post-discount) wholesale price plus the warehouse's own reseller
+// commission % plus the platform's cut, computed live wherever it's shown
+// or charged (see lib/pricing.ts). retailPriceJmd is still stored on the
+// row as an informational snapshot only — never trusted for money math.
 commerceRouter.post('/stores/:storeId/listings', requireAuth, requireRole(UserRole.RESELLER, UserRole.ADMIN), async (req, res, next) => {
   try {
     const input = createListingSchema.parse(req.body);
@@ -313,11 +342,17 @@ commerceRouter.post('/stores/:storeId/listings', requireAuth, requireRole(UserRo
       throw new HttpError(403, 'You do not own this store');
     }
 
-    const product = await prisma.masterProduct.findUnique({ where: { id: input.masterProductId } });
+    const product = await prisma.masterProduct.findUnique({
+      where: { id: input.masterProductId },
+      include: { warehouse: { select: { resellerCommissionPercent: true } } },
+    });
     if (!product) throw new HttpError(404, 'Master product not found');
-    if (input.retailPriceJmd <= Number(product.wholesalePriceJmd)) {
-      throw new HttpError(400, 'Retail price must exceed the wholesale price');
-    }
+
+    const { retailTotalJmd } = computeAffiliatePricing({
+      wholesalePriceJmd: product.wholesalePriceJmd.toString(),
+      discountPercent: product.discountPercent,
+      resellerCommissionPercent: product.warehouse.resellerCommissionPercent,
+    });
 
     // Domain B, two gates: (1) the warehouse has approved this reseller at
     // all, and (2) the warehouse has specifically granted this SKU to them —
@@ -341,11 +376,12 @@ commerceRouter.post('/stores/:storeId/listings', requireAuth, requireRole(UserRo
 
     // Upsert, not create: the unique (storeId, masterProductId) constraint means
     // "add this item" is idempotent — re-adding (or re-adding after removal)
-    // reactivates the same row and updates the price, rather than erroring.
+    // reactivates the same row and refreshes the price snapshot, rather than
+    // erroring.
     const listing = await prisma.storeListing.upsert({
       where: { storeId_masterProductId: { storeId: store.id, masterProductId: product.id } },
-      create: { storeId: store.id, masterProductId: product.id, retailPriceJmd: input.retailPriceJmd },
-      update: { retailPriceJmd: input.retailPriceJmd, isActive: true },
+      create: { storeId: store.id, masterProductId: product.id, retailPriceJmd: retailTotalJmd.toFixed(2) },
+      update: { retailPriceJmd: retailTotalJmd.toFixed(2), isActive: true },
     });
     res.status(201).json(listing);
   } catch (err) {
