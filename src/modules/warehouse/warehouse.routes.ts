@@ -349,7 +349,11 @@ warehouseRouter.get('/:warehouseId/authorizations', requireAuth, requireRole(Use
         warehouseId: String(req.params.warehouseId),
         ...(status ? { status: status as 'PENDING' | 'APPROVED' | 'SUSPENDED' | 'REJECTED' } : {}),
       },
-      include: { store: { select: { id: true, storeName: true, slug: true } } },
+      // Full store row (every ISLE-102 registration/KYC field — resellerType,
+      // TRN, socials, payout/bank details, id doc, etc.) plus the owning
+      // user's contact info, so the warehouse has everything it needs to
+      // actually decide on an application, not just a name and slug.
+      include: { store: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } } },
       orderBy: { requestedAt: 'desc' },
     });
     res.json(authorizations);
