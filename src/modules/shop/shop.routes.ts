@@ -7,6 +7,7 @@ import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { imageUrlSchema } from '../../lib/validation.js';
 import { createWithGeneratedSku } from '../../lib/sku.js';
+import { refundOrder } from '../ledger/ledger.service.js';
 
 export const shopRouter = Router();
 
@@ -208,7 +209,7 @@ shopRouter.get('/:shopId/delivery-applications', requireAuth, requireRole(UserRo
         shopId: String(req.params.shopId),
         ...(status ? { status: status as 'PENDING' | 'APPROVED' | 'SUSPENDED' | 'REJECTED' } : {}),
       },
-      include: { driver: { include: { user: { select: { fullName: true, phoneNumber: true } } } } },
+      include: { driver: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } } },
       orderBy: { requestedAt: 'desc' },
     });
     res.json(applications);
@@ -234,6 +235,12 @@ shopRouter.get('/:shopId/orders', requireAuth, requireRole(UserRole.STORE, UserR
       include: {
         shopProduct: { select: { title: true } },
         rating: true,
+        refund: true,
+        // Buyer name/phone — shown on the Packing Queue's printed shipping
+        // label (see printLabel.js) alongside the delivery address.
+        customer: { select: { fullName: true, phoneNumber: true } },
+        driver: { select: { fullName: true, phoneNumber: true, driverProfile: { select: { isOnline: true } } } },
+        trackingEvents: { orderBy: { createdAt: 'asc' } },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -242,6 +249,34 @@ shopRouter.get('/:shopId/orders', requireAuth, requireRole(UserRole.STORE, UserR
     next(err);
   }
 });
+
+const refundOrderSchema = z.object({
+  reason: z.string().min(1),
+});
+
+// Reverses one of this shop's STORE orders — see ledger.service.ts's
+// refundOrder for what that actually unwinds.
+shopRouter.post(
+  '/:shopId/orders/:orderId/refund',
+  requireAuth,
+  requireRole(UserRole.STORE, UserRole.ADMIN),
+  async (req, res, next) => {
+    try {
+      await assertOwnsShop(String(req.params.shopId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+      const { reason } = refundOrderSchema.parse(req.body);
+
+      const order = await prisma.order.findUnique({ where: { id: String(req.params.orderId) } });
+      if (!order || order.shopId !== req.params.shopId) {
+        throw new HttpError(404, 'Order not found for this shop');
+      }
+
+      const refunded = await refundOrder(order.id, req.user!.sub, reason);
+      res.json(refunded);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 // Feedback (rating + optional written comment) left on this shop's own
 // products — a STORE order's feedback is only ever visible here, unlike an

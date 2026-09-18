@@ -6,6 +6,7 @@ import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { computeAffiliatePricing, PLATFORM_COMMISSION_RATE } from '../../lib/pricing.js';
+import { logTrackingEvent } from '../../lib/tracking.js';
 
 export const ordersRouter = Router();
 
@@ -60,7 +61,7 @@ async function checkoutAffiliate(tx: Prisma.TransactionClient, customerId: strin
   const driverFee = FLAT_DRIVER_FEE_JMD;
   const totalPaid = retailTotalJmd.plus(driverFee);
 
-  return tx.order.create({
+  const order = await tx.order.create({
     data: {
       customerId,
       resellerStoreId: input.storeId,
@@ -79,6 +80,8 @@ async function checkoutAffiliate(tx: Prisma.TransactionClient, customerId: strin
       // the WiPay webhook confirms payment (see ledger.service.ts).
     },
   });
+  await logTrackingEvent(tx, order.id, 'AWAITING_PAYMENT', { note: 'Order placed — awaiting payment' });
+  return order;
 }
 
 async function checkoutStore(tx: Prisma.TransactionClient, customerId: string, input: z.infer<typeof checkoutSchema>) {
@@ -111,7 +114,7 @@ async function checkoutStore(tx: Prisma.TransactionClient, customerId: string, i
   const platformCommission = itemTotal.times(PLATFORM_COMMISSION_RATE).toDecimalPlaces(2);
   const totalPaid = itemTotal.plus(driverFee).plus(platformCommission);
 
-  return tx.order.create({
+  const order = await tx.order.create({
     data: {
       customerId,
       shopId: input.storeId,
@@ -127,6 +130,8 @@ async function checkoutStore(tx: Prisma.TransactionClient, customerId: string, i
       deliveryAddress: input.deliveryAddress,
     },
   });
+  await logTrackingEvent(tx, order.id, 'AWAITING_PAYMENT', { note: 'Order placed — awaiting payment' });
+  return order;
 }
 
 ordersRouter.post('/', requireAuth, requireRole(UserRole.CUSTOMER, UserRole.ADMIN), async (req, res, next) => {

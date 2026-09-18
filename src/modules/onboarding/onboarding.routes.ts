@@ -7,6 +7,7 @@ import { HttpError } from '../../middleware/errorHandler.js';
 import { kycUpload } from '../uploads/uploads.routes.js';
 import { trnSchema } from '../../lib/trn.js';
 import { PARISHES, type Parish } from '../../lib/parishes.js';
+import { verifyKycDocument, type KycDocumentType, type DocumentCheckResult } from '../../lib/ocrClient.js';
 import {
   registerWarehouseApplicant,
   registerResellerApplicant,
@@ -44,6 +45,45 @@ function requireFileUrl(files: UploadedFiles, field: string, label: string): str
   const url = fileUrl(files, field);
   if (!url) throw new HttpError(400, `${label} is required`);
   return url;
+}
+
+// Runs the FastAPI OCR check (src/lib/ocrClient.ts) on one required
+// onboarding KYC document — driver's license/insurance/registration, or a
+// reseller/small-vendor's own photo ID. Only an *expired* document is
+// rejected outright, before any account/profile is created — that's an
+// objective date comparison once a date is found. A name mismatch is NOT
+// rejected here: name-on-document extraction is far more error-prone (fonts,
+// middle names, maiden names, business-owned vehicles), so a false mismatch
+// would wrongly lock out a legitimate applicant with no recourse. Instead
+// it's stored as a flag (see toDocumentVerificationStatus) for the admin
+// reviewing the application in the /pending queue to check against the
+// actual document themselves. A document the OCR service couldn't
+// confidently read at all (`needs_review`) is likewise not rejected — see
+// ocrClient.ts's serviceUnavailableResult doc comment.
+async function verifyRequiredDocument(
+  files: UploadedFiles,
+  field: string,
+  documentType: KycDocumentType,
+  label: string,
+  expectedName: string,
+): Promise<DocumentCheckResult> {
+  const file = files[field]?.[0];
+  if (!file) throw new HttpError(400, `${label} is required`);
+
+  const result = await verifyKycDocument(file.path, file.mimetype, documentType, expectedName);
+
+  if (result.status === 'expired') {
+    throw new HttpError(400, `${label} has expired — upload a current one.`);
+  }
+  return result;
+}
+
+function toDocumentVerificationStatus(status: DocumentCheckResult['status']): 'VERIFIED' | 'NAME_MISMATCH' | 'NEEDS_REVIEW' {
+  // Only reachable with 'verified', 'name_mismatch', or 'needs_review' —
+  // verifyRequiredDocument above throws before returning 'expired'.
+  if (status === 'verified') return 'VERIFIED';
+  if (status === 'name_mismatch') return 'NAME_MISMATCH';
+  return 'NEEDS_REVIEW';
 }
 
 const accountSchema = z.object({
@@ -163,10 +203,16 @@ onboardingRouter.post('/reseller', kycUpload.fields([{ name: 'idDoc', maxCount: 
     const targetCategories = toArray(req.body.targetCategories);
     if (targetCategories.length < 1) throw new HttpError(400, 'Select at least one target product category');
 
+    const idDocLabel = 'Photo ID (driver’s license / passport / voter ID)';
+    const idDocCheck = await verifyRequiredDocument(files, 'idDoc', 'photo_id', idDocLabel, input.fullName);
+
     const result = await registerResellerApplicant({
       ...input,
       targetCategories,
-      idDocUrl: requireFileUrl(files, 'idDoc', 'Photo ID (driver’s license / passport / voter ID)'),
+      idDocUrl: requireFileUrl(files, 'idDoc', idDocLabel),
+      idDocHolderName: idDocCheck.extractedName ?? undefined,
+      idDocExpiry: idDocCheck.expiryDate ? new Date(idDocCheck.expiryDate) : undefined,
+      idDocVerificationStatus: toDocumentVerificationStatus(idDocCheck.status),
     });
 
     res.status(201).json({ ...result, status: 'PENDING_REVIEW' });
@@ -201,9 +247,15 @@ onboardingRouter.post('/small-vendor', kycUpload.fields([{ name: 'govId', maxCou
     const input = vendorSchema.parse(req.body);
     const files = (req.files ?? {}) as UploadedFiles;
 
+    const govIdLabel = 'Government ID photo';
+    const govIdCheck = await verifyRequiredDocument(files, 'govId', 'photo_id', govIdLabel, input.fullName);
+
     const result = await registerVendorApplicant({
       ...input,
-      govIdDocUrl: requireFileUrl(files, 'govId', 'Government ID photo'),
+      govIdDocUrl: requireFileUrl(files, 'govId', govIdLabel),
+      govIdHolderName: govIdCheck.extractedName ?? undefined,
+      govIdExpiry: govIdCheck.expiryDate ? new Date(govIdCheck.expiryDate) : undefined,
+      govIdVerificationStatus: toDocumentVerificationStatus(govIdCheck.status),
     });
 
     res.status(201).json({ ...result, status: 'PENDING_REVIEW', reviewEta: '12-24 hrs' });
@@ -234,7 +286,7 @@ const driverSchema = accountSchema
 
 onboardingRouter.post(
   '/driver',
-  kycUpload.fields([{ name: 'licensePhoto', maxCount: 1 }, { name: 'insuranceCert', maxCount: 1 }, { name: 'fitnessCert', maxCount: 1 }]),
+  kycUpload.fields([{ name: 'licensePhoto', maxCount: 1 }, { name: 'insuranceCert', maxCount: 1 }, { name: 'registrationCert', maxCount: 1 }]),
   async (req, res, next) => {
     try {
       const input = driverSchema.parse(req.body);
@@ -242,12 +294,30 @@ onboardingRouter.post(
       const zoneParishes = toArray(req.body.zoneParishes).filter((p) => (PARISHES as readonly string[]).includes(p));
       if (zoneParishes.length < 1) throw new HttpError(400, 'Select at least one operating zone parish');
 
+      // Name-match + expiry check against the applicant's own registered
+      // name (input.fullName) — run before creating any account/profile so
+      // a rejected document never gets partially onboarded.
+      const [licenseCheck, insuranceCheck, registrationCheck] = await Promise.all([
+        verifyRequiredDocument(files, 'licensePhoto', 'license', "Driver's license photo", input.fullName),
+        verifyRequiredDocument(files, 'insuranceCert', 'insurance', 'Certificate of insurance', input.fullName),
+        verifyRequiredDocument(files, 'registrationCert', 'registration', 'Certificate of registration', input.fullName),
+      ]);
+
       const result = await registerDriverApplicant({
         ...input,
         zoneParishes,
         licensePhotoUrl: requireFileUrl(files, 'licensePhoto', "Driver's license photo"),
-        insuranceCertUrl: fileUrl(files, 'insuranceCert'),
-        fitnessCertUrl: fileUrl(files, 'fitnessCert'),
+        licenseHolderName: licenseCheck.extractedName ?? undefined,
+        licenseExpiry: licenseCheck.expiryDate ? new Date(licenseCheck.expiryDate) : undefined,
+        licenseVerificationStatus: toDocumentVerificationStatus(licenseCheck.status),
+        insuranceCertUrl: requireFileUrl(files, 'insuranceCert', 'Certificate of insurance'),
+        insuranceHolderName: insuranceCheck.extractedName ?? undefined,
+        insuranceCertExpiry: insuranceCheck.expiryDate ? new Date(insuranceCheck.expiryDate) : undefined,
+        insuranceVerificationStatus: toDocumentVerificationStatus(insuranceCheck.status),
+        registrationCertUrl: requireFileUrl(files, 'registrationCert', 'Certificate of registration'),
+        registrationHolderName: registrationCheck.extractedName ?? undefined,
+        registrationCertExpiry: registrationCheck.expiryDate ? new Date(registrationCheck.expiryDate) : undefined,
+        registrationVerificationStatus: toDocumentVerificationStatus(registrationCheck.status),
       });
 
       res.status(201).json({ ...result, status: 'PENDING_REVIEW' });
@@ -275,15 +345,47 @@ onboardingRouter.get('/pending', requireAuth, requireRole(UserRole.ADMIN), async
       }),
       prisma.resellerStore.findMany({
         where: { applicantStatus: 'PENDING_REVIEW' },
-        select: { id: true, storeName: true, referenceId: true, parish: true, user: { select: { email: true, fullName: true } } },
+        select: {
+          id: true,
+          storeName: true,
+          referenceId: true,
+          parish: true,
+          user: { select: { email: true, fullName: true } },
+          // See driverProfile's select below for why these are surfaced.
+          idDocHolderName: true,
+          idDocVerificationStatus: true,
+        },
       }),
       prisma.shop.findMany({
         where: { applicantStatus: 'PENDING_REVIEW' },
-        select: { id: true, shopName: true, referenceId: true, parish: true, user: { select: { email: true, fullName: true } } },
+        select: {
+          id: true,
+          shopName: true,
+          referenceId: true,
+          parish: true,
+          user: { select: { email: true, fullName: true } },
+          govIdHolderName: true,
+          govIdVerificationStatus: true,
+        },
       }),
       prisma.driverProfile.findMany({
         where: { applicantStatus: 'PENDING_REVIEW' },
-        select: { id: true, referenceId: true, homeParish: true, user: { select: { email: true, fullName: true } } },
+        select: {
+          id: true,
+          referenceId: true,
+          homeParish: true,
+          user: { select: { email: true, fullName: true } },
+          // Surfaced so whoever reviews this queue can see a name-mismatch
+          // flag (see onboarding.routes.ts's verifyRequiredDocument) and
+          // check it against the actual uploaded document before deciding —
+          // it's a flag for a human to look at, not an auto-reject.
+          licenseHolderName: true,
+          licenseVerificationStatus: true,
+          insuranceHolderName: true,
+          insuranceVerificationStatus: true,
+          registrationHolderName: true,
+          registrationVerificationStatus: true,
+        },
       }),
     ]);
 

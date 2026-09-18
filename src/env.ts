@@ -12,7 +12,7 @@ const envSchema = z.object({
   WIPAY_ACCOUNT_NUMBER: z.string().optional(),
   WIPAY_API_KEY: z.string().optional(),
   WIPAY_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
-  AI_SERVICE_URL: z.string().default('http://localhost:8000'),
+  AI_SERVICE_URL: z.string().default('http://localhost:8001'),
 });
 
 const parsed = envSchema.safeParse(process.env);

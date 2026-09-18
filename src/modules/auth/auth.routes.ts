@@ -28,7 +28,7 @@ authRouter.post('/register', async (req, res, next) => {
 });
 
 const loginSchema = z.object({
-  email: z.string().email(),
+  email: z.string().trim().email(),
   password: z.string(),
 });
 
@@ -53,6 +53,10 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
         phoneNumber: true,
         role: true,
         createdAt: true,
+        // Set for logins a warehouse admin created via the Staff tab — the
+        // dashboard uses it to tell "not added to a warehouse yet" apart
+        // from "set up your first warehouse".
+        staffOfUserId: true,
         // Only meaningful for DRIVER — lets the driver dashboard tell "no
         // profile yet, go complete onboarding" apart from "profile exists,
         // just no applications yet" without a second round-trip.

@@ -5,6 +5,7 @@ import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { computeAffiliatePricing } from '../../lib/pricing.js';
+import { imageUrlSchema } from '../../lib/validation.js';
 
 export const commerceRouter = Router();
 
@@ -261,40 +262,67 @@ commerceRouter.get('/stores/mine', requireAuth, requireRole(UserRole.RESELLER, U
   }
 });
 
-// Public storefront lookup — checks reseller stores first, then shops
-// (slugs can't collide between the two tables, see assertSlugAvailable-style
-// checks above and in shop.routes.ts). A shop's response is normalized to
-// the same { storeName, slug, listings: [...] } shape so StorefrontPage.jsx
-// doesn't need to know which kind of seller it's rendering.
+// Public storefront by slug — resolves against reseller stores first, then
+// shops (slugs are unique across both, see POST /stores above). Both kinds
+// come back in the same { id, storeName, slug, parish, kind, listings } shape,
+// and each listing is normalized exactly like the marketplace's /listings
+// (live customer price, "was" price, discount, ship-from parish, `store`), so
+// the storefront page, cart and mobile app can treat them identically.
+//
+// Deliberately an explicit field list, not the row: a ResellerStore holds the
+// owner's TRN, bank/wallet payout details and ID-document link, none of which
+// may be served to an unauthenticated caller. Items whose warehouse has
+// suspended the product are left out, same as the marketplace browse.
 commerceRouter.get('/stores/:slug', async (req, res, next) => {
   try {
+    const slug = String(req.params.slug);
+
     const store = await prisma.resellerStore.findUnique({
-      where: { slug: req.params.slug },
-      include: {
+      where: { slug },
+      select: {
+        id: true,
+        storeName: true,
+        slug: true,
+        parish: true,
+        heroMode: true,
+        heroColor: true,
+        heroImageUrl: true,
         listings: {
-          where: { isActive: true },
-          include: { masterProduct: true },
+          where: { isActive: true, masterProduct: { isActive: true } },
+          include: {
+            masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
+            store: { select: { storeName: true, slug: true } },
+          },
+          orderBy: { masterProduct: { createdAt: 'desc' } },
         },
       },
     });
-    if (store) return res.json({ ...store, kind: 'AFFILIATE' });
+    if (store) {
+      return res.json({ ...store, kind: 'AFFILIATE', listings: store.listings.map(normalizeAffiliateListing) });
+    }
 
     const shop = await prisma.shop.findUnique({
-      where: { slug: req.params.slug },
-      include: { products: { where: { isActive: true } } },
+      where: { slug },
+      select: {
+        id: true,
+        shopName: true,
+        slug: true,
+        parish: true,
+        products: {
+          where: { isActive: true },
+          include: { shop: { select: { shopName: true, slug: true, parish: true } } },
+          orderBy: { createdAt: 'desc' },
+        },
+      },
     });
     if (shop) {
       return res.json({
         id: shop.id,
         storeName: shop.shopName,
         slug: shop.slug,
+        parish: shop.parish,
         kind: 'STORE',
-        listings: shop.products.map((p) => ({
-          id: p.id,
-          retailPriceJmd: p.priceJmd,
-          isActive: p.isActive,
-          masterProduct: { ...p, wholesalePriceJmd: p.priceJmd },
-        })),
+        listings: shop.products.map(normalizeShopProduct),
       });
     }
 
@@ -396,6 +424,80 @@ async function assertOwnsStore(storeId: string, userId: string, isAdmin: boolean
   return store;
 }
 
+const heroSchema = z
+  .object({
+    heroMode: z.enum(['DEFAULT', 'COLOR', 'IMAGE']),
+    heroColor: z
+      .string()
+      .regex(/^#[0-9a-fA-F]{6}$/, 'Color must be a hex value like #0f766e')
+      .nullable()
+      .optional(),
+    heroImageUrl: imageUrlSchema.nullable().optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.heroMode === 'COLOR' && !v.heroColor) ctx.addIssue({ code: 'custom', path: ['heroColor'], message: 'Pick a color for your banner' });
+    if (v.heroMode === 'IMAGE' && !v.heroImageUrl) ctx.addIssue({ code: 'custom', path: ['heroImageUrl'], message: 'Add an image for your banner' });
+  });
+
+// The reseller's own choice of storefront banner: the platform default, a
+// solid color, or an image. The color and image are stored even while another
+// mode is selected, so switching back doesn't make them re-upload. Returns
+// just the hero fields, not the store row (which holds payout/KYC details).
+commerceRouter.patch('/stores/:storeId', requireAuth, requireRole(UserRole.RESELLER, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const input = heroSchema.parse(req.body);
+    const store = await assertOwnsStore(String(req.params.storeId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const updated = await prisma.resellerStore.update({
+      where: { id: store.id },
+      data: {
+        heroMode: input.heroMode,
+        ...(input.heroColor !== undefined ? { heroColor: input.heroColor } : {}),
+        ...(input.heroImageUrl !== undefined ? { heroImageUrl: input.heroImageUrl } : {}),
+      },
+      select: { heroMode: true, heroColor: true, heroImageUrl: true },
+    });
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// The reseller dashboard's "My Store" tab: this store's own listings shaped
+// exactly like the marketplace's (live customer price, "was" price, discount,
+// ship-from parish — see normalizeAffiliateListing), so the tab can render the
+// same product cards a shopper sees, plus what the reseller earns per sale and
+// which warehouse supplies it. Unlike the public /stores/:slug, a listing whose
+// warehouse has since suspended the product is still returned (flagged by
+// masterProduct.isActive) so the reseller can see it and remove it.
+commerceRouter.get('/stores/:storeId/listings', requireAuth, requireRole(UserRole.RESELLER, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const store = await assertOwnsStore(String(req.params.storeId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+
+    const listings = await prisma.storeListing.findMany({
+      where: { storeId: store.id, isActive: true },
+      include: {
+        masterProduct: { include: { warehouse: { select: { name: true, parish: true, resellerCommissionPercent: true } } } },
+        store: { select: { storeName: true, slug: true } },
+      },
+      orderBy: { masterProduct: { createdAt: 'desc' } },
+    });
+
+    res.json(
+      listings.map((listing) => {
+        const { resellerMarginJmd } = computeAffiliatePricing({
+          wholesalePriceJmd: String(listing.masterProduct.wholesalePriceJmd),
+          discountPercent: listing.masterProduct.discountPercent,
+          resellerCommissionPercent: listing.masterProduct.warehouse.resellerCommissionPercent,
+        });
+        return { ...normalizeAffiliateListing(listing), earningPerUnitJmd: resellerMarginJmd.toFixed(2) };
+      }),
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
 // The "Orders" dashboard tab's full order history for this reseller store,
 // each row including its item title and rating/feedback if the customer has
 // left one — mirrors warehouse.routes.ts / shop.routes.ts's GET .../orders.
@@ -412,6 +514,9 @@ commerceRouter.get('/stores/:storeId/orders', requireAuth, requireRole(UserRole.
       include: {
         storeListing: { select: { masterProduct: { select: { title: true } } } },
         rating: true,
+        refund: true,
+        driver: { select: { fullName: true, phoneNumber: true, driverProfile: { select: { isOnline: true } } } },
+        trackingEvents: { orderBy: { createdAt: 'asc' } },
       },
       orderBy: { createdAt: 'desc' },
     });

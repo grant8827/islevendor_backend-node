@@ -53,13 +53,24 @@ enum UserRole {
 }
 
 model User {
-  id           String   @id @default(uuid()) @db.Uuid
-  email        String   @unique
-  passwordHash String   @map("password_hash")
-  fullName     String   @map("full_name")
-  phoneNumber  String   @map("phone_number")
-  role         UserRole
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  id            String   @id @default(uuid()) @db.Uuid
+  email         String   @unique
+  passwordHash  String   @map("password_hash")
+  fullName      String   @map("full_name")
+  phoneNumber   String   @map("phone_number")
+  role          UserRole
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  // Set only on accounts a warehouse admin created through the dashboard's
+  // Staff tab (see WarehouseMember below): the warehouse *owner* whose
+  // business this account works for. Such an account can only ever operate
+  // warehouses it's been added to — it can't create its own — and only that
+  // owner's admins may reset its password. Null for every self-registered
+  // account.
+  staffOfUserId String?  @map("staff_of_user_id") @db.Uuid
+
+  staffOf              User?             @relation("StaffOwner", fields: [staffOfUserId], references: [id], onDelete: SetNull)
+  staffAccounts        User[]            @relation("StaffOwner")
+  warehouseMemberships WarehouseMember[]
 
   driverProfile  DriverProfile?
   warehouses     Warehouse[]
@@ -67,9 +78,11 @@ model User {
   shops          Shop[]
   ledgerAccounts LedgerAccount[]
 
-  ordersAsCustomer Order[]         @relation("OrderCustomer")
-  ordersAsDriver   Order[]         @relation("OrderDriver")
-  productRatings   ProductRating[]
+  ordersAsCustomer     Order[]              @relation("OrderCustomer")
+  ordersAsDriver       Order[]              @relation("OrderDriver")
+  productRatings       ProductRating[]
+  refundsIssued        Refund[]             @relation("RefundInitiator")
+  trackingEventsPosted OrderTrackingEvent[] @relation("TrackingEventPoster")
 
   @@map("users")
 }
@@ -96,13 +109,29 @@ enum PayoutMethod {
   LYNK_WALLET
 }
 
+// Outcome of the FastAPI OCR check (name-on-file match + expiry) for one KYC
+// document. EXPIRED is rejected at submission (see onboarding.routes.ts) so
+// it never makes it into the database — it stays in the enum since it's
+// still a meaningful value the OCR service itself can return. VERIFIED,
+// NAME_MISMATCH, and NEEDS_REVIEW are all storable: a name mismatch isn't
+// auto-rejected (OCR name-matching is too error-prone to trust alone) — it's
+// stored as a flag for the admin /pending queue, so a human checks the
+// actual document before approving/rejecting.
+enum DocumentVerificationStatus {
+  VERIFIED
+  NAME_MISMATCH
+  EXPIRED
+  NEEDS_REVIEW
+}
+
 model DriverProfile {
   id               String                                @id @default(uuid()) @db.Uuid
   userId           String                                @unique @map("user_id") @db.Uuid
-  // Nullable: nothing creates a DriverProfile yet except the new ISLE-104
-  // onboarding endpoint, which only collects the license photo up front —
-  // licenseNumber/licenseExpiry get OCR'd in later (still-stubbed) and the
-  // selfie/liveness match is explicitly a later phase, see facial.py.
+  // licenseExpiry/licenseHolderName/licenseVerificationStatus are filled in
+  // from the FastAPI OCR service (see src/lib/ocrClient.ts) at onboarding
+  // submission time — licenseNumber isn't OCR'd (not asked for) and stays
+  // null until a later phase. The selfie/liveness match is a separate later
+  // phase too, see facial.py.
   licenseNumber    String?                               @map("license_number")
   licenseExpiry    DateTime?                             @map("license_expiry") @db.Date
   licenseImageUrl  String?                               @map("license_image_url")
@@ -117,34 +146,50 @@ model DriverProfile {
   createdAt        DateTime                              @default(now()) @map("created_at") @db.Timestamptz
 
   // ── ISLE-104: courier onboarding fields ──
-  trn               String?             @map("trn")
-  whatsappNumber    String?             @map("whatsapp_number")
-  homeParish        String?             @map("home_parish")
-  homeTown          String?             @map("home_town")
-  vehicleType       DriverVehicleType?  @map("vehicle_type")
-  vehicleMake       String?             @map("vehicle_make")
-  vehicleModel      String?             @map("vehicle_model")
-  vehicleYear       Int?                @map("vehicle_year")
-  licensePlate      String?             @map("license_plate")
-  hasColdBox        Boolean             @default(false) @map("has_cold_box")
-  zoneParishes      String[]            @default([]) @map("zone_parishes")
-  availability      DriverAvailability? @map("availability")
-  payoutMethod      PayoutMethod?       @map("payout_method")
-  bankName          String?             @map("bank_name")
-  accountHolderName String?             @map("account_holder_name")
-  accountNumber     String?             @map("account_number")
-  branchCode        String?             @map("branch_code")
-  lynkWalletId      String?             @map("lynk_wallet_id")
-  insuranceCertUrl  String?             @map("insurance_cert_url")
-  fitnessCertUrl    String?             @map("fitness_cert_url")
-  slaAcceptedAt     DateTime?           @map("sla_accepted_at") @db.Timestamptz
-  applicantStatus   ApplicantStatus     @default(PENDING_REVIEW) @map("applicant_status")
+  trn                 String?             @map("trn")
+  whatsappNumber      String?             @map("whatsapp_number")
+  homeParish          String?             @map("home_parish")
+  homeTown            String?             @map("home_town")
+  vehicleType         DriverVehicleType?  @map("vehicle_type")
+  vehicleMake         String?             @map("vehicle_make")
+  vehicleModel        String?             @map("vehicle_model")
+  vehicleYear         Int?                @map("vehicle_year")
+  licensePlate        String?             @map("license_plate")
+  hasColdBox          Boolean             @default(false) @map("has_cold_box")
+  zoneParishes        String[]            @default([]) @map("zone_parishes")
+  availability        DriverAvailability? @map("availability")
+  payoutMethod        PayoutMethod?       @map("payout_method")
+  bankName            String?             @map("bank_name")
+  accountHolderName   String?             @map("account_holder_name")
+  accountNumber       String?             @map("account_number")
+  branchCode          String?             @map("branch_code")
+  lynkWalletId        String?             @map("lynk_wallet_id")
+  insuranceCertUrl    String?             @map("insurance_cert_url")
+  registrationCertUrl String?             @map("registration_cert_url")
+
+  // ── Document OCR verification (name-on-file match + expiry) — see
+  // src/lib/ocrClient.ts and src/modules/onboarding/onboarding.routes.ts.
+  // Holder-name/status fields exist per document because the OCR call
+  // happens per document; expiry has its own column per document so the
+  // upcoming-expiry login alert (src/modules/drivers/drivers.routes.ts) can
+  // query/sort on it directly instead of parsing a status string.
+  licenseHolderName              String?                     @map("license_holder_name")
+  licenseVerificationStatus      DocumentVerificationStatus? @map("license_verification_status")
+  insuranceCertExpiry            DateTime?                   @map("insurance_cert_expiry") @db.Date
+  insuranceHolderName            String?                     @map("insurance_holder_name")
+  insuranceVerificationStatus    DocumentVerificationStatus? @map("insurance_verification_status")
+  registrationCertExpiry         DateTime?                   @map("registration_cert_expiry") @db.Date
+  registrationHolderName         String?                     @map("registration_holder_name")
+  registrationVerificationStatus DocumentVerificationStatus? @map("registration_verification_status")
+
+  slaAcceptedAt   DateTime?       @map("sla_accepted_at") @db.Timestamptz
+  applicantStatus ApplicantStatus @default(PENDING_REVIEW) @map("applicant_status")
   // Public-facing "IV-DRV-XXXXXX" reference from the onboarding success
   // screen — nullable because drivers created before this field existed
   // (or seeded directly) never got one.
-  referenceId       String?             @unique @map("reference_id")
+  referenceId     String?         @unique @map("reference_id")
 
-  user                 User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                 User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
   deliveryApplications DeliveryApplication[]
 
   @@map("driver_profiles")
@@ -208,8 +253,41 @@ model Warehouse {
   authorizations       ResellerAuthorization[]
   deliveryApplications DeliveryApplication[]
   vacancies            Vacancy[]
+  members              WarehouseMember[]
 
   @@map("warehouses")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 3a. WAREHOUSE STAFF
+// Who besides the owner (Warehouse.userId) may use a warehouse's dashboard.
+// Members log in like any other WAREHOUSE user; what they can reach is
+// decided per warehouse by this role (see lib/warehouseAccess.ts):
+//  - ADMIN: everything the owner can do except payouts (those sit on the
+//    owner's own ledger account) — including adding/removing staff.
+//  - STAFF: products, orders, feedback, applications and the packing queue
+//    only. No staff management, refunds, commission changes or profile.
+// The owner is implicit and never has a row here.
+// ─────────────────────────────────────────────────────────────────────────
+
+enum WarehouseMemberRole {
+  ADMIN
+  STAFF
+}
+
+model WarehouseMember {
+  id          String              @id @default(uuid()) @db.Uuid
+  warehouseId String              @map("warehouse_id") @db.Uuid
+  userId      String              @map("user_id") @db.Uuid
+  role        WarehouseMemberRole @default(STAFF)
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([warehouseId, userId])
+  @@index([userId])
+  @@map("warehouse_members")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -243,35 +321,35 @@ enum ProductCondition {
 }
 
 model MasterProduct {
-  id                String   @id @default(uuid()) @db.Uuid
-  warehouseId       String   @map("warehouse_id") @db.Uuid
-  sku               String   @unique
+  id                String           @id @default(uuid()) @db.Uuid
+  warehouseId       String           @map("warehouse_id") @db.Uuid
+  sku               String           @unique
   title             String
   description       String?
   category          String
-  wholesalePriceJmd Decimal  @map("wholesale_price_jmd") @db.Decimal(12, 2)
+  wholesalePriceJmd Decimal          @map("wholesale_price_jmd") @db.Decimal(12, 2)
   // The warehouse's own B2B discount off its wholesale price — see
   // lib/pricing.ts: since the reseller's and platform's cuts are both
   // computed as a percentage *of* this (post-discount) price, discounting
   // it lowers everyone's take, not just the warehouse's, and also lowers
   // what the customer ultimately pays.
-  discountPercent   Int      @default(0) @map("discount_percent")
+  discountPercent   Int              @default(0) @map("discount_percent")
   condition         ProductCondition @default(NEW)
   // Free-text shown to customers on the product page — return policy,
   // warranty, care instructions, whatever's relevant. Deliberately one
   // flexible field rather than several narrow ones.
-  productDetails    String?  @map("product_details")
-  stockQuantity     Int      @default(0) @map("stock_quantity")
+  productDetails    String?          @map("product_details")
+  stockQuantity     Int              @default(0) @map("stock_quantity")
   // imageUrl is always images[0] — kept as its own column so every existing
   // read site (ProductCard, cart, etc.) can keep reading a single field
   // without knowing about the gallery. images[] holds the full gallery,
   // main photo included, for the product detail page.
-  imageUrl          String?  @map("image_url")
-  images            String[] @default([])
+  imageUrl          String?          @map("image_url")
+  images            String[]         @default([])
   // Suspended by the warehouse — hidden from the marketplace, but not
   // deleted (existing reseller listings and order history stay intact).
-  isActive          Boolean  @default(true) @map("is_active")
-  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz
+  isActive          Boolean          @default(true) @map("is_active")
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz
 
   warehouse Warehouse              @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
   listings  StoreListing[]
@@ -296,6 +374,12 @@ enum SalesChannel {
   POP_UP
 }
 
+enum StoreHeroMode {
+  DEFAULT
+  COLOR
+  IMAGE
+}
+
 model ResellerStore {
   id        String @id @default(uuid()) @db.Uuid
   userId    String @unique @map("user_id") @db.Uuid
@@ -303,30 +387,44 @@ model ResellerStore {
   slug      String @unique
 
   // ── ISLE-102: reseller partner onboarding fields ──
-  resellerType         ResellerType?   @map("reseller_type")
-  legalName            String?         @map("legal_name")
-  trn                  String?         @map("trn")
-  contactPhone         String?         @map("contact_phone")
-  parish               String?         @map("parish")
-  instagramHandle      String?         @map("instagram_handle")
-  tiktokHandle         String?         @map("tiktok_handle")
-  primarySalesChannel  SalesChannel?   @map("primary_sales_channel")
-  targetCategories     String[]        @default([]) @map("target_categories")
+  resellerType            ResellerType?               @map("reseller_type")
+  legalName               String?                     @map("legal_name")
+  trn                     String?                     @map("trn")
+  contactPhone            String?                     @map("contact_phone")
+  parish                  String?                     @map("parish")
+  instagramHandle         String?                     @map("instagram_handle")
+  tiktokHandle            String?                     @map("tiktok_handle")
+  primarySalesChannel     SalesChannel?               @map("primary_sales_channel")
+  targetCategories        String[]                    @default([]) @map("target_categories")
   // 1–100, enforced in the service layer (Decimal has no declarative CHECK
   // in Prisma) — see onboarding.routes.ts.
-  defaultMarkupPercent Decimal?        @map("default_markup_percent") @db.Decimal(5, 2)
-  payoutMethod         PayoutMethod?   @map("payout_method")
-  bankName             String?         @map("bank_name")
-  accountHolderName    String?         @map("account_holder_name")
-  accountNumber        String?         @map("account_number")
-  branchCode           String?         @map("branch_code")
-  lynkWalletId         String?         @map("lynk_wallet_id")
-  idDocUrl             String?         @map("id_doc_url")
-  slaAcceptedAt        DateTime?       @map("sla_accepted_at") @db.Timestamptz
+  defaultMarkupPercent    Decimal?                    @map("default_markup_percent") @db.Decimal(5, 2)
+  payoutMethod            PayoutMethod?               @map("payout_method")
+  bankName                String?                     @map("bank_name")
+  accountHolderName       String?                     @map("account_holder_name")
+  accountNumber           String?                     @map("account_number")
+  branchCode              String?                     @map("branch_code")
+  lynkWalletId            String?                     @map("lynk_wallet_id")
+  idDocUrl                String?                     @map("id_doc_url")
+  // OCR verification of idDoc (name-on-file match + expiry) — same pattern
+  // as DriverProfile's document fields, see onboarding.routes.ts.
+  idDocExpiry             DateTime?                   @map("id_doc_expiry") @db.Date
+  idDocHolderName         String?                     @map("id_doc_holder_name")
+  idDocVerificationStatus DocumentVerificationStatus? @map("id_doc_verification_status")
+  slaAcceptedAt           DateTime?                   @map("sla_accepted_at") @db.Timestamptz
   // See Warehouse.applicantStatus for why this defaults to APPROVED —
   // same reasoning re: the existing StoreSetupForm quick-setup path.
-  applicantStatus      ApplicantStatus @default(APPROVED) @map("applicant_status")
-  referenceId          String?         @unique @map("reference_id")
+  applicantStatus         ApplicantStatus             @default(APPROVED) @map("applicant_status")
+  referenceId             String?                     @unique @map("reference_id")
+
+  // The banner across the top of this store's public storefront and its
+  // dashboard "My Store" tab — the reseller's own choice. DEFAULT is the
+  // platform's navy/teal gradient; COLOR fills it with heroColor (#rrggbb);
+  // IMAGE covers it with heroImageUrl. The color and image are kept even
+  // while another mode is active, so switching back doesn't lose them.
+  heroMode     StoreHeroMode @default(DEFAULT) @map("hero_mode")
+  heroColor    String?       @map("hero_color")
+  heroImageUrl String?       @map("hero_image_url")
 
   user           User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
   listings       StoreListing[]
@@ -422,31 +520,36 @@ model Shop {
   location    Unsupported("geometry(Point, 4326)")
 
   // ── ISLE-103: micro/small vendor fast-track onboarding fields ──
-  vendorCategory         VendorCategory?      @map("vendor_category")
+  vendorCategory          VendorCategory?             @map("vendor_category")
   // The catalog-wide category hint captured at signup (individual
   // ShopProduct rows carry their own, more specific category).
-  primaryProductCategory String?              @map("primary_product_category")
-  ownerName              String?              @map("owner_name")
-  trn                    String?              @map("trn")
-  whatsappNumber         String?              @map("whatsapp_number")
-  estimatedItemCount     Int?                 @map("estimated_item_count")
-  fulfillmentStrategy    FulfillmentStrategy? @map("fulfillment_strategy")
+  primaryProductCategory  String?                     @map("primary_product_category")
+  ownerName               String?                     @map("owner_name")
+  trn                     String?                     @map("trn")
+  whatsappNumber          String?                     @map("whatsapp_number")
+  estimatedItemCount      Int?                        @map("estimated_item_count")
+  fulfillmentStrategy     FulfillmentStrategy?        @map("fulfillment_strategy")
   // Only meaningful (and only collected) when fulfillmentStrategy is
   // SELF_DISPATCH — see onboarding.routes.ts / VendorOnboardingPage.jsx.
-  pickupAddress          String?              @map("pickup_address")
-  payoutMethod           PayoutMethod?        @map("payout_method")
-  bankName               String?              @map("bank_name")
-  accountHolderName      String?              @map("account_holder_name")
-  accountNumber          String?              @map("account_number")
-  branchCode             String?              @map("branch_code")
-  lynkWalletId           String?              @map("lynk_wallet_id")
-  govIdDocUrl            String?              @map("gov_id_doc_url")
-  slaAcceptedAt          DateTime?            @map("sla_accepted_at") @db.Timestamptz
+  pickupAddress           String?                     @map("pickup_address")
+  payoutMethod            PayoutMethod?               @map("payout_method")
+  bankName                String?                     @map("bank_name")
+  accountHolderName       String?                     @map("account_holder_name")
+  accountNumber           String?                     @map("account_number")
+  branchCode              String?                     @map("branch_code")
+  lynkWalletId            String?                     @map("lynk_wallet_id")
+  govIdDocUrl             String?                     @map("gov_id_doc_url")
+  // OCR verification of govIdDoc (name-on-file match + expiry) — same
+  // pattern as DriverProfile's document fields, see onboarding.routes.ts.
+  govIdExpiry             DateTime?                   @map("gov_id_expiry") @db.Date
+  govIdHolderName         String?                     @map("gov_id_holder_name")
+  govIdVerificationStatus DocumentVerificationStatus? @map("gov_id_verification_status")
+  slaAcceptedAt           DateTime?                   @map("sla_accepted_at") @db.Timestamptz
   // See Warehouse.applicantStatus — same "keep the quick-setup path
   // unaffected" reasoning re: ShopSetupForm. Fast-track review target is
   // 12–24 hrs, surfaced to the applicant, not enforced here.
-  applicantStatus        ApplicantStatus      @default(APPROVED) @map("applicant_status")
-  referenceId            String?              @unique @map("reference_id")
+  applicantStatus         ApplicantStatus             @default(APPROVED) @map("applicant_status")
+  referenceId             String?                     @unique @map("reference_id")
 
   user                 User                  @relation(fields: [userId], references: [id])
   products             ShopProduct[]
@@ -457,21 +560,21 @@ model Shop {
 }
 
 model ShopProduct {
-  id            String   @id @default(uuid()) @db.Uuid
-  shopId        String   @map("shop_id") @db.Uuid
-  sku           String   @unique
-  title         String
-  description   String?
-  category      String
-  priceJmd      Decimal  @map("price_jmd") @db.Decimal(12, 2)
-  discountPercent Int    @default(0) @map("discount_percent")
-  isFeatured     Boolean  @default(false) @map("is_featured")
-  stockQuantity Int      @default(0) @map("stock_quantity")
+  id              String   @id @default(uuid()) @db.Uuid
+  shopId          String   @map("shop_id") @db.Uuid
+  sku             String   @unique
+  title           String
+  description     String?
+  category        String
+  priceJmd        Decimal  @map("price_jmd") @db.Decimal(12, 2)
+  discountPercent Int      @default(0) @map("discount_percent")
+  isFeatured      Boolean  @default(false) @map("is_featured")
+  stockQuantity   Int      @default(0) @map("stock_quantity")
   // See MasterProduct.imageUrl/images for why both exist.
-  imageUrl      String?  @map("image_url")
-  images        String[] @default([])
-  isActive      Boolean  @default(true) @map("is_active")
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  imageUrl        String?  @map("image_url")
+  images          String[] @default([])
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
 
   shop    Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
   orders  Order[]
@@ -554,6 +657,11 @@ enum OrderStatus {
   PICKED_UP
   DELIVERED
   CANCELLED
+  // Distinct from CANCELLED: money was actually collected and credited out
+  // (ledger legs exist) before this order was reversed — see Refund below
+  // and ledger.service.ts's refundOrder. CANCELLED stays free for a future
+  // pre-payment cancellation flow, which has no ledger legs to unwind.
+  REFUNDED
 }
 
 model Order {
@@ -590,22 +698,57 @@ model Order {
   status                  OrderStatus @default(AWAITING_PAYMENT)
   deliveryAddress         String      @map("delivery_address")
   proofOfDeliveryImageUrl String?     @map("proof_of_delivery_image_url")
+  // When the driver actually marked it DELIVERED — distinct from createdAt
+  // (order placement time). Powers the driver's Delivered tab and lets the
+  // seller-side Orders view show when it landed, not just that it did.
+  deliveredAt             DateTime?   @map("delivered_at") @db.Timestamptz
   wipayTransactionId      String?     @unique @map("wipay_transaction_id")
   createdAt               DateTime    @default(now()) @map("created_at") @db.Timestamptz
 
-  customer      User                @relation("OrderCustomer", fields: [customerId], references: [id])
-  driver        User?               @relation("OrderDriver", fields: [driverId], references: [id])
-  resellerStore ResellerStore?      @relation(fields: [resellerStoreId], references: [id])
-  warehouse     Warehouse?          @relation(fields: [warehouseId], references: [id])
-  shop          Shop?               @relation(fields: [shopId], references: [id])
-  storeListing  StoreListing?       @relation(fields: [storeListingId], references: [id])
-  shopProduct   ShopProduct?        @relation(fields: [shopProductId], references: [id])
-  ledgerTxns    LedgerTransaction[]
+  customer       User                 @relation("OrderCustomer", fields: [customerId], references: [id])
+  driver         User?                @relation("OrderDriver", fields: [driverId], references: [id])
+  resellerStore  ResellerStore?       @relation(fields: [resellerStoreId], references: [id])
+  warehouse      Warehouse?           @relation(fields: [warehouseId], references: [id])
+  shop           Shop?                @relation(fields: [shopId], references: [id])
+  storeListing   StoreListing?        @relation(fields: [storeListingId], references: [id])
+  shopProduct    ShopProduct?         @relation(fields: [shopProductId], references: [id])
+  ledgerTxns     LedgerTransaction[]
   // At most one — the orderId unique constraint on ProductRating makes this
   // a true 1:1, not a list (see that model for why: one rating per purchase).
-  rating        ProductRating?
+  rating         ProductRating?
+  // At most one — same one-row-per-order reasoning as rating above (the
+  // orderId unique constraint on Refund makes this a true 1:1).
+  refund         Refund?
+  trackingEvents OrderTrackingEvent[]
 
   @@map("orders")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 5c. ORDER TRACKING
+// The timeline the warehouse/shop/reseller side reads to answer "the buyer
+// says they never got it — what actually happened?" One row per status
+// change (logged automatically at each transition — see src/lib/tracking.ts
+// and its call sites in orders.routes.ts, ledger.service.ts,
+// dispatch.routes.ts, dispatch.gateway.ts), plus optional free-text updates
+// a driver posts manually without changing the status (see dispatch.routes.ts's
+// POST /orders/:id/note) — e.g. "stuck in traffic", "buyer not answering".
+// ─────────────────────────────────────────────────────────────────────────
+
+model OrderTrackingEvent {
+  id        String      @id @default(uuid()) @db.Uuid
+  orderId   String      @map("order_id") @db.Uuid
+  status    OrderStatus
+  note      String?
+  // Set only for a driver's manual note post — null for the automatic
+  // events logged at each status transition.
+  postedBy  String?     @map("posted_by") @db.Uuid
+  createdAt DateTime    @default(now()) @map("created_at") @db.Timestamptz
+
+  order  Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  poster User? @relation("TrackingEventPoster", fields: [postedBy], references: [id])
+
+  @@map("order_tracking_events")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -670,6 +813,7 @@ model LedgerAccount {
 
   user         User?               @relation(fields: [userId], references: [id], onDelete: Cascade)
   transactions LedgerTransaction[]
+  payouts      Payout[]
 
   @@map("ledger_accounts")
 }
@@ -680,13 +824,73 @@ model LedgerTransaction {
   recipientAccountId String       @map("recipient_account_id") @db.Uuid
   amountJmd          Decimal      @map("amount_jmd") @db.Decimal(12, 2)
   escrowState        EscrowStatus @default(HELD_IN_ESCROW) @map("escrow_state")
+  // Set when a refund unwinds this leg (see ledger.service.ts's
+  // refundOrder) — the row is kept, not deleted, so the Payouts tab's
+  // history still shows the original credit, just annotated as reversed.
+  // Null means still in effect.
+  reversedAt         DateTime?    @map("reversed_at") @db.Timestamptz
+  // Set once this leg is swept into a withdrawal (see ledger.service.ts's
+  // withdrawBalance) — null means it's still sitting in the account's
+  // balance and shows up in the Payout tab's "available to withdraw" list;
+  // once set, it's moved to that Payout's line items in Payout History
+  // instead. A refunded leg (reversedAt set) is never eligible either way.
+  payoutId           String?      @map("payout_id") @db.Uuid
   createdAt          DateTime     @default(now()) @map("created_at") @db.Timestamptz
 
   order            Order         @relation(fields: [orderId], references: [id])
   recipientAccount LedgerAccount @relation(fields: [recipientAccountId], references: [id])
+  payout           Payout?       @relation(fields: [payoutId], references: [id])
 
   // Idempotency: one ledger entry per (order, recipient) leg — prevents duplicate
   // webhook deliveries from double-crediting an account.
   @@unique([orderId, recipientAccountId])
   @@map("ledger_transactions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 6b. REFUNDS
+// An internal bookkeeping record only — WiPay checkout itself doesn't exist
+// yet (see orders.routes.ts's TODO), so there's no live payment-processor
+// call to make here. Issuing one reverses this order's ledger legs (see
+// ledger.service.ts's refundOrder) and flips its status to REFUNDED.
+// Restricted to the two seller types that directly fulfill an order — a
+// warehouse (AFFILIATE orders) or a shop (STORE orders) — not the reseller
+// side of an AFFILIATE order, and not a driver.
+// ─────────────────────────────────────────────────────────────────────────
+
+model Refund {
+  id          String   @id @default(uuid()) @db.Uuid
+  orderId     String   @unique @map("order_id") @db.Uuid
+  amountJmd   Decimal  @map("amount_jmd") @db.Decimal(12, 2)
+  reason      String
+  initiatedBy String   @map("initiated_by") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  order     Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  initiator User  @relation("RefundInitiator", fields: [initiatedBy], references: [id])
+
+  @@map("refunds")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 6c. PAYOUTS
+// A withdrawal event: sweeps every not-yet-withdrawn, not-refunded ledger
+// leg on one account into a single record and zeroes them out of that
+// account's balance (see ledger.service.ts's withdrawBalance). Same
+// internal-bookkeeping caveat as Refund — there's no real bank/Lynk
+// disbursement wired up yet, this just moves the money from "Payout" (still
+// sitting in the account) to "Payout History" (already withdrawn) in the
+// dashboard's own books.
+// ─────────────────────────────────────────────────────────────────────────
+
+model Payout {
+  id              String   @id @default(uuid()) @db.Uuid
+  ledgerAccountId String   @map("ledger_account_id") @db.Uuid
+  amountJmd       Decimal  @map("amount_jmd") @db.Decimal(12, 2)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  ledgerAccount LedgerAccount       @relation(fields: [ledgerAccountId], references: [id], onDelete: Cascade)
+  legs          LedgerTransaction[]
+
+  @@map("payouts")
 }

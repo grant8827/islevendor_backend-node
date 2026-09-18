@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
@@ -7,6 +7,10 @@ import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { imageUrlSchema } from '../../lib/validation.js';
 import { createWithGeneratedSku } from '../../lib/sku.js';
+import { computeAffiliatePricing } from '../../lib/pricing.js';
+import { refundOrder } from '../ledger/ledger.service.js';
+import { assertWarehouseAccess, type WarehouseAccess } from '../../lib/warehouseAccess.js';
+import { registerStaffRoutes } from './warehouse.staff.js';
 
 export const warehouseRouter = Router();
 
@@ -27,6 +31,11 @@ const createWarehouseSchema = z.object({
 warehouseRouter.post('/', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
     const input = createWarehouseSchema.parse(req.body);
+
+    // A dashboard-created staff login only ever works inside the warehouse(s)
+    // it was added to — see User.staffOfUserId in schema.prisma.
+    const me = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { staffOfUserId: true } });
+    if (me?.staffOfUserId) throw new HttpError(403, "Staff accounts can't create warehouses");
 
     // Raw INSERT bypasses Prisma Client's id generation (its @default(uuid())
     // is applied client-side, not as a DB DEFAULT) — generate it ourselves.
@@ -123,11 +132,7 @@ warehouseRouter.post('/products', requireAuth, requireRole(UserRole.WAREHOUSE, U
     // belongs to is an explicit choice on the add-product form, not
     // implied by whichever warehouse happens to be selected in the
     // dashboard's switcher — see warehouse/ProductsPanel.jsx.
-    const warehouse = await prisma.warehouse.findUnique({ where: { id: input.warehouseId } });
-    if (!warehouse) throw new HttpError(404, 'Warehouse not found');
-    if (warehouse.userId !== req.user!.sub && req.user!.role !== UserRole.ADMIN) {
-      throw new HttpError(403, 'You do not own this warehouse');
-    }
+    await assertWarehouseAccess(input.warehouseId, req.user!);
 
     const product = await createWithGeneratedSku(input.category, (sku) =>
       prisma.masterProduct.create({
@@ -154,10 +159,10 @@ warehouseRouter.post('/products', requireAuth, requireRole(UserRole.WAREHOUSE, U
   }
 });
 
-async function assertOwnsProduct(productId: string, userId: string, isAdmin: boolean) {
-  const product = await prisma.masterProduct.findUnique({ where: { id: productId }, include: { warehouse: true } });
+async function assertProductAccess(productId: string, user: NonNullable<Request['user']>) {
+  const product = await prisma.masterProduct.findUnique({ where: { id: productId } });
   if (!product) throw new HttpError(404, 'Product not found');
-  if (product.warehouse.userId !== userId && !isAdmin) throw new HttpError(403, 'You do not own this product');
+  await assertWarehouseAccess(product.warehouseId, user);
   return product;
 }
 
@@ -180,7 +185,7 @@ const updateProductSchema = z.object({
 warehouseRouter.patch('/products/:id', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
     const { images, ...rest } = updateProductSchema.parse(req.body);
-    const product = await assertOwnsProduct(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const product = await assertProductAccess(String(req.params.id), req.user!);
 
     const updated = await prisma.masterProduct.update({
       where: { id: product.id },
@@ -197,7 +202,7 @@ warehouseRouter.patch('/products/:id', requireAuth, requireRole(UserRole.WAREHOU
 // that would silently vanish items off their storefronts. Suspend instead.
 warehouseRouter.delete('/products/:id', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    const product = await assertOwnsProduct(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const product = await assertProductAccess(String(req.params.id), req.user!);
 
     const listingCount = await prisma.storeListing.count({ where: { masterProductId: product.id } });
     if (listingCount > 0) {
@@ -223,27 +228,47 @@ warehouseRouter.get('/products', async (req, res, next) => {
   }
 });
 
-// The warehouse dashboard's landing check: every warehouse this user owns
-// (an owner can run more than one depot), so the dashboard can offer a
-// selector — or the "create your first warehouse" form if this is empty.
+// The warehouse dashboard's landing check: every warehouse this user can
+// operate — ones they own (an owner can run more than one depot) plus any
+// they've been added to as ADMIN/STAFF — each tagged with `accessRole` so the
+// dashboard knows which tabs to show. Empty means "create your first
+// warehouse" for an owner, or "ask your admin to add you" for a staff login.
+//
+// Only the owner gets the full row (payout/bank details, TRN, KYC document
+// links); anyone else gets just what running the dashboard needs.
+const NON_OWNER_WAREHOUSE_FIELDS = {
+  id: true,
+  name: true,
+  addressLine: true,
+  parish: true,
+  town: true,
+  coverageParishes: true,
+  operatingHours: true,
+  resellerCommissionPercent: true,
+  applicantStatus: true,
+} as const;
+
 warehouseRouter.get('/mine', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    const warehouses = await prisma.warehouse.findMany({
-      where: { userId: req.user!.sub },
-      orderBy: { name: 'asc' },
-    });
+    const userId = req.user!.sub;
+    const [owned, memberships] = await Promise.all([
+      prisma.warehouse.findMany({ where: { userId } }),
+      prisma.warehouseMember.findMany({
+        where: { userId },
+        select: { role: true, warehouse: { select: NON_OWNER_WAREHOUSE_FIELDS } },
+      }),
+    ]);
+
+    const warehouses = [
+      ...owned.map((w) => ({ ...w, accessRole: 'OWNER' as WarehouseAccess })),
+      ...memberships.map((m) => ({ ...m.warehouse, accessRole: m.role as WarehouseAccess })),
+    ].sort((a, b) => a.name.localeCompare(b.name));
+
     res.json(warehouses);
   } catch (err) {
     next(err);
   }
 });
-
-async function assertOwnsWarehouse(warehouseId: string, userId: string, isAdmin: boolean) {
-  const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } });
-  if (!warehouse) throw new HttpError(404, 'Warehouse not found');
-  if (warehouse.userId !== userId && !isAdmin) throw new HttpError(403, 'You do not own this warehouse');
-  return warehouse;
-}
 
 const updateWarehouseSchema = z.object({
   resellerCommissionPercent: z.number().int().min(0).max(100).optional(),
@@ -254,7 +279,7 @@ const updateWarehouseSchema = z.object({
 warehouseRouter.patch('/:warehouseId', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
     const input = updateWarehouseSchema.parse(req.body);
-    const warehouse = await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const { warehouse } = await assertWarehouseAccess(String(req.params.warehouseId), req.user!, { adminOnly: true });
 
     const updated = await prisma.warehouse.update({ where: { id: warehouse.id }, data: input });
     res.json(updated);
@@ -273,7 +298,7 @@ const vacancySchema = z.object({
 // shows active ones to resellers.
 warehouseRouter.get('/:warehouseId/vacancies', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    await assertWarehouseAccess(String(req.params.warehouseId), req.user!);
 
     const vacancies = await prisma.vacancy.findMany({
       where: { warehouseId: String(req.params.warehouseId) },
@@ -288,7 +313,7 @@ warehouseRouter.get('/:warehouseId/vacancies', requireAuth, requireRole(UserRole
 warehouseRouter.post('/:warehouseId/vacancies', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
     const input = vacancySchema.parse(req.body);
-    const warehouse = await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const { warehouse } = await assertWarehouseAccess(String(req.params.warehouseId), req.user!);
 
     const vacancy = await prisma.vacancy.create({
       data: { warehouseId: warehouse.id, title: input.title, description: input.description },
@@ -299,10 +324,10 @@ warehouseRouter.post('/:warehouseId/vacancies', requireAuth, requireRole(UserRol
   }
 });
 
-async function assertOwnsVacancy(vacancyId: string, userId: string, isAdmin: boolean) {
-  const vacancy = await prisma.vacancy.findUnique({ where: { id: vacancyId }, include: { warehouse: true } });
+async function assertVacancyAccess(vacancyId: string, user: NonNullable<Request['user']>) {
+  const vacancy = await prisma.vacancy.findUnique({ where: { id: vacancyId } });
   if (!vacancy) throw new HttpError(404, 'Vacancy not found');
-  if (vacancy.warehouse.userId !== userId && !isAdmin) throw new HttpError(403, 'You do not own this vacancy');
+  await assertWarehouseAccess(vacancy.warehouseId, user);
   return vacancy;
 }
 
@@ -318,7 +343,7 @@ const updateVacancySchema = z.object({
 warehouseRouter.patch('/vacancies/:id', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
     const input = updateVacancySchema.parse(req.body);
-    const vacancy = await assertOwnsVacancy(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const vacancy = await assertVacancyAccess(String(req.params.id), req.user!);
 
     const updated = await prisma.vacancy.update({ where: { id: vacancy.id }, data: input });
     res.json(updated);
@@ -329,7 +354,7 @@ warehouseRouter.patch('/vacancies/:id', requireAuth, requireRole(UserRole.WAREHO
 
 warehouseRouter.delete('/vacancies/:id', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    const vacancy = await assertOwnsVacancy(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const vacancy = await assertVacancyAccess(String(req.params.id), req.user!);
     await prisma.vacancy.delete({ where: { id: vacancy.id } });
     res.status(204).end();
   } catch (err) {
@@ -341,7 +366,7 @@ warehouseRouter.delete('/vacancies/:id', requireAuth, requireRole(UserRole.WAREH
 // for the reseller-side "apply" endpoint).
 warehouseRouter.get('/:warehouseId/authorizations', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    await assertWarehouseAccess(String(req.params.warehouseId), req.user!);
 
     const status = typeof req.query.status === 'string' ? req.query.status : undefined;
     const authorizations = await prisma.resellerAuthorization.findMany({
@@ -366,7 +391,7 @@ warehouseRouter.get('/:warehouseId/authorizations', requireAuth, requireRole(Use
 // delivery.routes.ts for the driver-side "apply" endpoint).
 warehouseRouter.get('/:warehouseId/delivery-applications', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    await assertWarehouseAccess(String(req.params.warehouseId), req.user!);
 
     const status = typeof req.query.status === 'string' ? req.query.status : undefined;
     const applications = await prisma.deliveryApplication.findMany({
@@ -374,7 +399,7 @@ warehouseRouter.get('/:warehouseId/delivery-applications', requireAuth, requireR
         warehouseId: String(req.params.warehouseId),
         ...(status ? { status: status as 'PENDING' | 'APPROVED' | 'SUSPENDED' | 'REJECTED' } : {}),
       },
-      include: { driver: { include: { user: { select: { fullName: true, phoneNumber: true } } } } },
+      include: { driver: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } } },
       orderBy: { requestedAt: 'desc' },
     });
     res.json(applications);
@@ -397,7 +422,7 @@ async function assertResellerRelationship(warehouseId: string, storeId: string) 
 // granted permission to sell? Powers the "assign items" checklist.
 warehouseRouter.get('/:warehouseId/resellers/:storeId/grants', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    await assertWarehouseAccess(String(req.params.warehouseId), req.user!);
     await assertResellerRelationship(String(req.params.warehouseId), String(req.params.storeId));
 
     const grants = await prisma.resellerProductGrant.findMany({
@@ -417,14 +442,18 @@ const setGrantSchema = z.object({
 
 // The core of "only what's been added to their account is sellable": the
 // warehouse toggles a single product's grant for a specific reseller.
-// Revoking also deactivates any listing the reseller already made for it.
+// Granting also lists it under the reseller's store right away (priced the
+// same live way as everywhere else — see lib/pricing.ts) rather than
+// leaving that as a separate manual step for the reseller; the reseller can
+// still remove it themselves afterward (DELETE /commerce/stores/:id/listings/:id)
+// if they don't want to carry it. Revoking mirrors this: it un-lists it too.
 warehouseRouter.put('/:warehouseId/resellers/:storeId/grants', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
     const input = setGrantSchema.parse(req.body);
     const warehouseId = String(req.params.warehouseId);
     const storeId = String(req.params.storeId);
 
-    await assertOwnsWarehouse(warehouseId, req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const { warehouse } = await assertWarehouseAccess(warehouseId, req.user!);
     await assertResellerRelationship(warehouseId, storeId);
 
     const product = await prisma.masterProduct.findUnique({ where: { id: input.masterProductId } });
@@ -433,11 +462,24 @@ warehouseRouter.put('/:warehouseId/resellers/:storeId/grants', requireAuth, requ
     }
 
     if (input.granted) {
-      await prisma.resellerProductGrant.upsert({
-        where: { storeId_masterProductId: { storeId, masterProductId: product.id } },
-        create: { storeId, masterProductId: product.id },
-        update: {},
+      const { retailTotalJmd } = computeAffiliatePricing({
+        wholesalePriceJmd: product.wholesalePriceJmd.toString(),
+        discountPercent: product.discountPercent,
+        resellerCommissionPercent: warehouse.resellerCommissionPercent,
       });
+
+      await prisma.$transaction([
+        prisma.resellerProductGrant.upsert({
+          where: { storeId_masterProductId: { storeId, masterProductId: product.id } },
+          create: { storeId, masterProductId: product.id },
+          update: {},
+        }),
+        prisma.storeListing.upsert({
+          where: { storeId_masterProductId: { storeId, masterProductId: product.id } },
+          create: { storeId, masterProductId: product.id, retailPriceJmd: retailTotalJmd.toFixed(2) },
+          update: { isActive: true, retailPriceJmd: retailTotalJmd.toFixed(2) },
+        }),
+      ]);
     } else {
       await prisma.$transaction([
         prisma.resellerProductGrant.deleteMany({ where: { storeId, masterProductId: product.id } }),
@@ -457,7 +499,7 @@ warehouseRouter.put('/:warehouseId/resellers/:storeId/grants', requireAuth, requ
 // left one (see dispatch.routes.ts for the "mark ready for pickup" transition).
 warehouseRouter.get('/:warehouseId/orders', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    await assertWarehouseAccess(String(req.params.warehouseId), req.user!);
 
     const status = typeof req.query.status === 'string' ? req.query.status : undefined;
     const orders = await prisma.order.findMany({
@@ -469,6 +511,12 @@ warehouseRouter.get('/:warehouseId/orders', requireAuth, requireRole(UserRole.WA
         resellerStore: { select: { storeName: true } },
         storeListing: { select: { masterProduct: { select: { title: true } } } },
         rating: true,
+        refund: true,
+        // Buyer name/phone — shown on the Packing Queue's printed shipping
+        // label (see printLabel.js) alongside the delivery address.
+        customer: { select: { fullName: true, phoneNumber: true } },
+        driver: { select: { fullName: true, phoneNumber: true, driverProfile: { select: { isOnline: true } } } },
+        trackingEvents: { orderBy: { createdAt: 'asc' } },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -478,6 +526,35 @@ warehouseRouter.get('/:warehouseId/orders', requireAuth, requireRole(UserRole.WA
   }
 });
 
+const refundOrderSchema = z.object({
+  reason: z.string().min(1),
+});
+
+// Reverses one of this warehouse's AFFILIATE orders — see
+// ledger.service.ts's refundOrder for what that actually unwinds.
+warehouseRouter.post(
+  '/:warehouseId/orders/:orderId/refund',
+  requireAuth,
+  requireRole(UserRole.WAREHOUSE, UserRole.ADMIN),
+  async (req, res, next) => {
+    try {
+      // Money going back out — owner/admins only, not plain staff.
+      await assertWarehouseAccess(String(req.params.warehouseId), req.user!, { adminOnly: true });
+      const { reason } = refundOrderSchema.parse(req.body);
+
+      const order = await prisma.order.findUnique({ where: { id: String(req.params.orderId) } });
+      if (!order || order.warehouseId !== req.params.warehouseId) {
+        throw new HttpError(404, 'Order not found for this warehouse');
+      }
+
+      const refunded = await refundOrder(order.id, req.user!.sub, reason);
+      res.json(refunded);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 // Feedback (rating + optional written comment) left on this warehouse's
 // stock. An AFFILIATE order's item is a StoreListing, which both the
 // warehouse that supplied it and the reseller who sold it can see feedback
@@ -486,7 +563,7 @@ warehouseRouter.get('/:warehouseId/orders', requireAuth, requireRole(UserRole.WA
 // listing. A STORE order's feedback never appears here — see shop.routes.ts.
 warehouseRouter.get('/:warehouseId/feedback', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    await assertOwnsWarehouse(String(req.params.warehouseId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    await assertWarehouseAccess(String(req.params.warehouseId), req.user!);
 
     const feedback = await prisma.productRating.findMany({
       where: { storeListing: { masterProduct: { warehouseId: String(req.params.warehouseId) } } },
@@ -506,3 +583,5 @@ warehouseRouter.get('/:warehouseId/feedback', requireAuth, requireRole(UserRole.
     next(err);
   }
 });
+
+registerStaffRoutes(warehouseRouter);

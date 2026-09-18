@@ -51,8 +51,21 @@ export async function registerUser(input: RegisterInput) {
   return { user: sanitizeUser(user), token };
 }
 
+// Emails are stored exactly as typed at registration, so an exact match is
+// tried first (nothing that worked before changes). The case-insensitive
+// fallback is for the person who types "Sam@Gmail.com" when the account was
+// saved as "sam@gmail.com" — phone keyboards capitalise the first letter, and
+// an admin adding staff may have typed it either way.
+export async function findUserByEmail(email: string) {
+  const trimmed = email.trim();
+  return (
+    (await prisma.user.findUnique({ where: { email: trimmed } })) ??
+    (await prisma.user.findFirst({ where: { email: { equals: trimmed, mode: 'insensitive' } } }))
+  );
+}
+
 export async function loginUser(email: string, password: string) {
-  const user = await prisma.user.findUnique({ where: { email } });
+  const user = await findUserByEmail(email);
   if (!user) {
     throw new HttpError(401, 'Invalid email or password');
   }

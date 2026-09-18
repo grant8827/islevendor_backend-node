@@ -1,9 +1,10 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
+import { assertWarehouseAccess } from '../../lib/warehouseAccess.js';
 
 export const deliveryRouter = Router();
 
@@ -82,15 +83,19 @@ const decideSchema = z.object({
   status: z.enum(['APPROVED', 'REJECTED', 'SUSPENDED']),
 });
 
-async function assertOwnsApplication(applicationId: string, userId: string, isAdmin: boolean) {
+async function assertApplicationAccess(applicationId: string, user: NonNullable<Request['user']>) {
   const application = await prisma.deliveryApplication.findUnique({
     where: { id: applicationId },
-    include: { warehouse: true, shop: true },
+    include: { shop: true },
   });
   if (!application) throw new HttpError(404, 'Application not found');
 
-  const ownerId = application.warehouse?.userId ?? application.shop?.userId;
-  if (ownerId !== userId && !isAdmin) throw new HttpError(403, 'You do not own this warehouse/shop');
+  if (application.warehouseId) {
+    // Owner, admins and staff of the warehouse may all decide applications.
+    await assertWarehouseAccess(application.warehouseId, user);
+  } else if (application.shop?.userId !== user.sub && user.role !== UserRole.ADMIN) {
+    throw new HttpError(403, 'You do not own this warehouse/shop');
+  }
   return application;
 }
 
@@ -104,7 +109,7 @@ deliveryRouter.patch(
   async (req, res, next) => {
     try {
       const input = decideSchema.parse(req.body);
-      const application = await assertOwnsApplication(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+      const application = await assertApplicationAccess(String(req.params.id), req.user!);
 
       const updated = await prisma.deliveryApplication.update({
         where: { id: application.id },
@@ -124,7 +129,7 @@ deliveryRouter.delete(
   requireRole(UserRole.WAREHOUSE, UserRole.STORE, UserRole.ADMIN),
   async (req, res, next) => {
     try {
-      const application = await assertOwnsApplication(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+      const application = await assertApplicationAccess(String(req.params.id), req.user!);
       await prisma.deliveryApplication.delete({ where: { id: application.id } });
       res.status(204).end();
     } catch (err) {

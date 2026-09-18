@@ -5,6 +5,7 @@ import { prisma } from '../../lib/prisma.js';
 import { env } from '../../env.js';
 import { getSocketServer } from '../../lib/socket.js';
 import { HttpError } from '../../middleware/errorHandler.js';
+import { logTrackingEvent } from '../../lib/tracking.js';
 
 export interface WiPayWebhookPayload {
   order_id: string;
@@ -67,6 +68,7 @@ export async function processWiPayWebhook(payload: WiPayWebhookPayload) {
         where: { id: order.id },
         data: { status: 'PACKING', wipayTransactionId: payload.transaction_id },
       });
+      await logTrackingEvent(tx, order.id, 'PACKING', { note: 'Payment confirmed — now packing' });
 
       const platformAccount = await tx.ledgerAccount.findFirstOrThrow({ where: { accountType: 'PLATFORM' } });
 
@@ -152,4 +154,106 @@ export async function processWiPayWebhook(payload: WiPayWebhookPayload) {
     }
     throw err;
   }
+}
+
+/**
+ * Reverses an order: unwinds every ledger leg it credited (warehouse/shop +
+ * reseller + platform's combined driver/commission leg) back off whichever
+ * balance currently holds it, records a Refund for the audit trail, and
+ * flips the order to REFUNDED.
+ *
+ * Internal bookkeeping only, same caveat as the rest of this file — WiPay
+ * checkout itself isn't wired up yet (see orders.routes.ts's TODO), so
+ * there's no live payment-processor call to make; this just makes the
+ * platform's own books agree that the money went back.
+ *
+ * Callers (warehouse.routes.ts, shop.routes.ts) are responsible for
+ * ownership/role checks before calling this — it only checks the order's
+ * own state.
+ */
+export async function refundOrder(orderId: string, initiatedByUserId: string, reason: string) {
+  return prisma.$transaction(async (tx) => {
+    const order = await tx.order.findUnique({ where: { id: orderId } });
+    if (!order) throw new HttpError(404, 'Order not found');
+    if (order.status === 'AWAITING_PAYMENT') {
+      throw new HttpError(409, 'This order was never paid for — there is nothing to refund');
+    }
+    if (order.status === 'REFUNDED') {
+      throw new HttpError(409, 'This order has already been refunded');
+    }
+
+    // Only unwind legs not already reversed — defensive against this ever
+    // being called twice for the same order (the REFUNDED check above
+    // already guards the normal path) — and not already swept into a
+    // payout, since withdrawBalance already zeroed that leg out of the
+    // account's balance; there's nothing left there to subtract back out.
+    const legs = await tx.ledgerTransaction.findMany({ where: { orderId, reversedAt: null, payoutId: null } });
+    for (const leg of legs) {
+      if (leg.escrowState === 'HELD_IN_ESCROW') {
+        await tx.$executeRaw`
+          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd - ${leg.amountJmd} WHERE id = ${leg.recipientAccountId}::uuid;
+        `;
+      } else {
+        await tx.$executeRaw`
+          UPDATE ledger_accounts SET available_balance_jmd = available_balance_jmd - ${leg.amountJmd} WHERE id = ${leg.recipientAccountId}::uuid;
+        `;
+      }
+      await tx.ledgerTransaction.update({ where: { id: leg.id }, data: { reversedAt: new Date() } });
+    }
+
+    await tx.refund.create({
+      data: { orderId, amountJmd: order.totalPaidJmd, reason, initiatedBy: initiatedByUserId },
+    });
+    await logTrackingEvent(tx, orderId, 'REFUNDED', { note: reason, postedBy: initiatedByUserId });
+
+    return tx.order.update({ where: { id: orderId }, data: { status: 'REFUNDED' } });
+  });
+}
+
+/**
+ * Withdraws everything currently sitting in `userId`'s ledger account(s):
+ * sweeps every leg not already withdrawn or refunded into one new Payout
+ * record, zeroes the corresponding balance column(s), and moves those legs
+ * from the Payout tab's "available to withdraw" list to Payout History.
+ *
+ * Internal bookkeeping only — same caveat as refundOrder above, there's no
+ * live bank/Lynk disbursement wired up yet, so "withdraw" just means "no
+ * longer sitting in the pending/available balance, now recorded as paid
+ * out." Pulls from pending_balance_jmd as well as available_balance_jmd
+ * since nothing in this codebase yet moves funds from pending -> available
+ * (that's the delivery-confirmation step noted in processWiPayWebhook,
+ * Domain D) — gating withdrawal on available_balance_jmd alone would make
+ * it permanently a no-op today.
+ */
+export async function withdrawBalance(userId: string) {
+  return prisma.$transaction(async (tx) => {
+    const accounts = await tx.ledgerAccount.findMany({ where: { userId } });
+    if (accounts.length === 0) throw new HttpError(404, 'No ledger account found for this user');
+
+    const payouts = [];
+    for (const account of accounts) {
+      const legs = await tx.ledgerTransaction.findMany({
+        where: { recipientAccountId: account.id, reversedAt: null, payoutId: null },
+      });
+      const total = legs.reduce((sum, leg) => sum.plus(leg.amountJmd.toString()), new Decimal(0));
+      if (total.lessThanOrEqualTo(0)) continue;
+
+      const payout = await tx.payout.create({
+        data: { ledgerAccountId: account.id, amountJmd: total.toFixed(2) },
+      });
+      await tx.ledgerTransaction.updateMany({
+        where: { id: { in: legs.map((leg) => leg.id) } },
+        data: { payoutId: payout.id },
+      });
+      await tx.$executeRaw`
+        UPDATE ledger_accounts SET pending_balance_jmd = 0, available_balance_jmd = 0 WHERE id = ${account.id}::uuid;
+      `;
+      payouts.push(payout);
+    }
+
+    if (payouts.length === 0) {
+      throw new HttpError(409, 'Nothing available to withdraw');
+    }
+    return payouts;
+  });
 }

@@ -1,9 +1,10 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
+import { assertWarehouseAccess } from '../../lib/warehouseAccess.js';
 
 export const authorizationRouter = Router();
 
@@ -63,15 +64,11 @@ const decideSchema = z.object({
   status: z.enum(['APPROVED', 'REJECTED', 'SUSPENDED']),
 });
 
-async function assertOwnsAuthorization(authorizationId: string, userId: string, isAdmin: boolean) {
-  const authorization = await prisma.resellerAuthorization.findUnique({
-    where: { id: authorizationId },
-    include: { warehouse: true },
-  });
+async function assertAuthorizationAccess(authorizationId: string, user: NonNullable<Request['user']>) {
+  const authorization = await prisma.resellerAuthorization.findUnique({ where: { id: authorizationId } });
   if (!authorization) throw new HttpError(404, 'Application not found');
-  if (authorization.warehouse.userId !== userId && !isAdmin) {
-    throw new HttpError(403, 'You do not own this warehouse');
-  }
+  // Owner, admins and staff of the warehouse may all decide applications.
+  await assertWarehouseAccess(authorization.warehouseId, user);
   return authorization;
 }
 
@@ -82,7 +79,7 @@ async function assertOwnsAuthorization(authorizationId: string, userId: string, 
 authorizationRouter.patch('/:id', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
     const input = decideSchema.parse(req.body);
-    const authorization = await assertOwnsAuthorization(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const authorization = await assertAuthorizationAccess(String(req.params.id), req.user!);
 
     const updated = await prisma.resellerAuthorization.update({
       where: { id: authorization.id },
@@ -99,7 +96,7 @@ authorizationRouter.patch('/:id', requireAuth, requireRole(UserRole.WAREHOUSE, U
 // sourced from this warehouse (so they don't linger on the marketplace).
 authorizationRouter.delete('/:id', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    const authorization = await assertOwnsAuthorization(String(req.params.id), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const authorization = await assertAuthorizationAccess(String(req.params.id), req.user!);
 
     await prisma.$transaction([
       prisma.resellerProductGrant.deleteMany({

@@ -1,6 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import bcrypt from 'bcryptjs';
-import type { Prisma, DriverAvailability, DriverVehicleType, FulfillmentStrategy, PayoutMethod, ResellerType, SalesChannel, VendorCategory } from '@prisma/client';
+import type {
+  Prisma,
+  DriverAvailability,
+  DriverVehicleType,
+  DocumentVerificationStatus,
+  FulfillmentStrategy,
+  PayoutMethod,
+  ResellerType,
+  SalesChannel,
+  VendorCategory,
+} from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { signAuthToken } from '../../middleware/auth.js';
@@ -159,6 +169,11 @@ export interface ResellerApplicantInput extends ApplicantAccountInput {
   branchCode?: string;
   lynkWalletId?: string;
   idDocUrl: string;
+  // See DriverApplicantInput's matching comment — populated from the FastAPI
+  // OCR check run by the route handler before this is called.
+  idDocHolderName?: string;
+  idDocExpiry?: Date;
+  idDocVerificationStatus?: DocumentVerificationStatus;
 }
 
 export async function registerResellerApplicant(input: ResellerApplicantInput) {
@@ -190,6 +205,9 @@ export async function registerResellerApplicant(input: ResellerApplicantInput) {
           branchCode: input.branchCode,
           lynkWalletId: input.lynkWalletId,
           idDocUrl: input.idDocUrl,
+          idDocHolderName: input.idDocHolderName,
+          idDocExpiry: input.idDocExpiry,
+          idDocVerificationStatus: input.idDocVerificationStatus,
           slaAcceptedAt: new Date(),
           applicantStatus: 'PENDING_REVIEW',
           referenceId,
@@ -228,6 +246,11 @@ export interface VendorApplicantInput extends ApplicantAccountInput {
   branchCode?: string;
   lynkWalletId?: string;
   govIdDocUrl: string;
+  // See DriverApplicantInput's matching comment — populated from the FastAPI
+  // OCR check run by the route handler before this is called.
+  govIdHolderName?: string;
+  govIdExpiry?: Date;
+  govIdVerificationStatus?: DocumentVerificationStatus;
 }
 
 export async function registerVendorApplicant(input: VendorApplicantInput) {
@@ -267,6 +290,9 @@ export async function registerVendorApplicant(input: VendorApplicantInput) {
           branchCode: input.branchCode,
           lynkWalletId: input.lynkWalletId,
           govIdDocUrl: input.govIdDocUrl,
+          govIdHolderName: input.govIdHolderName,
+          govIdExpiry: input.govIdExpiry,
+          govIdVerificationStatus: input.govIdVerificationStatus,
           slaAcceptedAt: new Date(),
           // Fast-track path — still PENDING_REVIEW, but the review target is
           // 12–24 hrs rather than the standard queue (surfaced to the
@@ -309,8 +335,24 @@ export interface DriverApplicantInput extends ApplicantAccountInput {
   branchCode?: string;
   lynkWalletId?: string;
   licensePhotoUrl: string;
-  insuranceCertUrl?: string;
-  fitnessCertUrl?: string;
+  insuranceCertUrl: string;
+  registrationCertUrl: string;
+  // Populated from the FastAPI OCR check (src/lib/ocrClient.ts) run by the
+  // route handler before this is called — a document whose OCR result was
+  // "expired" never gets here (rejected at the route), so verification
+  // status is always VERIFIED, NAME_MISMATCH, or NEEDS_REVIEW by this point.
+  // NAME_MISMATCH is stored, not rejected — see verifyRequiredDocument's
+  // doc comment for why (name extraction is too error-prone to auto-reject
+  // on) — the admin /pending queue surfaces it for a human to check.
+  licenseHolderName?: string;
+  licenseExpiry?: Date;
+  licenseVerificationStatus?: DocumentVerificationStatus;
+  insuranceHolderName?: string;
+  insuranceCertExpiry?: Date;
+  insuranceVerificationStatus?: DocumentVerificationStatus;
+  registrationHolderName?: string;
+  registrationCertExpiry?: Date;
+  registrationVerificationStatus?: DocumentVerificationStatus;
 }
 
 export async function registerDriverApplicant(input: DriverApplicantInput) {
@@ -344,8 +386,17 @@ export async function registerDriverApplicant(input: DriverApplicantInput) {
           accountNumber: input.accountNumber,
           branchCode: input.branchCode,
           lynkWalletId: input.lynkWalletId,
+          licenseHolderName: input.licenseHolderName,
+          licenseExpiry: input.licenseExpiry,
+          licenseVerificationStatus: input.licenseVerificationStatus,
           insuranceCertUrl: input.insuranceCertUrl,
-          fitnessCertUrl: input.fitnessCertUrl,
+          insuranceHolderName: input.insuranceHolderName,
+          insuranceCertExpiry: input.insuranceCertExpiry,
+          insuranceVerificationStatus: input.insuranceVerificationStatus,
+          registrationCertUrl: input.registrationCertUrl,
+          registrationHolderName: input.registrationHolderName,
+          registrationCertExpiry: input.registrationCertExpiry,
+          registrationVerificationStatus: input.registrationVerificationStatus,
           applicantStatus: 'PENDING_REVIEW',
           referenceId,
         },
