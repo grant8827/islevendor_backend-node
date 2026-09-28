@@ -212,7 +212,14 @@ shopRouter.get('/:shopId/delivery-applications', requireAuth, requireRole(UserRo
       include: { driver: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } } },
       orderBy: { requestedAt: 'desc' },
     });
-    res.json(applications);
+    // Payout/bank details are the driver's private info — never sent to the
+    // warehouse/shop they deliver for.
+    res.json(
+      applications.map(({ driver, ...rest }) => {
+        const { payoutMethod, bankName, accountHolderName, accountNumber, branchCode, lynkWalletId, ...publicDriver } = driver;
+        return { ...rest, driver: publicDriver };
+      }),
+    );
   } catch (err) {
     next(err);
   }

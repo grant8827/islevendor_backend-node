@@ -283,7 +283,9 @@ commerceRouter.get('/stores/:slug', async (req, res, next) => {
         id: true,
         storeName: true,
         slug: true,
-        parish: true,
+        // No parish: a reseller's items ship from their warehouses (see
+        // normalizeAffiliateListing's shipFromParish), so the reseller's own
+        // location isn't shown publicly.
         heroMode: true,
         heroColor: true,
         heroImageUrl: true,

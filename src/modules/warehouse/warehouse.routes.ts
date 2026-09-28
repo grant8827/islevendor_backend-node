@@ -374,14 +374,20 @@ warehouseRouter.get('/:warehouseId/authorizations', requireAuth, requireRole(Use
         warehouseId: String(req.params.warehouseId),
         ...(status ? { status: status as 'PENDING' | 'APPROVED' | 'SUSPENDED' | 'REJECTED' } : {}),
       },
-      // Full store row (every ISLE-102 registration/KYC field — resellerType,
-      // TRN, socials, payout/bank details, id doc, etc.) plus the owning
-      // user's contact info, so the warehouse has everything it needs to
-      // actually decide on an application, not just a name and slug.
+      // Store row (ISLE-102 registration/KYC fields — resellerType, TRN,
+      // socials, id doc, etc.) plus the owning user's contact info, so the
+      // warehouse has everything it needs to decide on an application.
+      // Payout/bank details are stripped below — they're the reseller's
+      // private info and never shown to a warehouse.
       include: { store: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } } },
       orderBy: { requestedAt: 'desc' },
     });
-    res.json(authorizations);
+    res.json(
+      authorizations.map(({ store, ...rest }) => {
+        const { payoutMethod, bankName, accountHolderName, accountNumber, branchCode, lynkWalletId, ...publicStore } = store;
+        return { ...rest, store: publicStore };
+      }),
+    );
   } catch (err) {
     next(err);
   }
@@ -402,7 +408,14 @@ warehouseRouter.get('/:warehouseId/delivery-applications', requireAuth, requireR
       include: { driver: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } } },
       orderBy: { requestedAt: 'desc' },
     });
-    res.json(applications);
+    // Payout/bank details are the driver's private info — never sent to the
+    // warehouse/shop they deliver for.
+    res.json(
+      applications.map(({ driver, ...rest }) => {
+        const { payoutMethod, bankName, accountHolderName, accountNumber, branchCode, lynkWalletId, ...publicDriver } = driver;
+        return { ...rest, driver: publicDriver };
+      }),
+    );
   } catch (err) {
     next(err);
   }
