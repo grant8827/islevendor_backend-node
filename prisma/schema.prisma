@@ -720,6 +720,7 @@ model Order {
   // orderId unique constraint on Refund makes this a true 1:1).
   refund         Refund?
   trackingEvents OrderTrackingEvent[]
+  paymentEvents  PaymentEvent[]
 
   @@map("orders")
 }
@@ -799,7 +800,10 @@ enum LedgerAccountType {
 
 enum EscrowStatus {
   HELD_IN_ESCROW
-  DISBURSED_TO_BANK
+  // Released into the recipient's available balance on delivery (see
+  // dispatch.routes.ts) and now withdrawable. Not "paid to a bank" — that's
+  // a Payout reaching PAID.
+  AVAILABLE
 }
 
 model LedgerAccount {
@@ -883,14 +887,60 @@ model Refund {
 // dashboard's own books.
 // ─────────────────────────────────────────────────────────────────────────
 
+// A withdrawal starts as REQUESTED: the amount has left the account's
+// available balance but nothing has been sent anywhere. PAID is reserved for
+// a verified external settlement — no code sets it yet (no bank/Lynk
+// integration exists), and nothing should until one does.
+enum PayoutStatus {
+  REQUESTED
+  PROCESSING
+  PAID
+  FAILED
+  REVERSED
+}
+
 model Payout {
-  id              String   @id @default(uuid()) @db.Uuid
-  ledgerAccountId String   @map("ledger_account_id") @db.Uuid
-  amountJmd       Decimal  @map("amount_jmd") @db.Decimal(12, 2)
-  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  id              String       @id @default(uuid()) @db.Uuid
+  ledgerAccountId String       @map("ledger_account_id") @db.Uuid
+  amountJmd       Decimal      @map("amount_jmd") @db.Decimal(12, 2)
+  status          PayoutStatus @default(REQUESTED)
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz
 
   ledgerAccount LedgerAccount       @relation(fields: [ledgerAccountId], references: [id], onDelete: Cascade)
   legs          LedgerTransaction[]
 
   @@map("payouts")
+}
+
+enum PaymentEventOutcome {
+  RECEIVED
+  // This callback is the one that moved its order to PACKING and credited
+  // the ledger.
+  APPLIED
+  IGNORED_NOT_SUCCESS
+  // A success callback for an order that was no longer AWAITING_PAYMENT —
+  // normally a second transaction against an already-paid order, i.e. a
+  // possible double charge that needs reconciling with the provider.
+  IGNORED_ORDER_NOT_AWAITING_PAYMENT
+}
+
+// One row per callback received from a payment provider, kept whether or not
+// it changed anything. The unique (provider, providerEventId) key is the
+// idempotency guard for processWiPayWebhook: a redelivered or replayed
+// callback finds its row already there and does nothing.
+model PaymentEvent {
+  id              String              @id @default(uuid()) @db.Uuid
+  provider        String
+  providerEventId String              @map("provider_event_id")
+  orderId         String              @map("order_id") @db.Uuid
+  status          String
+  outcome         PaymentEventOutcome @default(RECEIVED)
+  payload         Json
+  receivedAt      DateTime            @default(now()) @map("received_at") @db.Timestamptz
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@unique([provider, providerEventId])
+  @@index([orderId])
+  @@map("payment_events")
 }

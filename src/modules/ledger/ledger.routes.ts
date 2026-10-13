@@ -27,9 +27,9 @@ ledgerRouter.get('/accounts/me', requireAuth, async (req, res, next) => {
   }
 });
 
-// Powers the Payout tab's "available to withdraw" list — every ledger leg
-// still sitting in one of this user's ledger accounts (not yet swept into a
-// Payout, not reversed by a refund). Once withdrawn, a leg drops out of this
+// Powers the Payout tab's "not yet withdrawn" list — every ledger leg still
+// sitting in one of this user's ledger accounts (not yet swept into a
+// Payout), whether still in escrow or available. Once withdrawn, a leg drops out of this
 // list and shows up under its Payout in GET /payouts/me instead.
 ledgerRouter.get('/transactions/me', requireAuth, async (req, res, next) => {
   try {
@@ -45,8 +45,8 @@ ledgerRouter.get('/transactions/me', requireAuth, async (req, res, next) => {
   }
 });
 
-// Sweeps everything currently sitting in the user's ledger account(s) into
-// one new Payout each — see ledger.service.ts's withdrawBalance.
+// Requests a payout of the user's available (released-from-escrow) balance,
+// one REQUESTED Payout per account — see ledger.service.ts's withdrawBalance.
 ledgerRouter.post('/withdraw', requireAuth, async (req, res, next) => {
   try {
     const payouts = await withdrawBalance(req.user!.sub);

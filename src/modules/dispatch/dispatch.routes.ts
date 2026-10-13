@@ -106,22 +106,28 @@ dispatchRouter.post('/orders/:id/delivered', requireAuth, requireRole(UserRole.D
     if (order.driverId !== req.user!.sub) throw new HttpError(403, 'You are not assigned to this order');
 
     const updated = await prisma.$transaction(async (tx) => {
-      const updatedOrder = await tx.order.update({
-        where: { id: order.id },
+      // PICKED_UP -> DELIVERED, once. The status condition is the
+      // race-decider: a repeated or concurrent call matches zero rows, so
+      // escrow below can only ever be released a single time per order, and
+      // never for one that was refunded or isn't out for delivery.
+      const delivered = await tx.order.updateMany({
+        where: { id: order.id, driverId: req.user!.sub, status: 'PICKED_UP' },
         data: { status: 'DELIVERED', proofOfDeliveryImageUrl, deliveredAt: new Date() },
       });
+      if (delivered.count === 0) {
+        throw new HttpError(409, `This order can't be marked delivered (status: ${order.status.replaceAll('_', ' ')})`);
+      }
       await logTrackingEvent(tx, order.id, 'DELIVERED', { note: 'Delivered', postedBy: req.user!.sub });
 
-      // Escrow release: pending -> available for the seller (warehouse +
-      // affiliate, or shop) leg now that delivery is confirmed. Driver/
-      // platform payout wiring is Phase 6 (ACH batch generation). Moves the
-      // actual balance columns too, not just the escrow_state label — a leg
-      // still swept up by ledger.service.ts's withdrawBalance/refundOrder
-      // either way, but refundOrder in particular decides which column to
-      // subtract from based on escrow_state, so the two must stay in sync.
+      // Escrow release: pending -> available for every leg of this order now
+      // that delivery is confirmed — only from here on can it be withdrawn
+      // (see ledger.service.ts's withdrawBalance). Moves the balance columns
+      // and the escrow_state label together; refundOrder decides which
+      // column to subtract from based on escrow_state, so they must agree.
       if (env.ENABLE_ESCROW_RELEASE) {
         const legs = await tx.ledgerTransaction.findMany({
           where: { orderId: order.id, escrowState: 'HELD_IN_ESCROW', reversedAt: null, payoutId: null },
+          orderBy: { recipientAccountId: 'asc' },
         });
         for (const leg of legs) {
           await tx.$executeRaw`
@@ -132,11 +138,11 @@ dispatchRouter.post('/orders/:id/delivered', requireAuth, requireRole(UserRole.D
         }
         await tx.ledgerTransaction.updateMany({
           where: { id: { in: legs.map((leg) => leg.id) } },
-          data: { escrowState: 'DISBURSED_TO_BANK' },
+          data: { escrowState: 'AVAILABLE' },
         });
       }
 
-      return updatedOrder;
+      return tx.order.findUniqueOrThrow({ where: { id: order.id } });
     });
 
     // Live "delivered!" signal for whichever seller owns this order — the

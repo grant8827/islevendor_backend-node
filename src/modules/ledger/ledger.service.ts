@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { Decimal } from 'decimal.js';
-import { Prisma } from '@prisma/client';
+import { z } from 'zod';
+import { Prisma, type PaymentEventOutcome } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { env } from '../../env.js';
 import { getSocketServer } from '../../lib/socket.js';
@@ -11,9 +12,11 @@ export interface WiPayWebhookPayload {
   order_id: string;
   transaction_id: string;
   hash: string;
-  status: 'success' | 'failed';
+  status: string;
   [key: string]: unknown;
 }
+
+const WIPAY_PROVIDER = 'WIPAY';
 
 /**
  * WiPay signs callbacks with an MD5 hash over a set of response fields + your
@@ -32,131 +35,177 @@ export function verifyWiPayHash(payload: WiPayWebhookPayload): boolean {
   return expected === payload.hash;
 }
 
+// Strict shape for the fields this code acts on. Anything else WiPay sends
+// is kept verbatim on the PaymentEvent row, but never trusted.
+const wipayWebhookSchema = z
+  .object({
+    order_id: z.string().uuid(),
+    transaction_id: z.string().min(1).max(128),
+    hash: z.string().min(1).max(128),
+    status: z.string().min(1).max(32),
+  })
+  .passthrough();
+
+/** Adds `amount` to an account's pending (in-escrow) balance. */
+async function creditPending(tx: Prisma.TransactionClient, accountId: string, amount: Prisma.Decimal | string) {
+  await tx.$executeRaw`
+    UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${amount}::numeric WHERE id = ${accountId}::uuid
+  `;
+}
+
 /**
  * Atomically:
  *  1. Verifies the WiPay signature.
- *  2. Records the HELD_IN_ESCROW ledger legs — four (warehouse/affiliate/
- *     driver/platform) for an AFFILIATE order, three (shop/driver/platform)
- *     for a STORE order, since a shop sells its own stock directly.
+ *  2. Records the callback as a PaymentEvent.
  *  3. Flips the order from AWAITING_PAYMENT -> PACKING.
- *  4. Notifies the seller (warehouse or shop) over WebSocket.
+ *  4. Records the HELD_IN_ESCROW ledger legs — three (warehouse/affiliate/
+ *     platform) for an AFFILIATE order, two (shop/platform) for a STORE
+ *     order, since a shop sells its own stock directly — and credits each
+ *     recipient's pending balance.
+ *  5. Notifies the seller (warehouse or shop) over WebSocket.
  *
- * Idempotent: relies on `orders.wipay_transaction_id` UNIQUE and
- * `ledger_transactions (order_id, recipient_account_id)` UNIQUE so a retried
- * webhook delivery is a no-op rather than a double-credit.
+ * Exactly-once, however many callbacks arrive and however they interleave:
+ *  - The same callback redelivered (or a transaction id replayed against a
+ *    different order) hits the PaymentEvent unique key and stops at step 2.
+ *  - Two *different* transactions for one order queue on the order's row
+ *    lock; the first moves it out of AWAITING_PAYMENT, so the second's
+ *    conditional `status = AWAITING_PAYMENT` update at step 3 matches zero
+ *    rows and stops.
+ *  Only the winner of step 3 ever reaches step 4, so ledger rows and account
+ *  balances can't diverge.
  */
-export async function processWiPayWebhook(payload: WiPayWebhookPayload) {
+export async function processWiPayWebhook(rawPayload: unknown) {
   if (!env.ENABLE_WIPAY_WEBHOOKS) {
     throw new HttpError(503, 'WiPay webhook processing is temporarily disabled');
   }
+  const payload = wipayWebhookSchema.parse(rawPayload);
   if (!verifyWiPayHash(payload)) {
     throw new HttpError(400, 'Invalid WiPay signature');
   }
-  if (payload.status !== 'success') {
-    // Nothing to disburse — leave the order in AWAITING_PAYMENT for the
-    // customer to retry, or let a cleanup job cancel it after a timeout.
-    return { skipped: true, reason: 'payment not successful' };
-  }
 
-  try {
-    const order = await prisma.$transaction(async (tx) => {
-      const order = await tx.order.findUnique({ where: { id: payload.order_id } });
-      if (!order) throw new HttpError(404, 'Order not found for webhook payload');
-      if (order.status !== 'AWAITING_PAYMENT') {
-        // Already processed by a prior webhook delivery — idempotent no-op.
-        return order;
-      }
+  const result = await prisma.$transaction(async (tx) => {
+    // Row-lock the order before anything else, so callbacks for one order
+    // are handled strictly one at a time. Not just tidiness: the PaymentEvent
+    // insert below takes a key-share lock on this row through its foreign
+    // key, and the status update further down needs a full row lock (it
+    // writes the uniquely-indexed wipay_transaction_id) — two callbacks each
+    // holding the first while waiting for the second would deadlock.
+    await tx.$queryRaw`SELECT id FROM orders WHERE id = ${payload.order_id}::uuid FOR UPDATE`;
+    const order = await tx.order.findUnique({ where: { id: payload.order_id } });
+    if (!order) throw new HttpError(404, 'Order not found for webhook payload');
 
-      const updatedOrder = await tx.order.update({
-        where: { id: order.id },
-        data: { status: 'PACKING', wipayTransactionId: payload.transaction_id },
-      });
-      await logTrackingEvent(tx, order.id, 'PACKING', { note: 'Payment confirmed — now packing' });
-
-      const platformAccount = await tx.ledgerAccount.findFirstOrThrow({ where: { accountType: 'PLATFORM' } });
-
-      // No driver is assigned yet at payment time, so the driver's fee has
-      // nowhere of its own to go — it's held on the platform account *combined
-      // with* platform commission in a single leg (not two), because the
-      // ledger's idempotency key is (order_id, recipient_account_id): two
-      // separate rows against the same recipient would collide and, with
-      // skipDuplicates, silently drop one of them — which is exactly the bug
-      // this replaced (platform commission was vanishing under a real driver
-      // fee row). Phase 4 (dispatch) must split the driver's cut out of this
-      // combined balance into the driver's own ledger account once a driver
-      // accepts the job.
-      const platformHeldAmount = new Decimal(order.driverFeeJmd.toString()).plus(order.platformCommissionJmd.toString());
-
-      if (order.shopId) {
-        // STORE order: 3-way split — the shop keeps resellerMarginJmd in
-        // full (it's the full item revenue for a shop order, see
-        // orders.routes.ts), no separate wholesale/warehouse leg exists.
-        const shopAccount = await tx.ledgerAccount.findFirstOrThrow({
-          where: { accountType: 'STORE', user: { shops: { some: { id: order.shopId } } } },
-        });
-
-        await tx.ledgerTransaction.createMany({
-          data: [
-            { orderId: order.id, recipientAccountId: shopAccount.id, amountJmd: order.resellerMarginJmd, escrowState: 'HELD_IN_ESCROW' },
-            { orderId: order.id, recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount.toFixed(2), escrowState: 'HELD_IN_ESCROW' },
-          ],
-          skipDuplicates: true,
-        });
-
-        await tx.$executeRaw`
-          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${order.resellerMarginJmd} WHERE id = ${shopAccount.id}::uuid;
-        `;
-        await tx.$executeRaw`
-          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${platformHeldAmount.toFixed(2)}::numeric WHERE id = ${platformAccount.id}::uuid;
-        `;
-      } else {
-        // AFFILIATE order: 4-way split — warehouse (wholesale) + affiliate
-        // (margin) + driver/platform combined.
-        const [warehouseAccount, resellerAccount] = await Promise.all([
-          tx.ledgerAccount.findFirstOrThrow({
-            where: { accountType: 'WAREHOUSE', user: { warehouses: { some: { id: order.warehouseId! } } } },
-          }),
-          tx.ledgerAccount.findFirstOrThrow({
-            where: { accountType: 'RESELLER', user: { resellerStore: { id: order.resellerStoreId! } } },
-          }),
-        ]);
-
-        await tx.ledgerTransaction.createMany({
-          data: [
-            { orderId: order.id, recipientAccountId: warehouseAccount.id, amountJmd: order.wholesaleTotalJmd, escrowState: 'HELD_IN_ESCROW' },
-            { orderId: order.id, recipientAccountId: resellerAccount.id, amountJmd: order.resellerMarginJmd, escrowState: 'HELD_IN_ESCROW' },
-            { orderId: order.id, recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount.toFixed(2), escrowState: 'HELD_IN_ESCROW' },
-          ],
-          skipDuplicates: true, // guards against a retried webhook delivery re-inserting the same rows
-        });
-
-        // Move pending -> available only happens on delivery confirmation
-        // (Domain D) — here we just move funds into pending_balance_jmd.
-        await tx.$executeRaw`
-          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${order.wholesaleTotalJmd} WHERE id = ${warehouseAccount.id}::uuid;
-        `;
-        await tx.$executeRaw`
-          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${order.resellerMarginJmd} WHERE id = ${resellerAccount.id}::uuid;
-        `;
-        await tx.$executeRaw`
-          UPDATE ledger_accounts SET pending_balance_jmd = pending_balance_jmd + ${platformHeldAmount.toFixed(2)}::numeric WHERE id = ${platformAccount.id}::uuid;
-        `;
-      }
-
-      return updatedOrder;
+    // skipDuplicates (ON CONFLICT DO NOTHING) rather than a caught unique
+    // violation: a violation would abort this whole transaction. A concurrent
+    // delivery of the same event waits here until the first commits, then
+    // inserts nothing.
+    const recorded = await tx.paymentEvent.createMany({
+      data: [
+        {
+          provider: WIPAY_PROVIDER,
+          providerEventId: payload.transaction_id,
+          orderId: order.id,
+          status: payload.status,
+          payload: payload as Prisma.InputJsonObject,
+        },
+      ],
+      skipDuplicates: true,
     });
+    if (recorded.count === 0) {
+      return { skipped: true as const, reason: 'duplicate webhook delivery' };
+    }
+    const setOutcome = (outcome: PaymentEventOutcome) =>
+      tx.paymentEvent.update({
+        where: { provider_providerEventId: { provider: WIPAY_PROVIDER, providerEventId: payload.transaction_id } },
+        data: { outcome },
+      });
 
+    if (payload.status !== 'success') {
+      // Nothing to credit — leave the order in AWAITING_PAYMENT for the
+      // customer to retry, or let a cleanup job cancel it after a timeout.
+      await setOutcome('IGNORED_NOT_SUCCESS');
+      return { skipped: true as const, reason: 'payment not successful' };
+    }
+
+    const won = await tx.order.updateMany({
+      where: { id: order.id, status: 'AWAITING_PAYMENT' },
+      data: { status: 'PACKING', wipayTransactionId: payload.transaction_id },
+    });
+    if (won.count === 0) {
+      // A second successful transaction against an order that's already paid
+      // (or cancelled/refunded): money may have been taken twice. Nothing is
+      // credited; the recorded event is what reconciliation works from.
+      await setOutcome('IGNORED_ORDER_NOT_AWAITING_PAYMENT');
+      console.error(
+        `[wipay] success callback ${payload.transaction_id} for order ${order.id} ignored — order is not awaiting payment; needs reconciliation`,
+      );
+      return { skipped: true as const, reason: 'order is not awaiting payment' };
+    }
+    await logTrackingEvent(tx, order.id, 'PACKING', { note: 'Payment confirmed — now packing' });
+
+    const platformAccount = await tx.ledgerAccount.findFirstOrThrow({ where: { accountType: 'PLATFORM' } });
+
+    // No driver is assigned yet at payment time, so the driver's fee has
+    // nowhere of its own to go — it's held on the platform account *combined
+    // with* platform commission in a single leg (not two), because the
+    // ledger's unique key is (order_id, recipient_account_id): two separate
+    // rows against the same recipient would collide. Phase 4 (dispatch) must
+    // split the driver's cut out of this combined balance into the driver's
+    // own ledger account once a driver accepts the job.
+    const platformHeldAmount = new Decimal(order.driverFeeJmd.toString()).plus(order.platformCommissionJmd.toString()).toFixed(2);
+
+    let legs: { recipientAccountId: string; amountJmd: Prisma.Decimal | string }[];
+    if (order.shopId) {
+      // STORE order: the shop keeps resellerMarginJmd in full (it's the full
+      // item revenue for a shop order, see orders.routes.ts), no separate
+      // wholesale/warehouse leg exists.
+      const shopAccount = await tx.ledgerAccount.findFirstOrThrow({
+        where: { accountType: 'STORE', user: { shops: { some: { id: order.shopId } } } },
+      });
+      legs = [
+        { recipientAccountId: shopAccount.id, amountJmd: order.resellerMarginJmd },
+        { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
+      ];
+    } else {
+      // AFFILIATE order: warehouse (wholesale) + affiliate (margin) +
+      // driver/platform combined.
+      const [warehouseAccount, resellerAccount] = await Promise.all([
+        tx.ledgerAccount.findFirstOrThrow({
+          where: { accountType: 'WAREHOUSE', user: { warehouses: { some: { id: order.warehouseId! } } } },
+        }),
+        tx.ledgerAccount.findFirstOrThrow({
+          where: { accountType: 'RESELLER', user: { resellerStore: { id: order.resellerStoreId! } } },
+        }),
+      ]);
+      legs = [
+        { recipientAccountId: warehouseAccount.id, amountJmd: order.wholesaleTotalJmd },
+        { recipientAccountId: resellerAccount.id, amountJmd: order.resellerMarginJmd },
+        { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
+      ];
+    }
+
+    // Deliberately no skipDuplicates: this order just won the transition out
+    // of AWAITING_PAYMENT, so legs can't already exist — if they somehow do,
+    // failing (and rolling the whole thing back) beats crediting balances
+    // for rows that were never inserted. Funds only move pending -> available
+    // on delivery confirmation (see dispatch.routes.ts).
+    await tx.ledgerTransaction.createMany({
+      data: legs.map((leg) => ({ orderId: order.id, escrowState: 'HELD_IN_ESCROW' as const, ...leg })),
+    });
+    // Sorted so every transaction takes account row locks in the same order.
+    for (const leg of [...legs].sort((a, b) => a.recipientAccountId.localeCompare(b.recipientAccountId))) {
+      await creditPending(tx, leg.recipientAccountId, leg.amountJmd);
+    }
+
+    await setOutcome('APPLIED');
+    return { order: await tx.order.findUniqueOrThrow({ where: { id: order.id } }) };
+  });
+
+  if (!('skipped' in result)) {
+    const { order } = result;
     const room = order.shopId ? `shop_${order.shopId}` : `warehouse_${order.warehouseId}`;
     getSocketServer().to(room).emit('NEW_ORDER_TO_PACK', { orderId: order.id });
-    return { order };
-  } catch (err) {
-    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-      // Unique constraint hit — a concurrent duplicate delivery of the same
-      // webhook. Safe to swallow: the first delivery already did the work.
-      return { skipped: true, reason: 'duplicate webhook delivery' };
-    }
-    throw err;
   }
+  return result;
 }
 
 /**
@@ -191,7 +240,7 @@ export async function refundOrder(orderId: string, initiatedByUserId: string, re
     // Only unwind legs not already reversed — defensive against this ever
     // being called twice for the same order (the REFUNDED check above
     // already guards the normal path) — and not already swept into a
-    // payout, since withdrawBalance already zeroed that leg out of the
+    // payout, since withdrawBalance already took that leg out of the
     // account's balance; there's nothing left there to subtract back out.
     const legs = await tx.ledgerTransaction.findMany({ where: { orderId, reversedAt: null, payoutId: null } });
     for (const leg of legs) {
@@ -217,35 +266,50 @@ export async function refundOrder(orderId: string, initiatedByUserId: string, re
 }
 
 /**
- * Withdraws everything currently sitting in `userId`'s ledger account(s):
- * sweeps every leg not already withdrawn or refunded into one new Payout
- * record, zeroes the corresponding balance column(s), and moves those legs
- * from the Payout tab's "available to withdraw" list to Payout History.
+ * Requests a withdrawal of everything `userId` has *available*: every leg
+ * that delivery has released from escrow and that hasn't been refunded or
+ * already withdrawn is swept into one new REQUESTED Payout per account, and
+ * exactly that total comes off the account's available balance.
  *
- * Internal bookkeeping only — same caveat as refundOrder above, there's no
- * live bank/Lynk disbursement wired up yet, so "withdraw" just means "no
- * longer sitting in the pending/available balance, now recorded as paid
- * out." Pulls from pending_balance_jmd as well as available_balance_jmd
- * since nothing in this codebase yet moves funds from pending -> available
- * (that's the delivery-confirmation step noted in processWiPayWebhook,
- * Domain D) — gating withdrawal on available_balance_jmd alone would make
- * it permanently a no-op today.
+ * Funds still HELD_IN_ESCROW are never touched — they aren't the seller's
+ * until the order is delivered.
+ *
+ * A Payout is a request, not a payment: there's no bank/Lynk disbursement
+ * wired up yet, so nothing here (or anywhere) marks one PAID.
  */
 export async function withdrawBalance(userId: string) {
   if (!env.ENABLE_WITHDRAWALS) {
     throw new HttpError(503, 'Withdrawals are temporarily disabled');
   }
   return prisma.$transaction(async (tx) => {
-    const accounts = await tx.ledgerAccount.findMany({ where: { userId } });
+    const accounts = await tx.ledgerAccount.findMany({ where: { userId }, orderBy: { id: 'asc' } });
     if (accounts.length === 0) throw new HttpError(404, 'No ledger account found for this user');
 
     const payouts = [];
     for (const account of accounts) {
+      // Row-lock the account first: a second withdrawal racing this one
+      // waits here, then sees these legs already attached to a payout.
+      await tx.$queryRaw`SELECT id FROM ledger_accounts WHERE id = ${account.id}::uuid FOR UPDATE`;
+
       const legs = await tx.ledgerTransaction.findMany({
-        where: { recipientAccountId: account.id, reversedAt: null, payoutId: null },
+        where: { recipientAccountId: account.id, escrowState: 'AVAILABLE', reversedAt: null, payoutId: null },
       });
       const total = legs.reduce((sum, leg) => sum.plus(leg.amountJmd.toString()), new Decimal(0));
       if (total.lessThanOrEqualTo(0)) continue;
+
+      // The guard in the WHERE clause is what keeps the balance from ever
+      // going negative. Legs adding up to more than the cached balance means
+      // the two have drifted apart — stop and leave it for reconciliation
+      // rather than pay out against either number.
+      const debited = await tx.$executeRaw`
+        UPDATE ledger_accounts
+        SET available_balance_jmd = available_balance_jmd - ${total.toFixed(2)}::numeric
+        WHERE id = ${account.id}::uuid AND available_balance_jmd >= ${total.toFixed(2)}::numeric
+      `;
+      if (debited === 0) {
+        console.error(`[ledger] account ${account.id}: available legs total ${total.toFixed(2)} exceeds available balance; needs reconciliation`);
+        throw new HttpError(409, 'Your balance is under review — please contact support before withdrawing');
+      }
 
       const payout = await tx.payout.create({
         data: { ledgerAccountId: account.id, amountJmd: total.toFixed(2) },
@@ -254,9 +318,6 @@ export async function withdrawBalance(userId: string) {
         where: { id: { in: legs.map((leg) => leg.id) } },
         data: { payoutId: payout.id },
       });
-      await tx.$executeRaw`
-        UPDATE ledger_accounts SET pending_balance_jmd = 0, available_balance_jmd = 0 WHERE id = ${account.id}::uuid;
-      `;
       payouts.push(payout);
     }
 

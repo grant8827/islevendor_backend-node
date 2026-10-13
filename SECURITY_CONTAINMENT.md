@@ -31,6 +31,23 @@ have automated test evidence and an approved deployment plan. Enabling WiPay
 webhooks also requires both WiPay credentials at startup. A missing verification
 key always rejects callbacks.
 
+### Evidence so far
+
+`test/ledger.test.ts` covers, under concurrency, the parts of these paths that
+do not depend on the payment provider: callbacks credit an order exactly once,
+escrow is released once and only on a PICKED_UP -> DELIVERED transition,
+withdrawals take only released funds, and no balance can go negative.
+
+That is not yet enough to enable any flag in production:
+
+- `ENABLE_WIPAY_WEBHOOKS` — callback verification is still a placeholder and
+  does not bind the paid amount, merchant or currency.
+- `ENABLE_WITHDRAWALS` — a withdrawal only creates a `REQUESTED` payout; there
+  is no approval or disbursement workflow behind it.
+- `ENABLE_INTERNAL_REFUNDS` — unchanged; no provider refund is issued.
+- `ENABLE_ESCROW_RELEASE` — delivery proof is not yet validated, and the
+  driver's fee is still held on the platform account.
+
 ## Registration and uploads
 
 - `/api/auth/register` accepts only `CUSTOMER`. Marketplace roles must use

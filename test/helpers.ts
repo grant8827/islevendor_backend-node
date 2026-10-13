@@ -155,3 +155,15 @@ export function nextEvent(socket: Socket, events: string[], timeoutMs = 3000): P
     }
   });
 }
+
+export async function createLedgerAccount(userId: string, accountType: 'WAREHOUSE' | 'RESELLER' | 'STORE' | 'DRIVER') {
+  return prisma.ledgerAccount.create({ data: { userId, accountType } });
+}
+
+/** The single PLATFORM account (normally created by prisma/seed.ts). */
+export async function ensurePlatformAccount() {
+  return (
+    (await prisma.ledgerAccount.findFirst({ where: { accountType: 'PLATFORM' } })) ??
+    (await prisma.ledgerAccount.create({ data: { accountType: 'PLATFORM' } }))
+  );
+}
