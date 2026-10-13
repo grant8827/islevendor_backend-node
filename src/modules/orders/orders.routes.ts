@@ -7,6 +7,7 @@ import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { computeAffiliatePricing, PLATFORM_COMMISSION_RATE } from '../../lib/pricing.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
+import { assertOrderAccess, toOrderDto } from '../../lib/orderAccess.js';
 
 export const ordersRouter = Router();
 
@@ -187,11 +188,13 @@ ordersRouter.get('/mine', requireAuth, async (req, res, next) => {
   }
 });
 
+// Participants only (customer, assigned driver, the selling warehouse/
+// reseller/shop, or an admin), each with their own slice of the order — see
+// lib/orderAccess.ts.
 ordersRouter.get('/:id', requireAuth, async (req, res, next) => {
   try {
-    const order = await prisma.order.findUnique({ where: { id: String(req.params.id) } });
-    if (!order) throw new HttpError(404, 'Order not found');
-    res.json(order);
+    const { order, access } = await assertOrderAccess(String(req.params.id), req.user!);
+    res.json(toOrderDto(order, access));
   } catch (err) {
     next(err);
   }

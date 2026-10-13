@@ -14,7 +14,8 @@ const registerSchema = z.object({
   password: z.string().min(8, 'Password must be at least 8 characters'),
   fullName: z.string().min(1),
   phoneNumber: z.string().min(7),
-  role: z.nativeEnum(UserRole),
+  // Marketplace operators must use a role-specific onboarding flow.
+  role: z.literal(UserRole.CUSTOMER),
 });
 
 authRouter.post('/register', async (req, res, next) => {

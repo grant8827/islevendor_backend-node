@@ -5,6 +5,8 @@ import { prisma } from '../../lib/prisma.js';
 import { redis, DRIVER_GEO_KEY } from '../../lib/redis.js';
 import type { AuthTokenPayload } from '../../middleware/auth.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
+import { resolveWarehouseAccess } from '../../lib/warehouseAccess.js';
+import { isEligibleDriver } from '../../lib/driverEligibility.js';
 
 const JOB_OFFER_TTL_SECONDS = 30;
 
@@ -14,6 +16,11 @@ const JOB_OFFER_TTL_SECONDS = 30;
 // timing out. Same TTL as the offer itself.
 function offeredDriversKey(orderId: string): string {
   return `job_offer_drivers:${orderId}`;
+}
+
+// Socket payloads are whatever the client sent — never trust the declared type.
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
 export function registerDispatchGateway(io: Server) {
@@ -34,12 +41,39 @@ export function registerDispatchGateway(io: Server) {
     if (user.role === 'DRIVER') {
       socket.join(`driver_${user.sub}`);
     }
-    if (user.role === 'WAREHOUSE' || user.role === 'ADMIN') {
-      socket.on('warehouse:join', (warehouseId: string) => socket.join(`warehouse_${warehouseId}`));
-    }
-    if (user.role === 'STORE' || user.role === 'ADMIN') {
-      socket.on('shop:join', (shopId: string) => socket.join(`shop_${shopId}`));
-    }
+    // Seller rooms carry that seller's live order/delivery events, so a join
+    // is only honoured for someone who actually operates that warehouse/shop
+    // — the role in the JWT alone isn't enough (any WAREHOUSE login could
+    // otherwise listen in on any other warehouse by id). `ack` is optional:
+    // DeliveryNotificationListener.jsx emits without one.
+    type JoinAck = (result: { ok: boolean }) => void;
+    const settleJoin = (room: string, allowed: boolean, ack?: JoinAck) => {
+      if (allowed) socket.join(room);
+      else console.warn(`[dispatch] denied room join: user=${user.sub} role=${user.role} room=${room}`);
+      if (typeof ack === 'function') ack({ ok: allowed });
+    };
+
+    socket.on('warehouse:join', async (warehouseId: unknown, ack?: JoinAck) => {
+      const room = `warehouse_${String(warehouseId)}`;
+      try {
+        const warehouse = isUuid(warehouseId) ? await prisma.warehouse.findUnique({ where: { id: warehouseId } }) : null;
+        settleJoin(room, !!warehouse && !!(await resolveWarehouseAccess(warehouse, user)), ack);
+      } catch (err) {
+        console.error('[dispatch] warehouse:join failed', err);
+        settleJoin(room, false, ack);
+      }
+    });
+
+    socket.on('shop:join', async (shopId: unknown, ack?: JoinAck) => {
+      const room = `shop_${String(shopId)}`;
+      try {
+        const shop = isUuid(shopId) ? await prisma.shop.findUnique({ where: { id: shopId }, select: { userId: true } }) : null;
+        settleJoin(room, !!shop && (user.role === 'ADMIN' || shop.userId === user.sub), ack);
+      } catch (err) {
+        console.error('[dispatch] shop:join failed', err);
+        settleJoin(room, false, ack);
+      }
+    });
 
     // Spec: device transmits lat/lng every ~10s while online.
     socket.on('driver:heartbeat', async ({ lat, lng }: { lat: number; lng: number }) => {
@@ -63,13 +97,28 @@ export function registerDispatchGateway(io: Server) {
     // Driver taps "Accept" on a JOB_OFFER push. The order was broadcast to
     // every nearby online driver (offerJobToDrivers below), so first
     // acceptor wins — see claimJobForDriver below for the actual race-decider.
-    socket.on('driver:acceptJob', async ({ orderId }: { orderId: string }) => {
-      const claimed = await claimJobForDriver(io, orderId, user.sub, 'Picked up by driver');
-      if (!claimed) {
+    socket.on('driver:acceptJob', async (payload: { orderId?: unknown } | undefined) => {
+      const orderId = payload?.orderId;
+      if (!isUuid(orderId)) return;
+      try {
+        // Three gates before the race-decider: an approved driver, who this
+        // order was actually offered to, while that offer is still open (the
+        // Redis set expires with it). Without them any logged-in socket that
+        // knew an order id could make itself that order's driver.
+        const allowed =
+          (await isEligibleDriver(user)) && (await redis.sismember(offeredDriversKey(orderId), user.sub)) === 1;
+        if (!allowed) {
+          console.warn(`[dispatch] denied job claim: user=${user.sub} role=${user.role} order=${orderId}`);
+          socket.emit('JOB_OFFER_EXPIRED', { orderId });
+          return;
+        }
+
+        const claimed = await claimJobForDriver(io, orderId, user.sub, 'Picked up by driver');
+        socket.emit(claimed ? 'JOB_ASSIGNED' : 'JOB_OFFER_EXPIRED', { orderId });
+      } catch (err) {
+        console.error('[dispatch] driver:acceptJob failed', err);
         socket.emit('JOB_OFFER_EXPIRED', { orderId });
-        return;
       }
-      socket.emit('JOB_ASSIGNED', { orderId });
     });
   });
 }
@@ -84,15 +133,23 @@ export function registerDispatchGateway(io: Server) {
  * /orders/:id/scan-pickup (the QR code printed on the shipping label —
  * see printLabel.js — for a driver who never got/used the in-app offer).
  * Returns false if the job was already claimed by someone else.
+ *
+ * Callers are responsible for authorizing `driverId` first — the socket path
+ * by offer membership, the QR path by a signed pickup token.
  */
 export async function claimJobForDriver(io: Server, orderId: string, driverId: string, note: string): Promise<boolean> {
-  const claimed = await prisma.order.updateMany({
-    where: { id: orderId, status: 'READY_FOR_PICKUP', driverId: null },
-    data: { driverId, status: 'PICKED_UP' },
+  // One transaction, so an order can never end up assigned without its
+  // PICKED_UP tracking event (or vice versa).
+  const claimed = await prisma.$transaction(async (tx) => {
+    const result = await tx.order.updateMany({
+      where: { id: orderId, status: 'READY_FOR_PICKUP', driverId: null },
+      data: { driverId, status: 'PICKED_UP' },
+    });
+    if (result.count === 0) return false;
+    await logTrackingEvent(tx, orderId, 'PICKED_UP', { note, postedBy: driverId });
+    return true;
   });
-  if (claimed.count === 0) return false;
-
-  await logTrackingEvent(prisma, orderId, 'PICKED_UP', { note, postedBy: driverId });
+  if (!claimed) return false;
 
   // Tell the other drivers this offer went to that it's no longer available,
   // so their UI can drop it instead of waiting out the full offer window for

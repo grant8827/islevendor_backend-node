@@ -10,6 +10,7 @@ export const uploadsRouter = Router();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const UPLOADS_DIR = path.resolve(__dirname, '../../../uploads');
+export const PRIVATE_KYC_DIR = path.resolve(__dirname, '../../../private-kyc');
 
 const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 // KYC/verification documents (COCJ registration, TRN card, proof of address,
@@ -18,12 +19,9 @@ const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'im
 const ALLOWED_KYC_MIME_TYPES = new Set([...ALLOWED_MIME_TYPES, 'application/pdf']);
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
 
-// Local-disk storage for dev. Swap for S3/Cloudinary before production — this
-// won't survive a redeploy on most hosts and doesn't scale past one instance.
-// TODO(ISLE-105): swap for S3 + pre-signed short-lived URLs and encryption
-// at rest before this handles real KYC documents in production — tracked
-// separately since it needs real AWS credentials this environment doesn't have.
-const storage = multer.diskStorage({
+// Local-disk public product storage for development. Production still needs a
+// dedicated public-media object store.
+const publicStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
@@ -31,8 +29,16 @@ const storage = multer.diskStorage({
   },
 });
 
+const privateKycStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, PRIVATE_KYC_DIR),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+    cb(null, `${randomUUID()}${ext}`);
+  },
+});
+
 const upload = multer({
-  storage,
+  storage: publicStorage,
   limits: { fileSize: MAX_FILE_SIZE_BYTES },
   fileFilter: (_req, file, cb) => {
     if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
@@ -43,10 +49,11 @@ const upload = multer({
   },
 });
 
-// Same disk storage, but also accepts PDF — used to receive onboarding KYC
-// documents alongside each portal's form fields in one multipart submission.
+// Private local storage accepts PDF and images for onboarding. It is never
+// mounted by express.static; production still needs encrypted private object
+// storage plus short-lived, authorized retrieval.
 export const kycUpload = multer({
-  storage,
+  storage: privateKycStorage,
   limits: { fileSize: MAX_FILE_SIZE_BYTES },
   fileFilter: (_req, file, cb) => {
     if (!ALLOWED_KYC_MIME_TYPES.has(file.mimetype)) {
