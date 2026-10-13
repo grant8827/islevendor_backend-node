@@ -2,13 +2,16 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
-import { requireAuth, requireRole } from '../../middleware/auth.js';
+import { requireAuth, requireRole, type AuthTokenPayload } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { assertWarehouseAccess } from '../../lib/warehouseAccess.js';
 import { getSocketServer } from '../../lib/socket.js';
 import { offerJobToDrivers, claimJobForDriver } from './dispatch.gateway.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
 import { env } from '../../env.js';
+import { toOrderDto } from '../../lib/orderAccess.js';
+import { isEligibleDriver } from '../../lib/driverEligibility.js';
+import { consumePickupToken, issuePickupToken, verifyPickupToken } from '../../lib/pickupToken.js';
 
 export const dispatchRouter = Router();
 
@@ -18,6 +21,27 @@ const DISPATCH_RADIUS_METERS = 10_000;
 // LIMIT-less query is one to avoid regardless.
 const MAX_DRIVERS_OFFERED = 20;
 
+/** Loads an order and confirms `user` is the shop/warehouse that packs it. */
+async function loadOrderForSeller(orderId: string, user: AuthTokenPayload) {
+  const existing = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { shop: true },
+  });
+  if (!existing) throw new HttpError(404, 'Order not found');
+
+  if (existing.shopId) {
+    if (existing.shop?.userId !== user.sub && user.role !== UserRole.ADMIN) {
+      throw new HttpError(403, 'You do not own this order');
+    }
+  } else if (existing.warehouseId) {
+    // Warehouse staff pack and dispatch orders too, not just the owner.
+    await assertWarehouseAccess(existing.warehouseId, user);
+  } else {
+    throw new HttpError(403, 'You do not own this order');
+  }
+  return existing;
+}
+
 // Warehouse (or shop) finishes packing -> broadcast a JOB_OFFER to every
 // online, KYC-approved driver within 10km at once (up to MAX_DRIVERS_OFFERED);
 // first to accept gets it (see dispatch.gateway.ts's driver:acceptJob). The
@@ -26,22 +50,7 @@ const MAX_DRIVERS_OFFERED = 20;
 // same time rather than one at a time.
 dispatchRouter.post('/orders/:id/ready', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.STORE, UserRole.ADMIN), async (req, res, next) => {
   try {
-    const existing = await prisma.order.findUnique({
-      where: { id: String(req.params.id) },
-      include: { shop: true },
-    });
-    if (!existing) throw new HttpError(404, 'Order not found');
-
-    if (existing.shopId) {
-      if (existing.shop?.userId !== req.user!.sub && req.user!.role !== UserRole.ADMIN) {
-        throw new HttpError(403, 'You do not own this order');
-      }
-    } else if (existing.warehouseId) {
-      // Warehouse staff pack and dispatch orders too, not just the owner.
-      await assertWarehouseAccess(existing.warehouseId, req.user!);
-    } else {
-      throw new HttpError(403, 'You do not own this order');
-    }
+    const existing = await loadOrderForSeller(String(req.params.id), req.user!);
 
     const order = await prisma.order.update({
       where: { id: existing.id },
@@ -175,6 +184,25 @@ dispatchRouter.post('/orders/:id/note', requireAuth, requireRole(UserRole.DRIVER
   }
 });
 
+// Mints the signed, expiring token a shipping label's QR code carries (see
+// printLabel.js and lib/pickupToken.ts). Called each time the seller prints
+// a label; printing again invalidates the earlier label's token.
+dispatchRouter.post('/orders/:id/pickup-token', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.STORE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const order = await loadOrderForSeller(String(req.params.id), req.user!);
+    if (order.status !== 'PACKING' && order.status !== 'READY_FOR_PICKUP') {
+      throw new HttpError(409, `A pickup label can't be issued for this order (status: ${order.status.replaceAll('_', ' ')})`);
+    }
+    res.status(201).json(await issuePickupToken(order.id));
+  } catch (err) {
+    next(err);
+  }
+});
+
+const scanPickupSchema = z.object({
+  token: z.string().min(1).max(200).optional(),
+});
+
 // Confirms physical pickup by scanning the QR code printed on the shipping
 // label (see printLabel.js) — a second path into PICKED_UP alongside the
 // in-app driver:acceptJob accept, for a driver who's physically holding the
@@ -182,19 +210,38 @@ dispatchRouter.post('/orders/:id/note', requireAuth, requireRole(UserRole.DRIVER
 // claims it, same as accepting in-app (see claimJobForDriver); re-scanning
 // by the same already-assigned driver is a harmless no-op that just returns
 // the order again, so this page can be safely reloaded/rescanned.
-dispatchRouter.post('/orders/:id/scan-pickup', requireAuth, requireRole(UserRole.DRIVER, UserRole.ADMIN), async (req, res, next) => {
+//
+// Claiming needs the label's signed token, not just the order id in the URL
+// — the token is the proof of holding the physical label — and it's burned
+// on the first successful claim. Every failure a non-assigned caller can hit
+// returns the same 403, so this endpoint can't be used to probe order ids.
+dispatchRouter.post('/orders/:id/scan-pickup', requireAuth, requireRole(UserRole.DRIVER), async (req, res, next) => {
   try {
     const orderId = String(req.params.id);
-    const order = await prisma.order.findUnique({ where: { id: orderId } });
-    if (!order) throw new HttpError(404, 'Order not found');
+    const { token } = scanPickupSchema.parse(req.body ?? {});
+    const denied = new HttpError(403, 'This pickup code is invalid or has expired — ask the seller to reprint the label');
 
-    if (order.status === 'READY_FOR_PICKUP') {
-      const claimed = await claimJobForDriver(getSocketServer(), orderId, req.user!.sub, 'Picked up (QR scan)');
-      if (!claimed) throw new HttpError(409, 'This package was just claimed by another driver');
-    } else if (!(order.status === 'PICKED_UP' && order.driverId === req.user!.sub)) {
-      throw new HttpError(409, `This package can't be picked up right now (status: ${order.status.replaceAll('_', ' ')})`);
+    if (!(await isEligibleDriver(req.user!))) {
+      throw new HttpError(403, 'Your driver account is not approved for deliveries yet');
     }
 
+    const order = /^[0-9a-f-]{36}$/i.test(orderId) ? await prisma.order.findUnique({ where: { id: orderId } }) : null;
+    const alreadyMine = order?.status === 'PICKED_UP' && order.driverId === req.user!.sub;
+
+    if (!alreadyMine) {
+      const nonce = order ? await verifyPickupToken(orderId, token) : null;
+      if (!order || !nonce) throw denied;
+
+      if (order.status !== 'READY_FOR_PICKUP') {
+        throw new HttpError(409, `This package can't be picked up right now (status: ${order.status.replaceAll('_', ' ')})`);
+      }
+      const claimed = await claimJobForDriver(getSocketServer(), orderId, req.user!.sub, 'Picked up (QR scan)');
+      if (!claimed) throw new HttpError(409, 'This package was just claimed by another driver');
+      await consumePickupToken(orderId, nonce);
+    }
+
+    // The driver's slice of the order (see lib/orderAccess.ts) plus who and
+    // what they're delivering — not the seller/platform money split.
     const full = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
       include: {
@@ -203,7 +250,8 @@ dispatchRouter.post('/orders/:id/scan-pickup', requireAuth, requireRole(UserRole
         shopProduct: { select: { title: true } },
       },
     });
-    res.json(full);
+    const { customer, storeListing, shopProduct, ...order_ } = full;
+    res.json({ ...toOrderDto(order_, 'DRIVER'), customer, storeListing, shopProduct });
   } catch (err) {
     next(err);
   }
