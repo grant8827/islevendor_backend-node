@@ -3,7 +3,8 @@ import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { loginUser, registerUser } from './auth.service.js';
-import { requireAuth } from '../../middleware/auth.js';
+import { requireAuth, signAuthToken } from '../../middleware/auth.js';
+import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 
@@ -86,8 +87,29 @@ authRouter.patch('/password', requireAuth, async (req, res, next) => {
     }
 
     const passwordHash = await bcrypt.hash(input.newPassword, 12);
-    await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
-    res.json({ message: 'Password updated successfully' });
+    // Changing the password signs out every other device — if it was changed
+    // because someone else had it, their session must not outlive it. This
+    // device gets a fresh token in the response so it stays signed in.
+    const tokenVersion = await prisma.$transaction(async (tx) => {
+      await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
+      return revokeUserSessions(user.id, tx);
+    });
+    disconnectUserSockets(user.id);
+    res.json({
+      message: 'Password updated successfully',
+      token: signAuthToken({ sub: user.id, role: user.role, ver: tokenVersion }),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// "Sign out everywhere" — for a lost phone or a login left open somewhere.
+// Every token issued so far stops working, this one included.
+authRouter.post('/sessions/revoke', requireAuth, async (req, res, next) => {
+  try {
+    await revokeUserSessions(req.user!.sub);
+    res.status(204).end();
   } catch (err) {
     next(err);
   }

@@ -75,11 +75,11 @@ export async function loginUser(email: string, password: string) {
     throw new HttpError(401, 'Invalid email or password');
   }
 
-  const token = signAuthToken({ sub: user.id, role: user.role });
+  const token = signAuthToken({ sub: user.id, role: user.role, ver: user.tokenVersion });
   return { user: sanitizeUser(user), token };
 }
 
-function sanitizeUser<T extends { passwordHash: string }>(user: T) {
-  const { passwordHash: _passwordHash, ...safe } = user;
+function sanitizeUser<T extends { passwordHash: string; tokenVersion: number }>(user: T) {
+  const { passwordHash: _passwordHash, tokenVersion: _tokenVersion, ...safe } = user;
   return safe;
 }

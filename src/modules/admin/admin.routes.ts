@@ -6,8 +6,10 @@ import { requireAuth } from '../../middleware/auth.js';
 import { requireCurrentAdmin } from '../../middleware/requireAdmin.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { loadDocumentReferences, type ApplicantType } from '../../lib/kycDocuments.js';
+import { recordAuditEvent } from '../../lib/audit.js';
+import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 
-// The superadmin console's API (frontend: pages/admin). Read-side only so
+// The superadmin console's API (frontend: pages/admin). Mostly read-side so
 // far, plus the applicant review flow — the decision itself and the KYC
 // document links live with the rest of onboarding, in onboarding.routes.ts.
 export const adminRouter = Router();
@@ -212,6 +214,26 @@ adminRouter.get('/users', async (req, res, next) => {
       }),
     ]);
     res.json({ total, page, pageSize: PAGE_SIZE, users });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Signs a user out of every device — the response to a suspected
+// compromised account, or to anything that should take effect before the
+// user's current token would expire. Audited in the same transaction.
+adminRouter.post('/users/:id/revoke-sessions', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const reason = z.string().trim().min(1, 'A reason is required').max(500).parse(req.body?.reason);
+    if (!(await prisma.user.findUnique({ where: { id }, select: { id: true } }))) throw new HttpError(404, 'User not found');
+
+    await prisma.$transaction(async (tx) => {
+      await revokeUserSessions(id, tx);
+      await recordAuditEvent(req, { action: 'user.sessions_revoked', targetType: 'user', targetId: id, metadata: { reason } }, tx);
+    });
+    disconnectUserSockets(id);
+    res.status(204).end();
   } catch (err) {
     next(err);
   }

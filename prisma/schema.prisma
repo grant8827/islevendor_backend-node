@@ -67,6 +67,10 @@ model User {
   // owner's admins may reset its password. Null for every self-registered
   // account.
   staffOfUserId String?  @map("staff_of_user_id") @db.Uuid
+  // Bumped to sign the user out everywhere — a login token is only accepted
+  // while the version it was issued under still matches (see
+  // middleware/auth.ts and lib/sessions.ts).
+  tokenVersion  Int      @default(0) @map("token_version")
 
   staffOf              User?             @relation("StaffOwner", fields: [staffOfUserId], references: [id], onDelete: SetNull)
   staffAccounts        User[]            @relation("StaffOwner")
