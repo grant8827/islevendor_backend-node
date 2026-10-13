@@ -38,7 +38,8 @@ type UploadedFiles = Record<string, Express.Multer.File[] | undefined>;
 
 function fileUrl(files: UploadedFiles, field: string): string | undefined {
   const file = files[field]?.[0];
-  return file ? `/uploads/${file.filename}` : undefined;
+  // Opaque reference to a private object. It is deliberately not an HTTP URL.
+  return file ? `private-kyc://${file.filename}` : undefined;
 }
 
 function requireFileUrl(files: UploadedFiles, field: string, label: string): string {

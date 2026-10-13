@@ -8,6 +8,7 @@ import { assertWarehouseAccess } from '../../lib/warehouseAccess.js';
 import { getSocketServer } from '../../lib/socket.js';
 import { offerJobToDrivers, claimJobForDriver } from './dispatch.gateway.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
+import { env } from '../../env.js';
 
 export const dispatchRouter = Router();
 
@@ -109,20 +110,22 @@ dispatchRouter.post('/orders/:id/delivered', requireAuth, requireRole(UserRole.D
       // still swept up by ledger.service.ts's withdrawBalance/refundOrder
       // either way, but refundOrder in particular decides which column to
       // subtract from based on escrow_state, so the two must stay in sync.
-      const legs = await tx.ledgerTransaction.findMany({
-        where: { orderId: order.id, escrowState: 'HELD_IN_ESCROW', reversedAt: null, payoutId: null },
-      });
-      for (const leg of legs) {
-        await tx.$executeRaw`
-          UPDATE ledger_accounts
-          SET pending_balance_jmd = pending_balance_jmd - ${leg.amountJmd}, available_balance_jmd = available_balance_jmd + ${leg.amountJmd}
-          WHERE id = ${leg.recipientAccountId}::uuid;
-        `;
+      if (env.ENABLE_ESCROW_RELEASE) {
+        const legs = await tx.ledgerTransaction.findMany({
+          where: { orderId: order.id, escrowState: 'HELD_IN_ESCROW', reversedAt: null, payoutId: null },
+        });
+        for (const leg of legs) {
+          await tx.$executeRaw`
+            UPDATE ledger_accounts
+            SET pending_balance_jmd = pending_balance_jmd - ${leg.amountJmd}, available_balance_jmd = available_balance_jmd + ${leg.amountJmd}
+            WHERE id = ${leg.recipientAccountId}::uuid;
+          `;
+        }
+        await tx.ledgerTransaction.updateMany({
+          where: { id: { in: legs.map((leg) => leg.id) } },
+          data: { escrowState: 'DISBURSED_TO_BANK' },
+        });
       }
-      await tx.ledgerTransaction.updateMany({
-        where: { id: { in: legs.map((leg) => leg.id) } },
-        data: { escrowState: 'DISBURSED_TO_BANK' },
-      });
 
       return updatedOrder;
     });

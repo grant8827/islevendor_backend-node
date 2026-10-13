@@ -34,15 +34,17 @@ app.use(express.json());
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'backend-node' }));
 
-// Uploaded images — same-origin in normal use (frontend proxies /uploads to
-// here), but relax helmet's default CORP so an <img> tag can also load these
-// directly cross-origin if something ever points at the API host instead.
-app.use(
-  '/uploads',
-  express.static(UPLOADS_DIR, {
-    setHeaders: (res) => res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin'),
-  }),
-);
+// Legacy local product media. Disabled by default because this directory
+// historically also received KYC files; never enable it until those objects
+// have been classified and migrated out.
+if (env.SERVE_PUBLIC_UPLOADS) {
+  app.use(
+    '/uploads',
+    express.static(UPLOADS_DIR, {
+      setHeaders: (res) => res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin'),
+    }),
+  );
+}
 
 app.use('/api/auth', authRouter);
 app.use('/api/warehouse', warehouseRouter);

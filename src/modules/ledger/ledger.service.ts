@@ -22,8 +22,8 @@ export interface WiPayWebhookPayload {
  */
 export function verifyWiPayHash(payload: WiPayWebhookPayload): boolean {
   if (!env.WIPAY_API_KEY) {
-    console.warn('[wipay] WIPAY_API_KEY not set — skipping hash verification (dev only)');
-    return env.NODE_ENV !== 'production';
+    console.error('[wipay] WIPAY_API_KEY is not configured; rejecting callback');
+    return false;
   }
   const expected = crypto
     .createHash('md5')
@@ -46,6 +46,9 @@ export function verifyWiPayHash(payload: WiPayWebhookPayload): boolean {
  * webhook delivery is a no-op rather than a double-credit.
  */
 export async function processWiPayWebhook(payload: WiPayWebhookPayload) {
+  if (!env.ENABLE_WIPAY_WEBHOOKS) {
+    throw new HttpError(503, 'WiPay webhook processing is temporarily disabled');
+  }
   if (!verifyWiPayHash(payload)) {
     throw new HttpError(400, 'Invalid WiPay signature');
   }
@@ -172,6 +175,9 @@ export async function processWiPayWebhook(payload: WiPayWebhookPayload) {
  * own state.
  */
 export async function refundOrder(orderId: string, initiatedByUserId: string, reason: string) {
+  if (!env.ENABLE_INTERNAL_REFUNDS) {
+    throw new HttpError(503, 'Refund processing is temporarily disabled');
+  }
   return prisma.$transaction(async (tx) => {
     const order = await tx.order.findUnique({ where: { id: orderId } });
     if (!order) throw new HttpError(404, 'Order not found');
@@ -226,6 +232,9 @@ export async function refundOrder(orderId: string, initiatedByUserId: string, re
  * it permanently a no-op today.
  */
 export async function withdrawBalance(userId: string) {
+  if (!env.ENABLE_WITHDRAWALS) {
+    throw new HttpError(503, 'Withdrawals are temporarily disabled');
+  }
   return prisma.$transaction(async (tx) => {
     const accounts = await tx.ledgerAccount.findMany({ where: { userId } });
     if (accounts.length === 0) throw new HttpError(404, 'No ledger account found for this user');

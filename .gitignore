@@ -9,5 +9,7 @@ npm-debug.log*
 
 uploads/*
 !uploads/.gitkeep
+private-kyc/*
+!private-kyc/.gitkeep
 
 .DS_Store
