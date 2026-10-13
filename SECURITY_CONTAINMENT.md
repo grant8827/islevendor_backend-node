@@ -51,8 +51,12 @@ That is not yet enough to enable any flag in production:
 ## Registration and uploads
 
 - `/api/auth/register` accepts only `CUSTOMER`. Marketplace roles must use
-  their controlled onboarding flows; administrator accounts require separate
-  audited provisioning tooling.
+  their controlled onboarding flows.
+- Administrator accounts are created only with
+  `npm run admin:create -- --email <email> --name "<name>" --phone <phone>`,
+  run by an operator against the target database. It prints a generated
+  password once and writes an `admin.created` audit event. Admin routes check
+  the account's current role on every request, not the role in the token.
 - New KYC files are written under `private-kyc/` and represented in the database
   by opaque `private-kyc://` references.
 - `SERVE_PUBLIC_UPLOADS` defaults to `false`. This also hides legacy public
