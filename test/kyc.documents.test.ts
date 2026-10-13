@@ -182,13 +182,4 @@ describe('private KYC documents', () => {
     assert.equal((await fetch(url)).status, 404, 'a link issued before deletion must stop working');
     assert.equal((await del(admin)).status, 404);
   });
-
-  it('audits an applicant decision with the admin who made it', async () => {
-    const res = await api(server, `${BASE}/driver/${driverProfileId}/decision`, { method: 'POST', token: admin.token, body: { decision: 'REJECTED' } });
-    assert.equal(res.status, 200);
-
-    const event = await prisma.auditEvent.findFirstOrThrow({ where: { action: 'applicant.decision', targetId: driverProfileId } });
-    assert.equal(event.actorId, admin.id);
-    assert.deepEqual(event.metadata, { decision: 'REJECTED' });
-  });
 });

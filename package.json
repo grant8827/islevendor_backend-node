@@ -15,7 +15,8 @@
     "test": "node --import ./test/setup-env.mjs --import tsx --test \"test/**/*.test.ts\"",
     "test:db:prepare": "node --import ./test/setup-env.mjs node_modules/prisma/build/index.js migrate deploy",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p test/tsconfig.json",
-    "kyc:migrate-legacy": "tsx prisma/migrateLegacyKyc.ts"
+    "kyc:migrate-legacy": "tsx prisma/migrateLegacyKyc.ts",
+    "admin:create": "tsx prisma/createAdmin.ts"
   },
   "keywords": [],
   "author": "",

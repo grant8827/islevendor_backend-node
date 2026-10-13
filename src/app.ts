@@ -20,6 +20,7 @@ import { shopRouter } from './modules/shop/shop.routes.js';
 import { ratingsRouter } from './modules/ratings/ratings.routes.js';
 import { onboardingRouter } from './modules/onboarding/onboarding.routes.js';
 import { driversRouter } from './modules/drivers/drivers.routes.js';
+import { adminRouter } from './modules/admin/admin.routes.js';
 
 const app = express();
 
@@ -58,6 +59,7 @@ app.use('/api/uploads', uploadsRouter);
 app.use('/api/shop', shopRouter);
 app.use('/api/ratings', ratingsRouter);
 app.use('/api/drivers', driversRouter);
+app.use('/api/admin', adminRouter);
 // Versioned per ISLE-105's spec (the rest of the API is unversioned) — the
 // four public onboarding portals + admin review queue.
 app.use('/api/v1/onboarding', onboardingRouter);
