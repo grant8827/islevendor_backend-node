@@ -59,8 +59,26 @@ That is not yet enough to enable any flag in production:
   product media because the historical directory mixed product and KYC files.
   Do not enable it on an environment containing legacy KYC documents.
 
-An authorized private-document retrieval endpoint and object storage are still
-required before administrators can review new KYC documents in production.
+### Reviewing KYC documents
+
+Administrators reach documents only through `/api/v1/onboarding`:
+
+- `GET /:type/:id/documents` lists which documents an applicant has on file.
+- `POST /:type/:id/documents/:kind/access` returns a link valid for two
+  minutes and writes a `kyc_document.access_granted` audit event.
+- `DELETE /:type/:id/documents/:kind` removes the file and its reference and
+  writes a `kyc_document.deleted` audit event.
+
+Documents uploaded before the split still sit in `uploads/` under a
+`/uploads/...` reference. They are reviewable through the same links.
+`npm run kyc:migrate-legacy` reports them; with `-- --apply` it moves each
+into `private-kyc/`. Run it on the host that holds the upload files. Every
+reference it reports was publicly fetchable while `/uploads` was served, so
+treat those documents as exposed.
+
+Still required: encrypted private object storage in place of local disk, and
+a retention period after which rejected or withdrawn applicants' documents
+are deleted.
 
 ## Deployment and rollback
 

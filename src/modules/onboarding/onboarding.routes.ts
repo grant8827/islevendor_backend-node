@@ -8,6 +8,16 @@ import { kycUpload } from '../uploads/uploads.routes.js';
 import { trnSchema } from '../../lib/trn.js';
 import { PARISHES, type Parish } from '../../lib/parishes.js';
 import { verifyKycDocument, type KycDocumentType, type DocumentCheckResult } from '../../lib/ocrClient.js';
+import { recordAuditEvent } from '../../lib/audit.js';
+import {
+  deleteDocument,
+  documentKindsFor,
+  issueDocumentLink,
+  loadDocumentReferences,
+  resolveStoredDocument,
+  verifyDocumentLink,
+  type ApplicantType,
+} from '../../lib/kycDocuments.js';
 import {
   registerWarehouseApplicant,
   registerResellerApplicant,
@@ -405,27 +415,136 @@ const applicantTypeSchema = z.enum(['warehouse', 'reseller', 'small-vendor', 'dr
 const decisionSchema = z.enum(['APPROVED', 'REJECTED']);
 
 // One decision endpoint for all four applicant types — DRY rather than four
-// near-identical approve/reject route pairs.
+// near-identical approve/reject route pairs. The decision and its audit
+// record are one transaction.
 onboardingRouter.post('/:type/:id/decision', requireAuth, requireRole(UserRole.ADMIN), async (req, res, next) => {
   try {
     const type = applicantTypeSchema.parse(req.params.type);
     const id = z.string().uuid().parse(req.params.id);
     const applicantStatus = decisionSchema.parse(req.body.decision);
 
-    const updated = await (() => {
-      switch (type) {
-        case 'warehouse':
-          return prisma.warehouse.update({ where: { id }, data: { applicantStatus } });
-        case 'reseller':
-          return prisma.resellerStore.update({ where: { id }, data: { applicantStatus } });
-        case 'small-vendor':
-          return prisma.shop.update({ where: { id }, data: { applicantStatus } });
-        case 'driver':
-          return prisma.driverProfile.update({ where: { id }, data: { applicantStatus } });
-      }
-    })();
+    const updated = await prisma.$transaction(async (tx) => {
+      const record = await (() => {
+        switch (type) {
+          case 'warehouse':
+            return tx.warehouse.update({ where: { id }, data: { applicantStatus } });
+          case 'reseller':
+            return tx.resellerStore.update({ where: { id }, data: { applicantStatus } });
+          case 'small-vendor':
+            return tx.shop.update({ where: { id }, data: { applicantStatus } });
+          case 'driver':
+            return tx.driverProfile.update({ where: { id }, data: { applicantStatus } });
+        }
+      })();
+      await recordAuditEvent(req, { action: 'applicant.decision', targetType: type, targetId: id, metadata: { decision: applicantStatus } }, tx);
+      return record;
+    });
 
     res.json({ id: updated.id, applicantStatus: updated.applicantStatus });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Applicant KYC documents — private. Nothing here is reachable through a
+// static file mount; see lib/kycDocuments.ts for how a document is addressed
+// and where it lives.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Parses the (type, id, kind) a document route is addressed by and loads its stored reference. */
+async function loadDocumentParams(params: Record<string, unknown>) {
+  const type: ApplicantType = applicantTypeSchema.parse(params.type);
+  const id = z.string().uuid().parse(params.id);
+  const references = await loadDocumentReferences(type, id);
+  if (!references) throw new HttpError(404, 'Applicant not found');
+  return { type, id, references };
+}
+
+function requireDocumentKind(type: ApplicantType, kind: unknown): string {
+  if (typeof kind !== 'string' || !documentKindsFor(type).includes(kind)) {
+    throw new HttpError(404, 'Unknown document type for this applicant');
+  }
+  return kind;
+}
+
+// Which documents an applicant has on file — the reviewer's starting point.
+// Lists kinds only, never the stored references themselves.
+onboardingRouter.get('/:type/:id/documents', requireAuth, requireRole(UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const { references } = await loadDocumentParams(req.params);
+    res.json(Object.entries(references).map(([kind, reference]) => ({ kind, onFile: reference !== null })));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// An admin asks to view one document and gets back a link that works on its
+// own for DOCUMENT_LINK_TTL_SECONDS (an <img> or embedded PDF can't send an
+// Authorization header). Every grant is audited — this, not the link's
+// later use, is the access decision.
+onboardingRouter.post('/:type/:id/documents/:kind/access', requireAuth, requireRole(UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const { type, id, references } = await loadDocumentParams(req.params);
+    const kind = requireDocumentKind(type, req.params.kind);
+    if (!resolveStoredDocument(references[kind])) throw new HttpError(404, 'No document on file');
+
+    await recordAuditEvent(req, { action: 'kyc_document.access_granted', targetType: type, targetId: id, metadata: { kind } });
+    const { token, expiresAt } = issueDocumentLink({ type, id, kind, actorId: req.user!.sub });
+    res.status(201).json({ url: `${req.protocol}://${req.get('host')}/api/v1/onboarding/documents/view/${token}`, expiresAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Where an access link points. No session: the signed, expiring token *is*
+// the authorization. The reference is looked up again here, so a document
+// deleted after a link was issued is gone immediately, not when the link
+// expires.
+onboardingRouter.get('/documents/view/:token', async (req, res, next) => {
+  try {
+    const claims = verifyDocumentLink(String(req.params.token));
+    if (!claims) throw new HttpError(403, 'This document link is invalid or has expired');
+
+    const references = await loadDocumentReferences(claims.type, claims.id);
+    const stored = resolveStoredDocument(references?.[claims.kind] ?? null);
+    if (!stored) throw new HttpError(404, 'No document on file');
+
+    res.sendFile(
+      stored.absolutePath,
+      {
+        dotfiles: 'deny',
+        headers: {
+          'Content-Type': stored.contentType,
+          'Content-Disposition': `inline; filename="${claims.kind}${stored.filename.slice(stored.filename.lastIndexOf('.'))}"`,
+          'Cache-Control': 'private, no-store',
+          'X-Content-Type-Options': 'nosniff',
+          // The admin console is a different origin from this API; without
+          // this, helmet's default same-origin policy blocks the embed.
+          'Cross-Origin-Resource-Policy': 'cross-origin',
+        },
+      },
+      (err) => {
+        if (err && !res.headersSent) next(new HttpError(404, 'No document on file'));
+      },
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Permanently removes one document — the deletion path for a withdrawn or
+// rejected application, or a data-subject request. Audited before the file
+// is touched, so a delete can't happen without a record of who asked.
+onboardingRouter.delete('/:type/:id/documents/:kind', requireAuth, requireRole(UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const { type, id, references } = await loadDocumentParams(req.params);
+    const kind = requireDocumentKind(type, req.params.kind);
+    if (!references[kind]) throw new HttpError(404, 'No document on file');
+
+    await recordAuditEvent(req, { action: 'kyc_document.deleted', targetType: type, targetId: id, metadata: { kind } });
+    await deleteDocument(type, id, kind, references[kind]);
+    res.status(204).end();
   } catch (err) {
     next(err);
   }

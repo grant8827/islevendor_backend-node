@@ -83,6 +83,7 @@ model User {
   productRatings       ProductRating[]
   refundsIssued        Refund[]             @relation("RefundInitiator")
   trackingEventsPosted OrderTrackingEvent[] @relation("TrackingEventPoster")
+  auditEvents          AuditEvent[]         @relation("AuditActor")
 
   @@map("users")
 }
@@ -943,4 +944,26 @@ model PaymentEvent {
   @@unique([provider, providerEventId])
   @@index([orderId])
   @@map("payment_events")
+}
+
+// Append-only record of privileged actions — who did what to which record,
+// and when. Written through src/lib/audit.ts; nothing updates or deletes
+// these rows. `action` is a dotted name ("kyc_document.access_granted"),
+// `targetType`/`targetId` the record acted on, `metadata` whatever detail
+// that action needs (which document, the decision made, …).
+model AuditEvent {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  targetType String   @map("target_type")
+  targetId   String   @map("target_id")
+  metadata   Json     @default("{}")
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([targetType, targetId, createdAt])
+  @@index([actorId, createdAt])
+  @@map("audit_events")
 }
