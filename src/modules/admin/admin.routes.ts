@@ -7,6 +7,7 @@ import { requireCurrentAdmin } from '../../middleware/requireAdmin.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { loadDocumentReferences, type ApplicantType } from '../../lib/kycDocuments.js';
 import { recordAuditEvent } from '../../lib/audit.js';
+import { getIsleDashRate, setIsleDashRate } from '../../lib/platformSettings.js';
 import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 
 // The superadmin console's API (frontend: pages/admin). Mostly read-side so
@@ -282,6 +283,48 @@ adminRouter.get('/orders', async (req, res, next) => {
       }),
     ]);
     res.json({ total, page, pageSize: PAGE_SIZE, orders });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Platform settings ───────────────────────────────────────────────────────
+
+adminRouter.get('/settings/isledash', async (_req, res, next) => {
+  try {
+    const rate = await getIsleDashRate();
+    res.json({ baseFeeJmd: rate.baseFeeJmd.toFixed(2), extraItemPercent: rate.extraItemPercent });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const isleDashRateSchema = z.object({
+  baseFeeJmd: z.number().min(0).max(100_000),
+  extraItemPercent: z.number().int().min(0).max(100),
+});
+
+// IsleDash delivery pricing: the first item's fee and the % each further
+// item from the same seller costs. Applies to checkouts from now on; orders
+// already placed keep what they were charged. Audited with before and after.
+adminRouter.put('/settings/isledash', async (req, res, next) => {
+  try {
+    const input = isleDashRateSchema.parse(req.body);
+    await prisma.$transaction(async (tx) => {
+      const before = await getIsleDashRate(tx);
+      await setIsleDashRate(input, req.user!.sub, tx);
+      await recordAuditEvent(
+        req,
+        {
+          action: 'settings.isledash_rate_changed',
+          targetType: 'platform_settings',
+          targetId: 'default',
+          metadata: { before: { baseFeeJmd: before.baseFeeJmd.toFixed(2), extraItemPercent: before.extraItemPercent }, after: input },
+        },
+        tx,
+      );
+    });
+    res.json({ baseFeeJmd: input.baseFeeJmd.toFixed(2), extraItemPercent: input.extraItemPercent });
   } catch (err) {
     next(err);
   }

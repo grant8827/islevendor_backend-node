@@ -249,15 +249,18 @@ model Warehouse {
   // ── Delivery options this business offers customers at checkout (see
   // src/lib/deliveryOptions.ts). A reseller's orders ship from the
   // warehouse, so these live on warehouses and shops, not reseller stores.
-  offersIsleDash       Boolean  @default(true) @map("offers_isledash")
-  offersSellerDelivery Boolean  @default(false) @map("offers_seller_delivery")
+  offersIsleDash                 Boolean  @default(true) @map("offers_isledash")
+  offersSellerDelivery           Boolean  @default(false) @map("offers_seller_delivery")
   // The business's own delivery: what it charges, and anything the customer
   // should know ("Kingston and St. Andrew only, same day before 3pm").
-  sellerDeliveryFeeJmd Decimal? @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
-  sellerDeliveryNote   String?  @map("seller_delivery_note")
+  sellerDeliveryFeeJmd           Decimal? @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  sellerDeliveryNote             String?  @map("seller_delivery_note")
+  // Each further item in the same checkout costs this % of the fee (the
+  // first is charged in full). 50 = "first item full, each extra half".
+  sellerDeliveryExtraItemPercent Int      @default(50) @map("seller_delivery_extra_item_percent")
   // Customer collects it themselves — always free.
-  offersPickup         Boolean  @default(false) @map("offers_pickup")
-  pickupInstructions   String?  @map("pickup_instructions")
+  offersPickup                   Boolean  @default(false) @map("offers_pickup")
+  pickupInstructions             String?  @map("pickup_instructions")
 
   user                 User                    @relation(fields: [userId], references: [id])
   products             MasterProduct[]
@@ -566,15 +569,18 @@ model Shop {
   // ── Delivery options this business offers customers at checkout (see
   // src/lib/deliveryOptions.ts). A reseller's orders ship from the
   // warehouse, so these live on warehouses and shops, not reseller stores.
-  offersIsleDash       Boolean  @default(true) @map("offers_isledash")
-  offersSellerDelivery Boolean  @default(false) @map("offers_seller_delivery")
+  offersIsleDash                 Boolean  @default(true) @map("offers_isledash")
+  offersSellerDelivery           Boolean  @default(false) @map("offers_seller_delivery")
   // The business's own delivery: what it charges, and anything the customer
   // should know ("Kingston and St. Andrew only, same day before 3pm").
-  sellerDeliveryFeeJmd Decimal? @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
-  sellerDeliveryNote   String?  @map("seller_delivery_note")
+  sellerDeliveryFeeJmd           Decimal? @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  sellerDeliveryNote             String?  @map("seller_delivery_note")
+  // Each further item in the same checkout costs this % of the fee (the
+  // first is charged in full). 50 = "first item full, each extra half".
+  sellerDeliveryExtraItemPercent Int      @default(50) @map("seller_delivery_extra_item_percent")
   // Customer collects it themselves — always free.
-  offersPickup         Boolean  @default(false) @map("offers_pickup")
-  pickupInstructions   String?  @map("pickup_instructions")
+  offersPickup                   Boolean  @default(false) @map("offers_pickup")
+  pickupInstructions             String?  @map("pickup_instructions")
 
   user                 User                  @relation(fields: [userId], references: [id])
   products             ShopProduct[]
@@ -734,6 +740,10 @@ model Order {
   // seller, unlike driverFeeJmd, which is held for an IsleDash driver. Zero
   // for every other method.
   sellerDeliveryFeeJmd    Decimal        @default(0) @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  // Orders for one seller placed in the same checkout share one shipping
+  // charge — first item full, extras at the multi-item rate — split across
+  // them; this ties them together. Null for orders placed one at a time.
+  checkoutGroupId         String?        @map("checkout_group_id") @db.Uuid
   status                  OrderStatus    @default(AWAITING_PAYMENT)
   deliveryAddress         String         @map("delivery_address")
   proofOfDeliveryImageUrl String?        @map("proof_of_delivery_image_url")
@@ -761,6 +771,7 @@ model Order {
   trackingEvents OrderTrackingEvent[]
   paymentEvents  PaymentEvent[]
 
+  @@index([checkoutGroupId])
   @@map("orders")
 }
 
@@ -1004,4 +1015,19 @@ model AuditEvent {
   @@index([targetType, targetId, createdAt])
   @@index([actorId, createdAt])
   @@map("audit_events")
+}
+
+// Platform-wide settings an IsleVendor admin manages. A single row, id
+// "default" (see lib/platformSettings.ts, which falls back to the same
+// defaults if it's ever missing).
+model PlatformSetting {
+  id                       String   @id
+  // IsleDash delivery: the fee for the first item, and what % of it each
+  // further item from the same seller in one checkout costs.
+  isleDashBaseFeeJmd       Decimal  @default(300) @map("isledash_base_fee_jmd") @db.Decimal(12, 2)
+  isleDashExtraItemPercent Int      @default(50) @map("isledash_extra_item_percent")
+  updatedAt                DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  updatedBy                String?  @map("updated_by") @db.Uuid
+
+  @@map("platform_settings")
 }

@@ -14,9 +14,10 @@ if (!['localhost', '127.0.0.1', '::1'].includes(hostname) || !pathname.endsWith(
   throw new Error(`Refusing to run tests against ${hostname}${pathname} — the test database must be local and named *_test`);
 }
 
-// Each test file is its own process with its own Prisma pool, all running at
-// once. Left at Prisma's default (2 x CPUs + 1 each) they can together exceed
-// Postgres's max_connections and fail at random; cap each file's share.
+// Each test file is its own process with its own Prisma pool. They run one
+// at a time (package.json's --test-concurrency=1, because some change shared
+// platform settings), but cap the pool anyway so a parallel run can't exceed
+// Postgres's max_connections.
 const pooledUrl = new URL(databaseUrl);
 if (!pooledUrl.searchParams.has('connection_limit')) pooledUrl.searchParams.set('connection_limit', '8');
 

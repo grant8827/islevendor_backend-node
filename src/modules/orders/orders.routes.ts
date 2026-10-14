@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { Decimal } from 'decimal.js';
@@ -11,12 +12,13 @@ import { assertOrderAccess, toOrderDto } from '../../lib/orderAccess.js';
 import { APPROVED_SELLER } from '../../lib/eligibility.js';
 import {
   DELIVERY_SETTINGS_SELECT,
-  deliveryFeesFor,
   deliveryOptionsFor,
+  perItemFees,
   pickupLocationOf,
-  type DeliveryOption,
+  requireRate,
   type DeliverySettings,
 } from '../../lib/deliveryOptions.js';
+import { getIsleDashRate } from '../../lib/platformSettings.js';
 
 export const ordersRouter = Router();
 
@@ -30,21 +32,7 @@ const lineSchema = z.object({
   masterProductId: z.string().uuid(),
   quantity: z.number().int().positive().max(999),
 });
-
-const checkoutSchema = lineSchema
-  .extend({
-    // Defaults to IsleDash so a client that predates delivery options keeps
-    // working — every business offered IsleDash before they existed.
-    deliveryMethod: deliveryMethodSchema.default('ISLEDASH'),
-    deliveryAddress: z.string().trim().min(1).optional(),
-  })
-  .refine((v) => v.deliveryMethod === 'PICKUP' || !!v.deliveryAddress, {
-    message: 'Enter a delivery address',
-    path: ['deliveryAddress'],
-  });
-
 type Line = z.infer<typeof lineSchema>;
-type CheckoutInput = z.infer<typeof checkoutSchema>;
 type Db = Prisma.TransactionClient | typeof prisma;
 
 // Only from businesses IsleVendor has approved — the same rule the
@@ -72,185 +60,267 @@ function findShopProduct(db: Db, line: Line) {
   });
 }
 
-type AffiliateListing = NonNullable<Awaited<ReturnType<typeof findAffiliateListing>>>;
-type ShopProductRow = NonNullable<Awaited<ReturnType<typeof findShopProduct>>>;
-
-// Priced live off the warehouse's current wholesale price/discount and
-// reseller commission %, not the (informational-only) snapshot stored on the
-// StoreListing at add-to-store time — see lib/pricing.ts and
-// commerce.routes.ts's normalizeAffiliateListing, which computes the same way
-// so what a customer is shown is always what they're charged.
-function priceAffiliate(listing: AffiliateListing, quantity: number) {
-  const { wholesaleTotalJmd, resellerMarginJmd, platformCommissionJmd, retailTotalJmd } = computeAffiliatePricing({
-    wholesalePriceJmd: listing.masterProduct.wholesalePriceJmd.toString(),
-    discountPercent: listing.masterProduct.discountPercent,
-    resellerCommissionPercent: listing.masterProduct.warehouse.resellerCommissionPercent,
-    quantity,
-  });
-  return { goodsTotalJmd: retailTotalJmd, wholesaleTotalJmd, resellerMarginJmd, platformCommissionJmd };
+/**
+ * One cart line, looked up and priced: what the customer pays for the goods,
+ * how that splits between warehouse/reseller/shop/platform, and — as
+ * `sellerKey` — which business packs and ships it. That's the shop for a
+ * shop item, and the warehouse behind a reseller's listing, whose delivery
+ * options therefore apply.
+ */
+interface ResolvedLine {
+  line: Line;
+  sellerKey: string;
+  sellerName: string;
+  seller: DeliverySettings;
+  stockQuantity: number;
+  stock: { table: 'master_products' | 'shop_products'; id: string };
+  goodsTotalJmd: Decimal;
+  wholesaleTotalJmd: Decimal;
+  resellerMarginJmd: Decimal;
+  platformCommissionJmd: Decimal;
+  orderFields: { resellerStoreId?: string; warehouseId?: string; storeListingId?: string; shopId?: string; shopProductId?: string };
 }
 
-// No wholesale/margin split for a shop's own stock — it keeps the full item
-// price (via resellerMarginJmd, reused as "seller's take" — see the Order
-// model comment), and the platform's commission is added on top.
-function priceShopProduct(product: ShopProductRow, quantity: number) {
-  const discountMultiplier = new Decimal(1).minus(new Decimal(product.discountPercent).dividedBy(100));
-  const discountedUnitPrice = new Decimal(product.priceJmd.toString()).times(discountMultiplier).toDecimalPlaces(2);
-  const itemTotal = discountedUnitPrice.times(quantity);
-  const platformCommissionJmd = itemTotal.times(PLATFORM_COMMISSION_RATE).toDecimalPlaces(2);
+async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
+  if (line.kind === 'STORE') {
+    const product = await findShopProduct(db, line);
+    if (!product) return null;
+    // No wholesale/margin split for a shop's own stock — it keeps the full
+    // item price (via resellerMarginJmd, reused as "seller's take" — see the
+    // Order model comment), and the platform's commission is added on top.
+    const discountMultiplier = new Decimal(1).minus(new Decimal(product.discountPercent).dividedBy(100));
+    const discountedUnitPrice = new Decimal(product.priceJmd.toString()).times(discountMultiplier).toDecimalPlaces(2);
+    const itemTotal = discountedUnitPrice.times(line.quantity);
+    const platformCommissionJmd = itemTotal.times(PLATFORM_COMMISSION_RATE).toDecimalPlaces(2);
+    return {
+      line,
+      sellerKey: `shop:${product.shop.id}`,
+      sellerName: product.shop.shopName,
+      seller: product.shop,
+      stockQuantity: product.stockQuantity,
+      stock: { table: 'shop_products', id: product.id },
+      goodsTotalJmd: itemTotal.plus(platformCommissionJmd),
+      wholesaleTotalJmd: new Decimal(0),
+      resellerMarginJmd: itemTotal,
+      platformCommissionJmd,
+      // shopProductId records exactly which item this was — the proof a
+      // DELIVERED order later needs to unlock rating it (ratings.routes.ts).
+      orderFields: { shopId: line.storeId, shopProductId: product.id },
+    };
+  }
+
+  const listing = await findAffiliateListing(db, line);
+  if (!listing) return null;
+  const { warehouse } = listing.masterProduct;
+  // Priced live off the warehouse's current wholesale price/discount and
+  // reseller commission %, not the informational snapshot on the
+  // StoreListing — see lib/pricing.ts and commerce.routes.ts's
+  // normalizeAffiliateListing, which computes the same way so what a
+  // customer is shown is always what they're charged.
+  const price = computeAffiliatePricing({
+    wholesalePriceJmd: listing.masterProduct.wholesalePriceJmd.toString(),
+    discountPercent: listing.masterProduct.discountPercent,
+    resellerCommissionPercent: warehouse.resellerCommissionPercent,
+    quantity: line.quantity,
+  });
   return {
-    goodsTotalJmd: itemTotal.plus(platformCommissionJmd),
-    wholesaleTotalJmd: new Decimal(0),
-    resellerMarginJmd: itemTotal,
-    platformCommissionJmd,
+    line,
+    sellerKey: `warehouse:${warehouse.id}`,
+    // Customers buy from the reseller; it ships from their supplier.
+    sellerName: `${listing.store.storeName} (ships from ${warehouse.parish})`,
+    seller: warehouse,
+    stockQuantity: listing.masterProduct.stockQuantity,
+    stock: { table: 'master_products', id: listing.masterProductId },
+    goodsTotalJmd: price.retailTotalJmd,
+    wholesaleTotalJmd: price.wholesaleTotalJmd,
+    resellerMarginJmd: price.resellerMarginJmd,
+    platformCommissionJmd: price.platformCommissionJmd,
+    orderFields: { resellerStoreId: line.storeId, warehouseId: warehouse.id, storeListingId: listing.id },
   };
 }
 
-/** Where a pickup order is collected, recorded as its delivery address so every seller view and label shows it. */
-function addressFor(input: CheckoutInput, seller: DeliverySettings): string {
-  return input.deliveryMethod === 'PICKUP' ? `Customer pickup: ${pickupLocationOf(seller)}` : input.deliveryAddress!;
+/** Lines grouped by the business that ships them, in cart order. */
+function groupBySeller(lines: ResolvedLine[]): Map<string, ResolvedLine[]> {
+  const groups = new Map<string, ResolvedLine[]>();
+  for (const line of lines) groups.set(line.sellerKey, [...(groups.get(line.sellerKey) ?? []), line]);
+  return groups;
 }
+
+const unitsOf = (lines: ResolvedLine[]) => lines.reduce((sum, l) => sum + l.line.quantity, 0);
 
 // Row-lock the product so two concurrent checkouts can't both pass the
 // stock check and oversell the last unit.
-async function reserveStock(tx: Prisma.TransactionClient, table: 'master_products' | 'shop_products', productId: string, quantity: number) {
-  const [locked] =
-    table === 'master_products'
-      ? await tx.$queryRaw<{ stock_quantity: number }[]>`SELECT stock_quantity FROM master_products WHERE id = ${productId}::uuid FOR UPDATE`
-      : await tx.$queryRaw<{ stock_quantity: number }[]>`SELECT stock_quantity FROM shop_products WHERE id = ${productId}::uuid FOR UPDATE`;
-  if (!locked || locked.stock_quantity < quantity) {
-    throw new HttpError(409, 'Not enough stock available');
-  }
+async function reserveStock(tx: Prisma.TransactionClient, { table, id }: ResolvedLine['stock'], quantity: number) {
   const updated =
     table === 'master_products'
-      ? await tx.$executeRaw`UPDATE master_products SET stock_quantity = stock_quantity - ${quantity} WHERE id = ${productId}::uuid AND stock_quantity >= ${quantity}`
-      : await tx.$executeRaw`UPDATE shop_products SET stock_quantity = stock_quantity - ${quantity} WHERE id = ${productId}::uuid AND stock_quantity >= ${quantity}`;
+      ? await tx.$executeRaw`UPDATE master_products SET stock_quantity = stock_quantity - ${quantity} WHERE id = ${id}::uuid AND stock_quantity >= ${quantity}`
+      : await tx.$executeRaw`UPDATE shop_products SET stock_quantity = stock_quantity - ${quantity} WHERE id = ${id}::uuid AND stock_quantity >= ${quantity}`;
   if (updated === 0) throw new HttpError(409, 'Not enough stock available');
 }
 
-async function checkoutAffiliate(tx: Prisma.TransactionClient, customerId: string, input: CheckoutInput) {
-  const listing = await findAffiliateListing(tx, input);
-  if (!listing) throw new HttpError(404, 'Listing not found or inactive');
-  // The warehouse packs and ships a reseller's orders, so its delivery
-  // options are the ones that apply.
-  const fees = deliveryFeesFor(listing.masterProduct.warehouse, input.deliveryMethod);
-
-  await reserveStock(tx, 'master_products', listing.masterProductId, input.quantity);
-  const price = priceAffiliate(listing, input.quantity);
-
-  const order = await tx.order.create({
-    data: {
-      customerId,
-      resellerStoreId: input.storeId,
-      warehouseId: listing.masterProduct.warehouseId,
-      // Records exactly which listing this was for — the proof a DELIVERED
-      // order later needs to unlock rating this item (see ratings.routes.ts).
-      storeListingId: listing.id,
-      quantity: input.quantity,
-      totalPaidJmd: price.goodsTotalJmd.plus(fees.driverFeeJmd).plus(fees.sellerDeliveryFeeJmd).toFixed(2),
-      wholesaleTotalJmd: price.wholesaleTotalJmd.toFixed(2),
-      resellerMarginJmd: price.resellerMarginJmd.toFixed(2),
-      driverFeeJmd: fees.driverFeeJmd.toFixed(2),
-      sellerDeliveryFeeJmd: fees.sellerDeliveryFeeJmd.toFixed(2),
-      platformCommissionJmd: price.platformCommissionJmd.toFixed(2),
-      deliveryMethod: input.deliveryMethod,
-      deliveryAddress: addressFor(input, listing.masterProduct.warehouse),
-      // status defaults to AWAITING_PAYMENT — flips to PACKING only once
-      // the WiPay webhook confirms payment (see ledger.service.ts).
-    },
+const checkoutSchema = z
+  .object({
+    items: z.array(lineSchema).min(1).max(50),
+    // One choice per business shipping something in this cart, keyed by the
+    // sellerKey POST /orders/quote returns.
+    deliveryMethods: z.record(z.string(), deliveryMethodSchema),
+    deliveryAddress: z.string().trim().min(1).max(500).optional(),
   });
-  await logTrackingEvent(tx, order.id, 'AWAITING_PAYMENT', { note: 'Order placed — awaiting payment' });
-  return order;
+type CheckoutInput = z.infer<typeof checkoutSchema>;
+
+/**
+ * Places a whole cart, all or nothing: one order per cart line, created in a
+ * single transaction, so a failure anywhere (out of stock, a seller no
+ * longer approved, an option it doesn't offer) leaves nothing behind.
+ *
+ * Shipping is charged per seller, not per line: each business's items share
+ * one delivery charge — the first item at the full fee, every further item
+ * at that rate's extra-item fee (see lib/deliveryOptions.ts) — split across
+ * its orders unit by unit, and tied together by checkoutGroupId.
+ */
+async function placeCheckout(customerId: string, input: CheckoutInput) {
+  return prisma.$transaction(async (tx) => {
+    const isleDashRate = await getIsleDashRate(tx);
+    const resolved: ResolvedLine[] = [];
+    for (const line of input.items) {
+      const r = await resolveLine(tx, line);
+      if (!r) throw new HttpError(404, 'An item in your cart is no longer available — refresh your cart');
+      resolved.push(r);
+    }
+
+    // Take stock in a fixed order (by product) so two checkouts holding the
+    // same products can't deadlock each other.
+    const byProduct = [...resolved].sort((a, b) => `${a.stock.table}:${a.stock.id}`.localeCompare(`${b.stock.table}:${b.stock.id}`));
+    for (const r of byProduct) await reserveStock(tx, r.stock, r.line.quantity);
+
+    const orders = [];
+    for (const [sellerKey, lines] of groupBySeller(resolved)) {
+      const method = input.deliveryMethods[sellerKey];
+      if (!method) throw new HttpError(400, `Choose how you want to get the items from ${lines[0].sellerName}`);
+      const rate = requireRate(lines[0].seller, method, isleDashRate);
+      if (method !== 'PICKUP' && !input.deliveryAddress) throw new HttpError(400, 'Enter a delivery address');
+
+      const unitFees = perItemFees(rate, unitsOf(lines));
+      const checkoutGroupId = randomUUID();
+      for (const r of lines) {
+        const fee = unitFees.splice(0, r.line.quantity).reduce((sum, f) => sum.plus(f), new Decimal(0));
+        const driverFee = method === 'ISLEDASH' ? fee : new Decimal(0);
+        const sellerDeliveryFee = method === 'SELLER_DELIVERY' ? fee : new Decimal(0);
+
+        const order = await tx.order.create({
+          data: {
+            customerId,
+            ...r.orderFields,
+            quantity: r.line.quantity,
+            totalPaidJmd: r.goodsTotalJmd.plus(fee).toFixed(2),
+            wholesaleTotalJmd: r.wholesaleTotalJmd.toFixed(2),
+            resellerMarginJmd: r.resellerMarginJmd.toFixed(2),
+            driverFeeJmd: driverFee.toFixed(2),
+            sellerDeliveryFeeJmd: sellerDeliveryFee.toFixed(2),
+            platformCommissionJmd: r.platformCommissionJmd.toFixed(2),
+            deliveryMethod: method,
+            // A pickup records where to collect, so every seller view and
+            // label shows it.
+            deliveryAddress: method === 'PICKUP' ? `Customer pickup: ${pickupLocationOf(r.seller)}` : input.deliveryAddress!,
+            checkoutGroupId,
+            // status defaults to AWAITING_PAYMENT — flips to PACKING only once
+            // the WiPay webhook confirms payment (see ledger.service.ts).
+          },
+        });
+        await logTrackingEvent(tx, order.id, 'AWAITING_PAYMENT', { note: 'Order placed — awaiting payment' });
+        orders.push(order);
+      }
+    }
+    return orders;
+  });
 }
 
-async function checkoutStore(tx: Prisma.TransactionClient, customerId: string, input: CheckoutInput) {
-  const product = await findShopProduct(tx, input);
-  if (!product) throw new HttpError(404, 'Product not found or inactive');
-  const fees = deliveryFeesFor(product.shop, input.deliveryMethod);
-
-  await reserveStock(tx, 'shop_products', product.id, input.quantity);
-  const price = priceShopProduct(product, input.quantity);
-
-  const order = await tx.order.create({
-    data: {
-      customerId,
-      shopId: input.storeId,
-      // Records exactly which product this was for — see checkoutAffiliate's
-      // storeListingId comment above.
-      shopProductId: product.id,
-      quantity: input.quantity,
-      totalPaidJmd: price.goodsTotalJmd.plus(fees.driverFeeJmd).plus(fees.sellerDeliveryFeeJmd).toFixed(2),
-      wholesaleTotalJmd: '0.00',
-      resellerMarginJmd: price.resellerMarginJmd.toFixed(2),
-      driverFeeJmd: fees.driverFeeJmd.toFixed(2),
-      sellerDeliveryFeeJmd: fees.sellerDeliveryFeeJmd.toFixed(2),
-      platformCommissionJmd: price.platformCommissionJmd.toFixed(2),
-      deliveryMethod: input.deliveryMethod,
-      deliveryAddress: addressFor(input, product.shop),
-    },
-  });
-  await logTrackingEvent(tx, order.id, 'AWAITING_PAYMENT', { note: 'Order placed — awaiting payment' });
-  return order;
-}
-
-const quoteSchema = z.object({ items: z.array(lineSchema).min(1).max(50) });
-
-// The cart's view of itself, priced by the server: what each line costs
-// today, whether it's still in stock, and the delivery options each seller
-// offers. Customers choose one option per seller from `sellers`, then check
-// out. Public, like the marketplace — a guest can build a cart.
-//
-// A seller here is whoever packs and ships the order: the shop for a shop
-// item, the warehouse behind a reseller's listing.
-ordersRouter.post('/quote', async (req, res, next) => {
+// IsleVendor's current IsleDash pricing — shown to sellers on their
+// Shipping tab so they know what customers pay when they pick IsleDash.
+ordersRouter.get('/isledash-rate', async (_req, res, next) => {
   try {
-    const { items } = quoteSchema.parse(req.body);
-    const sellers = new Map<string, { key: string; name: string; options: DeliveryOption[] }>();
-
-    const lines = await Promise.all(
-      items.map(async (line) => {
-        const unavailable = (reason: string) => ({ ...line, available: false as const, reason });
-
-        if (line.kind === 'STORE') {
-          const product = await findShopProduct(prisma, line);
-          if (!product) return unavailable('No longer available');
-          const key = `shop:${product.shop.id}`;
-          sellers.set(key, { key, name: product.shop.shopName, options: deliveryOptionsFor(product.shop) });
-          if (product.stockQuantity < line.quantity) return { ...unavailable(`Only ${product.stockQuantity} left`), sellerKey: key };
-          const price = priceShopProduct(product, line.quantity);
-          return { ...line, available: true as const, sellerKey: key, goodsTotalJmd: price.goodsTotalJmd.toFixed(2), serviceFeeJmd: price.platformCommissionJmd.toFixed(2) };
-        }
-
-        const listing = await findAffiliateListing(prisma, line);
-        if (!listing) return unavailable('No longer available');
-        const { warehouse } = listing.masterProduct;
-        const key = `warehouse:${warehouse.id}`;
-        // Customers buy from the reseller; it ships from their supplier.
-        sellers.set(key, { key, name: `${listing.store.storeName} (ships from ${warehouse.parish})`, options: deliveryOptionsFor(warehouse) });
-        if (listing.masterProduct.stockQuantity < line.quantity) {
-          return { ...unavailable(`Only ${listing.masterProduct.stockQuantity} left`), sellerKey: key };
-        }
-        const price = priceAffiliate(listing, line.quantity);
-        return { ...line, available: true as const, sellerKey: key, goodsTotalJmd: price.goodsTotalJmd.toFixed(2), serviceFeeJmd: '0.00' };
-      }),
-    );
-
-    res.json({ items: lines, sellers: [...sellers.values()] });
+    const rate = await getIsleDashRate();
+    res.json({ baseFeeJmd: rate.baseFeeJmd.toFixed(2), extraItemPercent: rate.extraItemPercent });
   } catch (err) {
     next(err);
   }
 });
 
+const quoteSchema = z.object({ items: z.array(lineSchema).min(1).max(50) });
+
+// The cart's view of itself, priced by the server: what each line costs
+// today, whether it's still in stock, and — per business shipping something
+// — the delivery options it offers, each priced for all of that business's
+// items together. Customers choose one option per seller, then check out.
+// Public, like the marketplace — a guest can build a cart.
+ordersRouter.post('/quote', async (req, res, next) => {
+  try {
+    const { items } = quoteSchema.parse(req.body);
+    const isleDashRate = await getIsleDashRate();
+    const resolved = await Promise.all(items.map((line) => resolveLine(prisma, line)));
+
+    const lines = items.map((line, i) => {
+      const r = resolved[i];
+      if (!r) return { ...line, available: false as const, reason: 'No longer available' };
+      if (r.stockQuantity < line.quantity) return { ...line, available: false as const, reason: `Only ${r.stockQuantity} left`, sellerKey: r.sellerKey };
+      return {
+        ...line,
+        available: true as const,
+        sellerKey: r.sellerKey,
+        goodsTotalJmd: r.goodsTotalJmd.toFixed(2),
+        serviceFeeJmd: line.kind === 'STORE' ? r.platformCommissionJmd.toFixed(2) : '0.00',
+      };
+    });
+
+    const available = resolved.filter((r, i): r is ResolvedLine => r !== null && lines[i].available);
+    const sellers = [...groupBySeller(resolved.filter((r): r is ResolvedLine => r !== null))].map(([key, group]) => {
+      const units = unitsOf(available.filter((r) => r.sellerKey === key));
+      return { key, name: group[0].sellerName, units, options: deliveryOptionsFor(group[0].seller, isleDashRate, Math.max(units, 1)) };
+    });
+
+    res.json({ items: lines, sellers });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Places the whole cart — see placeCheckout.
+ordersRouter.post('/checkout', requireAuth, requireRole(UserRole.CUSTOMER, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const orders = await placeCheckout(req.user!.sub, checkoutSchema.parse(req.body));
+    // TODO(Phase 3): initiate one WiPay hosted checkout session for the whole
+    // cart here and return its redirect URL alongside the orders.
+    res.status(201).json(orders);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// One item on its own — kept for clients that predate whole-cart checkout
+// (the IsleVendor mobile app). The same as /checkout with a single line.
+const singleCheckoutSchema = lineSchema
+  .extend({
+    // Defaults to IsleDash: every business offered it before delivery
+    // options existed.
+    deliveryMethod: deliveryMethodSchema.default('ISLEDASH'),
+    deliveryAddress: z.string().trim().min(1).max(500).optional(),
+  })
+  .refine((v) => v.deliveryMethod === 'PICKUP' || !!v.deliveryAddress, {
+    message: 'Enter a delivery address',
+    path: ['deliveryAddress'],
+  });
+
 ordersRouter.post('/', requireAuth, requireRole(UserRole.CUSTOMER, UserRole.ADMIN), async (req, res, next) => {
   try {
-    const input = checkoutSchema.parse(req.body);
+    const { deliveryMethod, deliveryAddress, ...line } = singleCheckoutSchema.parse(req.body);
+    const resolved = await resolveLine(prisma, line);
+    if (!resolved) throw new HttpError(404, line.kind === 'STORE' ? 'Product not found or inactive' : 'Listing not found or inactive');
 
-    const order = await prisma.$transaction((tx) =>
-      input.kind === 'STORE' ? checkoutStore(tx, req.user!.sub, input) : checkoutAffiliate(tx, req.user!.sub, input),
-    );
-
-    // TODO(Phase 3): initiate the WiPay hosted-fields checkout session here and
-    // return its redirect/session URL alongside the order id.
+    const [order] = await placeCheckout(req.user!.sub, {
+      items: [line],
+      deliveryMethods: { [resolved.sellerKey]: deliveryMethod },
+      deliveryAddress,
+    });
     res.status(201).json(order);
   } catch (err) {
     next(err);

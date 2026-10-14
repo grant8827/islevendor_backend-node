@@ -116,8 +116,9 @@ describe('delivery options', () => {
       const seller = res.body.sellers.find((s: any) => s.key === line.sellerKey);
       assert.deepEqual(
         seller.options.map((o: any) => [o.method, o.feeJmd, o.needsAddress]),
+        // Two items: the first at the full fee, the second at half.
         [
-          ['SELLER_DELIVERY', '450.00', true],
+          ['SELLER_DELIVERY', '675.00', true],
           ['PICKUP', '0.00', false],
         ],
       );
