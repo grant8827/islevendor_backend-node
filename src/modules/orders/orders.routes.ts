@@ -392,8 +392,7 @@ ordersRouter.get('/mine', requireAuth, async (req, res, next) => {
 
     res.json(
       orders.map((o) => {
-        const ratingOf = (listingId: string | null) =>
-          o.ratings.find((r) => (r.storeListingId ?? r.shopProductId) === listingId)?.rating ?? null;
+        const ratingOf = (listingId: string | null) => o.ratings.find((r) => (r.storeListingId ?? r.shopProductId) === listingId);
         return {
           id: o.id,
           status: o.status,
@@ -403,7 +402,10 @@ ordersRouter.get('/mine', requireAuth, async (req, res, next) => {
           deliveryMethod: o.deliveryMethod,
           deliveryAddress: o.deliveryAddress,
           sellerName: o.resellerStore?.storeName ?? o.shop?.shopName ?? null,
-          items: o.items.map((item) => ({ ...toItemView(item), myRating: ratingOf(item.storeListingId ?? item.shopProductId) })),
+          items: o.items.map((item) => {
+            const rating = ratingOf(item.storeListingId ?? item.shopProductId);
+            return { ...toItemView(item), myRating: rating?.rating ?? null, myComment: rating?.comment ?? null };
+          }),
           // A one-line summary and the first item, for clients that show one
           // product per order. listingId doubles as the /product/:id route param.
           itemTitle: summarizeItems(o.items),
