@@ -5,6 +5,7 @@ import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { assertWarehouseAccess } from '../../lib/warehouseAccess.js';
+import { APPROVED_SELLER } from '../../lib/eligibility.js';
 
 export const deliveryRouter = Router();
 
@@ -30,16 +31,21 @@ deliveryRouter.post('/', requireAuth, requireRole(UserRole.DRIVER, UserRole.ADMI
   try {
     const input = applySchema.parse(req.body);
     const driver = await requireDriverProfile(req.user!.sub);
+    // IsleVendor approves a driver first; only then can they apply to
+    // individual businesses.
+    if (driver.applicantStatus !== 'APPROVED') {
+      throw new HttpError(403, 'You can apply to businesses once IsleVendor has approved your driver application');
+    }
 
     const where = input.warehouseId
       ? { driverId_warehouseId: { driverId: driver.id, warehouseId: input.warehouseId } }
       : { driverId_shopId: { driverId: driver.id, shopId: input.shopId! } };
 
     if (input.warehouseId) {
-      const warehouse = await prisma.warehouse.findUnique({ where: { id: input.warehouseId } });
+      const warehouse = await prisma.warehouse.findUnique({ where: { id: input.warehouseId, ...APPROVED_SELLER } });
       if (!warehouse) throw new HttpError(404, 'Warehouse not found');
     } else {
-      const shop = await prisma.shop.findUnique({ where: { id: input.shopId } });
+      const shop = await prisma.shop.findUnique({ where: { id: input.shopId, ...APPROVED_SELLER } });
       if (!shop) throw new HttpError(404, 'Shop not found');
     }
 

@@ -19,3 +19,21 @@ export async function isEligibleDriver(user: AuthTokenPayload): Promise<boolean>
   });
   return !!profile && profile.isKycApproved && profile.applicantStatus !== 'REJECTED';
 }
+
+/**
+ * Whether this driver has been accepted to deliver for the business that
+ * packs `order` — the warehouse for a reseller order, the shop for a store
+ * order. Each business picks its own couriers (DeliveryApplication); being
+ * an approved IsleVendor driver isn't enough on its own.
+ */
+export async function isAcceptedByOrderSeller(
+  driverUserId: string,
+  order: { warehouseId: string | null; shopId: string | null },
+): Promise<boolean> {
+  const seller = order.shopId ? { shopId: order.shopId } : order.warehouseId ? { warehouseId: order.warehouseId } : null;
+  if (!seller) return false;
+  const accepted = await prisma.deliveryApplication.count({
+    where: { ...seller, status: 'APPROVED', driver: { userId: driverUserId } },
+  });
+  return accepted > 0;
+}

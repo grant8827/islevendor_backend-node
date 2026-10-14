@@ -7,6 +7,7 @@ import { env } from '../../env.js';
 import { getSocketServer } from '../../lib/socket.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
+import { canWithdrawFrom } from '../../lib/eligibility.js';
 
 export interface WiPayWebhookPayload {
   order_id: string;
@@ -284,6 +285,11 @@ export async function withdrawBalance(userId: string) {
   return prisma.$transaction(async (tx) => {
     const accounts = await tx.ledgerAccount.findMany({ where: { userId }, orderBy: { id: 'asc' } });
     if (accounts.length === 0) throw new HttpError(404, 'No ledger account found for this user');
+    for (const account of accounts) {
+      if (!(await canWithdrawFrom(userId, account.accountType))) {
+        throw new HttpError(403, 'Withdrawals open once IsleVendor has approved your account');
+      }
+    }
 
     const payouts = [];
     for (const account of accounts) {

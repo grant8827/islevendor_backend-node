@@ -8,6 +8,7 @@ import { HttpError } from '../../middleware/errorHandler.js';
 import { computeAffiliatePricing, PLATFORM_COMMISSION_RATE } from '../../lib/pricing.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
 import { assertOrderAccess, toOrderDto } from '../../lib/orderAccess.js';
+import { APPROVED_SELLER } from '../../lib/eligibility.js';
 
 export const ordersRouter = Router();
 
@@ -27,7 +28,15 @@ const checkoutSchema = z.object({
 
 async function checkoutAffiliate(tx: Prisma.TransactionClient, customerId: string, input: z.infer<typeof checkoutSchema>) {
   const listing = await tx.storeListing.findFirst({
-    where: { storeId: input.storeId, masterProductId: input.masterProductId, isActive: true },
+    // Only from businesses IsleVendor has approved — the same rule the
+    // marketplace uses to decide what to show (see lib/eligibility.ts).
+    where: {
+      storeId: input.storeId,
+      masterProductId: input.masterProductId,
+      isActive: true,
+      store: APPROVED_SELLER,
+      masterProduct: { isActive: true, warehouse: APPROVED_SELLER },
+    },
     include: { masterProduct: { include: { warehouse: { select: { resellerCommissionPercent: true } } } }, store: true },
   });
   if (!listing) throw new HttpError(404, 'Listing not found or inactive');
@@ -87,7 +96,7 @@ async function checkoutAffiliate(tx: Prisma.TransactionClient, customerId: strin
 
 async function checkoutStore(tx: Prisma.TransactionClient, customerId: string, input: z.infer<typeof checkoutSchema>) {
   const product = await tx.shopProduct.findFirst({
-    where: { id: input.masterProductId, shopId: input.storeId, isActive: true },
+    where: { id: input.masterProductId, shopId: input.storeId, isActive: true, shop: APPROVED_SELLER },
   });
   if (!product) throw new HttpError(404, 'Product not found or inactive');
 

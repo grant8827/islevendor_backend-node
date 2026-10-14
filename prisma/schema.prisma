@@ -16,17 +16,11 @@ datasource db {
 
 // ─────────────────────────────────────────────────────────────────────────
 // 0. ONBOARDING / KYC APPLICANT STATUS
-// Shared across Warehouse, ResellerStore, Shop, and DriverProfile. Defaults
-// to APPROVED on each model so the pre-existing "quick setup" dashboard
-// forms (WarehouseSetupForm, StoreSetupForm, ShopSetupForm — which create a
-// row for an already-authenticated user with no review step) keep behaving
-// exactly as before. The new public onboarding endpoints (see
-// modules/onboarding) explicitly set PENDING_REVIEW instead — that's the
-// only thing that actually gates anything on this field today; there is no
-// enforcement yet stopping a PENDING_REVIEW row from operating normally
-// (listing products, accepting dispatches, etc.) — see onboarding.routes.ts
-// for the admin approve/reject endpoints and the follow-up needed to
-// actually gate access on this status.
+// Shared across Warehouse, ResellerStore, Shop, and DriverProfile. Every
+// new row starts PENDING_REVIEW, whichever form created it, and IsleVendor's
+// admin approves or rejects it (modules/admin, onboarding.routes.ts's
+// decision endpoint). Until APPROVED it can't list, sell, dispatch or
+// withdraw — see lib/eligibility.ts and lib/driverEligibility.ts.
 // ─────────────────────────────────────────────────────────────────────────
 
 enum ApplicantStatus {
@@ -241,7 +235,7 @@ model Warehouse {
   // Existing WarehouseSetupForm (dashboard quick-setup) rows keep the
   // APPROVED default — see the ApplicantStatus doc comment above. The new
   // ISLE-105 onboarding endpoint explicitly overrides this to PENDING_REVIEW.
-  applicantStatus   ApplicantStatus @default(APPROVED) @map("applicant_status")
+  applicantStatus   ApplicantStatus @default(PENDING_REVIEW) @map("applicant_status")
   referenceId       String?         @unique @map("reference_id")
 
   // The warehouse's own call, not a platform-wide constant: what percentage
@@ -419,7 +413,7 @@ model ResellerStore {
   slaAcceptedAt           DateTime?                   @map("sla_accepted_at") @db.Timestamptz
   // See Warehouse.applicantStatus for why this defaults to APPROVED —
   // same reasoning re: the existing StoreSetupForm quick-setup path.
-  applicantStatus         ApplicantStatus             @default(APPROVED) @map("applicant_status")
+  applicantStatus         ApplicantStatus             @default(PENDING_REVIEW) @map("applicant_status")
   referenceId             String?                     @unique @map("reference_id")
 
   // The banner across the top of this store's public storefront and its
@@ -553,7 +547,7 @@ model Shop {
   // See Warehouse.applicantStatus — same "keep the quick-setup path
   // unaffected" reasoning re: ShopSetupForm. Fast-track review target is
   // 12–24 hrs, surfaced to the applicant, not enforced here.
-  applicantStatus         ApplicantStatus             @default(APPROVED) @map("applicant_status")
+  applicantStatus         ApplicantStatus             @default(PENDING_REVIEW) @map("applicant_status")
   referenceId             String?                     @unique @map("reference_id")
 
   user                 User                  @relation(fields: [userId], references: [id])

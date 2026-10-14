@@ -10,6 +10,7 @@ import { createWithGeneratedSku } from '../../lib/sku.js';
 import { computeAffiliatePricing } from '../../lib/pricing.js';
 import { refundOrder } from '../ledger/ledger.service.js';
 import { assertWarehouseAccess, type WarehouseAccess } from '../../lib/warehouseAccess.js';
+import { APPROVED_SELLER, assertApprovedSeller, assertHasPayoutDetails } from '../../lib/eligibility.js';
 import { registerStaffRoutes } from './warehouse.staff.js';
 
 export const warehouseRouter = Router();
@@ -36,6 +37,11 @@ warehouseRouter.post('/', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.
     // it was added to — see User.staffOfUserId in schema.prisma.
     const me = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { staffOfUserId: true } });
     if (me?.staffOfUserId) throw new HttpError(403, "Staff accounts can't create warehouses");
+    // Payouts for every warehouse go to the owner's one ledger account, so
+    // the bank details from their onboarding application cover this one too.
+    // The new warehouse itself starts PENDING_REVIEW (the column default)
+    // and waits for IsleVendor's approval like any other application.
+    await assertHasPayoutDetails(req.user!.sub);
 
     // Raw INSERT bypasses Prisma Client's id generation (its @default(uuid())
     // is applied client-side, not as a DB DEFAULT) — generate it ourselves.
@@ -56,10 +62,12 @@ warehouseRouter.post('/', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.
   }
 });
 
-// Browse all registered warehouses — used by resellers deciding who to apply to.
+// Browse every IsleVendor-approved warehouse — used by resellers deciding
+// who to apply to, and by drivers looking for businesses to deliver for.
 warehouseRouter.get('/', async (req, res, next) => {
   try {
     const warehouses = await prisma.warehouse.findMany({
+      where: APPROVED_SELLER,
       select: {
         id: true,
         name: true,
@@ -132,7 +140,8 @@ warehouseRouter.post('/products', requireAuth, requireRole(UserRole.WAREHOUSE, U
     // belongs to is an explicit choice on the add-product form, not
     // implied by whichever warehouse happens to be selected in the
     // dashboard's switcher — see warehouse/ProductsPanel.jsx.
-    await assertWarehouseAccess(input.warehouseId, req.user!);
+    const { warehouse } = await assertWarehouseAccess(input.warehouseId, req.user!);
+    assertApprovedSeller(warehouse, 'warehouse');
 
     const product = await createWithGeneratedSku(input.category, (sku) =>
       prisma.masterProduct.create({
@@ -467,6 +476,7 @@ warehouseRouter.put('/:warehouseId/resellers/:storeId/grants', requireAuth, requ
     const storeId = String(req.params.storeId);
 
     const { warehouse } = await assertWarehouseAccess(warehouseId, req.user!);
+    assertApprovedSeller(warehouse, 'warehouse');
     await assertResellerRelationship(warehouseId, storeId);
 
     const product = await prisma.masterProduct.findUnique({ where: { id: input.masterProductId } });

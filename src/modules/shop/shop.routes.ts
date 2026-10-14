@@ -5,6 +5,7 @@ import { UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
+import { APPROVED_SELLER, assertApprovedSeller, assertHasPayoutDetails } from '../../lib/eligibility.js';
 import { imageUrlSchema } from '../../lib/validation.js';
 import { createWithGeneratedSku } from '../../lib/sku.js';
 import { refundOrder } from '../ledger/ledger.service.js';
@@ -42,6 +43,9 @@ shopRouter.post('/', requireAuth, requireRole(UserRole.STORE, UserRole.ADMIN), a
   try {
     const input = createShopSchema.parse(req.body);
     await assertSlugAvailable(input.slug);
+    // Same as a second warehouse: the owner's onboarding payout details cover
+    // it, and it starts PENDING_REVIEW (the column default) until approved.
+    await assertHasPayoutDetails(req.user!.sub);
 
     const id = randomUUID();
     const [shop] = await prisma.$queryRaw<{ id: string }[]>`
@@ -57,11 +61,12 @@ shopRouter.post('/', requireAuth, requireRole(UserRole.STORE, UserRole.ADMIN), a
   }
 });
 
-// Browse all registered shops — used by drivers deciding who to apply to
-// deliver for (mirrors warehouseRouter's GET '/').
+// Browse every IsleVendor-approved shop — used by drivers deciding who to
+// apply to deliver for (mirrors warehouseRouter's GET '/').
 shopRouter.get('/', async (req, res, next) => {
   try {
     const shops = await prisma.shop.findMany({
+      where: APPROVED_SELLER,
       select: { id: true, shopName: true, addressLine: true, parish: true, _count: { select: { products: true } } },
     });
     res.json(shops);
@@ -109,7 +114,8 @@ const createProductSchema = z.object({
 shopRouter.post('/products', requireAuth, requireRole(UserRole.STORE, UserRole.ADMIN), async (req, res, next) => {
   try {
     const input = createProductSchema.parse(req.body);
-    await assertOwnsShop(input.shopId, req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const shop = await assertOwnsShop(input.shopId, req.user!.sub, req.user!.role === UserRole.ADMIN);
+    assertApprovedSeller(shop, 'shop');
 
     const product = await createWithGeneratedSku(input.category, (sku) =>
       prisma.shopProduct.create({

@@ -10,7 +10,8 @@ import { offerJobToDrivers, claimJobForDriver } from './dispatch.gateway.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
 import { env } from '../../env.js';
 import { toOrderDto } from '../../lib/orderAccess.js';
-import { isEligibleDriver } from '../../lib/driverEligibility.js';
+import { isAcceptedByOrderSeller, isEligibleDriver } from '../../lib/driverEligibility.js';
+import { assertApprovedSeller } from '../../lib/eligibility.js';
 import { consumePickupToken, issuePickupToken, verifyPickupToken } from '../../lib/pickupToken.js';
 
 export const dispatchRouter = Router();
@@ -35,15 +36,19 @@ async function loadOrderForSeller(orderId: string, user: AuthTokenPayload) {
     }
   } else if (existing.warehouseId) {
     // Warehouse staff pack and dispatch orders too, not just the owner.
-    await assertWarehouseAccess(existing.warehouseId, user);
+    const { warehouse } = await assertWarehouseAccess(existing.warehouseId, user);
+    assertApprovedSeller(warehouse, 'warehouse');
   } else {
     throw new HttpError(403, 'You do not own this order');
   }
+  if (existing.shop) assertApprovedSeller(existing.shop, 'shop');
   return existing;
 }
 
 // Warehouse (or shop) finishes packing -> broadcast a JOB_OFFER to every
-// online, KYC-approved driver within 10km at once (up to MAX_DRIVERS_OFFERED);
+// online, KYC-approved driver within 10km *whom this business has accepted
+// as one of its couriers* (an APPROVED DeliveryApplication) at once (up to
+// MAX_DRIVERS_OFFERED);
 // first to accept gets it (see dispatch.gateway.ts's driver:acceptJob). The
 // query still orders nearest-first — harmless to keep, just no longer
 // meaningful now that every driver up to the cap gets the same offer at the
@@ -65,6 +70,8 @@ dispatchRouter.post('/orders/:id/ready', requireAuth, requireRole(UserRole.WAREH
           SELECT dp.user_id
           FROM driver_profiles dp
           JOIN shops s ON s.id = ${order.shopId}::uuid
+          JOIN delivery_applications da
+            ON da.driver_id = dp.id AND da.shop_id = s.id AND da.status = 'APPROVED'
           WHERE dp.is_online = TRUE
             AND dp.is_kyc_approved = TRUE
             AND dp.current_location IS NOT NULL
@@ -76,6 +83,8 @@ dispatchRouter.post('/orders/:id/ready', requireAuth, requireRole(UserRole.WAREH
           SELECT dp.user_id
           FROM driver_profiles dp
           JOIN warehouses w ON w.id = ${order.warehouseId}::uuid
+          JOIN delivery_applications da
+            ON da.driver_id = dp.id AND da.warehouse_id = w.id AND da.status = 'APPROVED'
           WHERE dp.is_online = TRUE
             AND dp.is_kyc_approved = TRUE
             AND dp.current_location IS NOT NULL
@@ -85,7 +94,7 @@ dispatchRouter.post('/orders/:id/ready', requireAuth, requireRole(UserRole.WAREH
         `;
 
     if (nearbyDrivers.length === 0) {
-      return res.json({ order, dispatched: false, reason: 'No available drivers within 10km' });
+      return res.json({ order, dispatched: false, reason: 'None of your accepted drivers are online within 10km' });
     }
 
     const driverIds = nearbyDrivers.map((d) => d.user_id);
@@ -237,6 +246,11 @@ dispatchRouter.post('/orders/:id/scan-pickup', requireAuth, requireRole(UserRole
     if (!alreadyMine) {
       const nonce = order ? await verifyPickupToken(orderId, token) : null;
       if (!order || !nonce) throw denied;
+      // Holding the label isn't enough: only a courier this business has
+      // accepted may take its packages.
+      if (!(await isAcceptedByOrderSeller(req.user!.sub, order))) {
+        throw new HttpError(403, "You aren't one of this business's accepted drivers — apply to deliver for them first");
+      }
 
       if (order.status !== 'READY_FOR_PICKUP') {
         throw new HttpError(409, `This package can't be picked up right now (status: ${order.status.replaceAll('_', ' ')})`);

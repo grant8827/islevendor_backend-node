@@ -48,6 +48,12 @@ export async function createUser(role: UserRole): Promise<TestUser> {
   return { id: user.id, role, token: signAuthToken({ sub: user.id, role }) };
 }
 
+/** Records that a business has accepted this driver as one of its couriers. */
+export async function acceptDriver(driver: TestUser, business: { warehouseId: string } | { shopId: string }) {
+  const profile = await prisma.driverProfile.findUniqueOrThrow({ where: { userId: driver.id } });
+  await prisma.deliveryApplication.create({ data: { driverId: profile.id, status: 'APPROVED', decidedAt: new Date(), ...business } });
+}
+
 export async function createDriver(opts: { isKycApproved?: boolean; applicantStatus?: 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED' } = {}) {
   const user = await createUser('DRIVER');
   await prisma.driverProfile.create({
@@ -62,29 +68,33 @@ export async function createDriver(opts: { isKycApproved?: boolean; applicantSta
 
 // Warehouse/Shop have a PostGIS `location` column Prisma can't write, so —
 // like the app's own create routes — these go through raw SQL.
-export async function createWarehouse(ownerId: string): Promise<string> {
+type ApplicantStatus = 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED';
+
+// Approved by IsleVendor unless a test says otherwise — most tests are about
+// something other than the approval gate.
+export async function createWarehouse(ownerId: string, applicantStatus: ApplicantStatus = 'APPROVED'): Promise<string> {
   const id = randomUUID();
   await prisma.$executeRaw`
-    INSERT INTO warehouses (id, user_id, name, address_line, parish, location)
+    INSERT INTO warehouses (id, user_id, name, address_line, parish, location, applicant_status)
     VALUES (${id}::uuid, ${ownerId}::uuid, 'Test Warehouse', '1 Test Road', 'Kingston',
-            ST_SetSRID(ST_MakePoint(-76.79, 18.01), 4326))
+            ST_SetSRID(ST_MakePoint(-76.79, 18.01), 4326), ${applicantStatus}::"ApplicantStatus")
   `;
   return id;
 }
 
-export async function createShop(ownerId: string): Promise<string> {
+export async function createShop(ownerId: string, applicantStatus: ApplicantStatus = 'APPROVED'): Promise<string> {
   const id = randomUUID();
   await prisma.$executeRaw`
-    INSERT INTO shops (id, user_id, shop_name, slug, address_line, parish, location)
+    INSERT INTO shops (id, user_id, shop_name, slug, address_line, parish, location, applicant_status)
     VALUES (${id}::uuid, ${ownerId}::uuid, 'Test Shop', ${`shop-${id}`}, '2 Test Road', 'Kingston',
-            ST_SetSRID(ST_MakePoint(-76.79, 18.01), 4326))
+            ST_SetSRID(ST_MakePoint(-76.79, 18.01), 4326), ${applicantStatus}::"ApplicantStatus")
   `;
   return id;
 }
 
-export async function createResellerStore(ownerId: string): Promise<string> {
+export async function createResellerStore(ownerId: string, applicantStatus: ApplicantStatus = 'APPROVED'): Promise<string> {
   const store = await prisma.resellerStore.create({
-    data: { userId: ownerId, storeName: 'Test Store', slug: `store-${randomUUID()}` },
+    data: { userId: ownerId, storeName: 'Test Store', slug: `store-${randomUUID()}`, applicantStatus },
   });
   return store.id;
 }
