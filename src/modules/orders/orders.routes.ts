@@ -19,6 +19,7 @@ import {
   type DeliverySettings,
 } from '../../lib/deliveryOptions.js';
 import { getIsleDashRate } from '../../lib/platformSettings.js';
+import { ITEMS_IN_ORDER, summarizeItems, toItemView } from '../../lib/orderItems.js';
 
 export const ordersRouter = Router();
 
@@ -70,6 +71,14 @@ function findShopProduct(db: Db, line: Line) {
 interface ResolvedLine {
   line: Line;
   sellerKey: string;
+  /**
+   * Which order this line belongs in: everything from one shop, or — since
+   * a reseller is paid separately from the warehouse that ships for it —
+   * everything from one reseller's store that one warehouse ships.
+   */
+  orderKey: string;
+  title: string;
+  imageUrl: string | null;
   sellerName: string;
   seller: DeliverySettings;
   stockQuantity: number;
@@ -78,7 +87,8 @@ interface ResolvedLine {
   wholesaleTotalJmd: Decimal;
   resellerMarginJmd: Decimal;
   platformCommissionJmd: Decimal;
-  orderFields: { resellerStoreId?: string; warehouseId?: string; storeListingId?: string; shopId?: string; shopProductId?: string };
+  orderFields: { resellerStoreId: string; warehouseId: string } | { shopId: string };
+  itemFields: { storeListingId: string } | { shopProductId: string };
 }
 
 async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
@@ -95,6 +105,9 @@ async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
     return {
       line,
       sellerKey: `shop:${product.shop.id}`,
+      orderKey: `shop:${product.shop.id}`,
+      title: product.title,
+      imageUrl: product.imageUrl,
       sellerName: product.shop.shopName,
       seller: product.shop,
       stockQuantity: product.stockQuantity,
@@ -103,9 +116,10 @@ async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
       wholesaleTotalJmd: new Decimal(0),
       resellerMarginJmd: itemTotal,
       platformCommissionJmd,
-      // shopProductId records exactly which item this was — the proof a
-      // DELIVERED order later needs to unlock rating it (ratings.routes.ts).
-      orderFields: { shopId: line.storeId, shopProductId: product.id },
+      orderFields: { shopId: line.storeId },
+      // Which exact item this was — the proof a DELIVERED order later needs
+      // to unlock rating it (ratings.routes.ts).
+      itemFields: { shopProductId: product.id },
     };
   }
 
@@ -126,6 +140,9 @@ async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
   return {
     line,
     sellerKey: `warehouse:${warehouse.id}`,
+    orderKey: `warehouse:${warehouse.id}:store:${line.storeId}`,
+    title: listing.masterProduct.title,
+    imageUrl: listing.masterProduct.imageUrl,
     // Customers buy from the reseller; it ships from their supplier.
     sellerName: `${listing.store.storeName} (ships from ${warehouse.parish})`,
     seller: warehouse,
@@ -135,16 +152,20 @@ async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
     wholesaleTotalJmd: price.wholesaleTotalJmd,
     resellerMarginJmd: price.resellerMarginJmd,
     platformCommissionJmd: price.platformCommissionJmd,
-    orderFields: { resellerStoreId: line.storeId, warehouseId: warehouse.id, storeListingId: listing.id },
+    orderFields: { resellerStoreId: line.storeId, warehouseId: warehouse.id },
+    itemFields: { storeListingId: listing.id },
   };
 }
 
 /** Lines grouped by the business that ships them, in cart order. */
-function groupBySeller(lines: ResolvedLine[]): Map<string, ResolvedLine[]> {
+function groupBy(lines: ResolvedLine[], key: (line: ResolvedLine) => string): Map<string, ResolvedLine[]> {
   const groups = new Map<string, ResolvedLine[]>();
-  for (const line of lines) groups.set(line.sellerKey, [...(groups.get(line.sellerKey) ?? []), line]);
+  for (const line of lines) groups.set(key(line), [...(groups.get(key(line)) ?? []), line]);
   return groups;
 }
+const groupBySeller = (lines: ResolvedLine[]) => groupBy(lines, (l) => l.sellerKey);
+
+const sum = (values: Decimal[]) => values.reduce((total, v) => total.plus(v), new Decimal(0));
 
 const unitsOf = (lines: ResolvedLine[]) => lines.reduce((sum, l) => sum + l.line.quantity, 0);
 
@@ -169,14 +190,19 @@ const checkoutSchema = z
 type CheckoutInput = z.infer<typeof checkoutSchema>;
 
 /**
- * Places a whole cart, all or nothing: one order per cart line, created in a
- * single transaction, so a failure anywhere (out of stock, a seller no
- * longer approved, an option it doesn't offer) leaves nothing behind.
+ * Places a whole cart, all or nothing, in a single transaction — a failure
+ * anywhere (out of stock, a seller no longer approved, an option it doesn't
+ * offer) leaves nothing behind.
  *
- * Shipping is charged per seller, not per line: each business's items share
- * one delivery charge — the first item at the full fee, every further item
- * at that rate's extra-item fee (see lib/deliveryOptions.ts) — split across
- * its orders unit by unit, and tied together by checkoutGroupId.
+ * Everything bought from one business ships together as ONE order holding
+ * several items: one label, one packing step, one driver trip. (A reseller
+ * is paid separately from its warehouse, so items from two resellers that
+ * share a warehouse become two orders.)
+ *
+ * Shipping is charged per business that ships, across all its items: the
+ * first item at the full fee, every further unit at that rate's extra-item
+ * fee (lib/deliveryOptions.ts). Orders sharing one charge carry the same
+ * checkoutGroupId.
  */
 async function placeCheckout(customerId: string, input: CheckoutInput) {
   return prisma.$transaction(async (tx) => {
@@ -194,38 +220,57 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
     for (const r of byProduct) await reserveStock(tx, r.stock, r.line.quantity);
 
     const orders = [];
-    for (const [sellerKey, lines] of groupBySeller(resolved)) {
+    for (const [sellerKey, sellerLines] of groupBySeller(resolved)) {
       const method = input.deliveryMethods[sellerKey];
-      if (!method) throw new HttpError(400, `Choose how you want to get the items from ${lines[0].sellerName}`);
-      const rate = requireRate(lines[0].seller, method, isleDashRate);
+      if (!method) throw new HttpError(400, `Choose how you want to get the items from ${sellerLines[0].sellerName}`);
+      const rate = requireRate(sellerLines[0].seller, method, isleDashRate);
       if (method !== 'PICKUP' && !input.deliveryAddress) throw new HttpError(400, 'Enter a delivery address');
 
-      const unitFees = perItemFees(rate, unitsOf(lines));
+      // This seller's shipping, unit by unit in cart order, then summed per order.
+      const unitFees = perItemFees(rate, unitsOf(sellerLines));
       const checkoutGroupId = randomUUID();
-      for (const r of lines) {
-        const fee = unitFees.splice(0, r.line.quantity).reduce((sum, f) => sum.plus(f), new Decimal(0));
+
+      for (const lines of groupBy(sellerLines, (l) => l.orderKey).values()) {
+        const fee = sum(unitFees.splice(0, unitsOf(lines)));
         const driverFee = method === 'ISLEDASH' ? fee : new Decimal(0);
         const sellerDeliveryFee = method === 'SELLER_DELIVERY' ? fee : new Decimal(0);
+        const goodsTotal = sum(lines.map((l) => l.goodsTotalJmd));
 
         const order = await tx.order.create({
           data: {
             customerId,
-            ...r.orderFields,
-            quantity: r.line.quantity,
-            totalPaidJmd: r.goodsTotalJmd.plus(fee).toFixed(2),
-            wholesaleTotalJmd: r.wholesaleTotalJmd.toFixed(2),
-            resellerMarginJmd: r.resellerMarginJmd.toFixed(2),
+            ...lines[0].orderFields,
+            // The first item and total units, for clients that still show one
+            // product per order (see the Order model).
+            ...lines[0].itemFields,
+            quantity: unitsOf(lines),
+            totalPaidJmd: goodsTotal.plus(fee).toFixed(2),
+            wholesaleTotalJmd: sum(lines.map((l) => l.wholesaleTotalJmd)).toFixed(2),
+            resellerMarginJmd: sum(lines.map((l) => l.resellerMarginJmd)).toFixed(2),
             driverFeeJmd: driverFee.toFixed(2),
             sellerDeliveryFeeJmd: sellerDeliveryFee.toFixed(2),
-            platformCommissionJmd: r.platformCommissionJmd.toFixed(2),
+            platformCommissionJmd: sum(lines.map((l) => l.platformCommissionJmd)).toFixed(2),
             deliveryMethod: method,
             // A pickup records where to collect, so every seller view and
             // label shows it.
-            deliveryAddress: method === 'PICKUP' ? `Customer pickup: ${pickupLocationOf(r.seller)}` : input.deliveryAddress!,
+            deliveryAddress: method === 'PICKUP' ? `Customer pickup: ${pickupLocationOf(lines[0].seller)}` : input.deliveryAddress!,
             checkoutGroupId,
+            items: {
+              create: lines.map((l) => ({
+                ...l.itemFields,
+                title: l.title,
+                imageUrl: l.imageUrl,
+                quantity: l.line.quantity,
+                goodsTotalJmd: l.goodsTotalJmd.toFixed(2),
+                wholesaleTotalJmd: l.wholesaleTotalJmd.toFixed(2),
+                resellerMarginJmd: l.resellerMarginJmd.toFixed(2),
+                platformCommissionJmd: l.platformCommissionJmd.toFixed(2),
+              })),
+            },
             // status defaults to AWAITING_PAYMENT — flips to PACKING only once
             // the WiPay webhook confirms payment (see ledger.service.ts).
           },
+          include: { items: true },
         });
         await logTrackingEvent(tx, order.id, 'AWAITING_PAYMENT', { note: 'Order placed — awaiting payment' });
         orders.push(order);
@@ -337,27 +382,35 @@ ordersRouter.get('/mine', requireAuth, async (req, res, next) => {
     const orders = await prisma.order.findMany({
       where: { customerId: req.user!.sub },
       include: {
-        storeListing: { include: { masterProduct: true, store: { select: { storeName: true } } } },
-        shopProduct: { include: { shop: { select: { shopName: true } } } },
+        items: ITEMS_IN_ORDER,
+        ratings: true,
+        resellerStore: { select: { storeName: true } },
+        shop: { select: { shopName: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
 
     res.json(
-      orders.map((o) => ({
-        id: o.id,
-        status: o.status,
-        createdAt: o.createdAt,
-        quantity: o.quantity,
-        totalPaidJmd: o.totalPaidJmd,
-        deliveryAddress: o.deliveryAddress,
-        // Listing id doubles as the /product/:id route param — same id
-        // space the marketplace and ratings already use.
-        listingId: o.storeListingId ?? o.shopProductId ?? null,
-        itemTitle: o.storeListing?.masterProduct.title ?? o.shopProduct?.title ?? 'Item no longer available',
-        itemImageUrl: o.storeListing?.masterProduct.imageUrl ?? o.shopProduct?.imageUrl ?? null,
-        sellerName: o.storeListing?.store.storeName ?? o.shopProduct?.shop.shopName ?? null,
-      })),
+      orders.map((o) => {
+        const ratingOf = (listingId: string | null) =>
+          o.ratings.find((r) => (r.storeListingId ?? r.shopProductId) === listingId)?.rating ?? null;
+        return {
+          id: o.id,
+          status: o.status,
+          createdAt: o.createdAt,
+          quantity: o.quantity,
+          totalPaidJmd: o.totalPaidJmd,
+          deliveryMethod: o.deliveryMethod,
+          deliveryAddress: o.deliveryAddress,
+          sellerName: o.resellerStore?.storeName ?? o.shop?.shopName ?? null,
+          items: o.items.map((item) => ({ ...toItemView(item), myRating: ratingOf(item.storeListingId ?? item.shopProductId) })),
+          // A one-line summary and the first item, for clients that show one
+          // product per order. listingId doubles as the /product/:id route param.
+          itemTitle: summarizeItems(o.items),
+          itemImageUrl: o.items[0]?.imageUrl ?? null,
+          listingId: o.items[0] ? (o.items[0].storeListingId ?? o.items[0].shopProductId) : null,
+        };
+      }),
     );
   } catch (err) {
     next(err);
@@ -370,7 +423,8 @@ ordersRouter.get('/mine', requireAuth, async (req, res, next) => {
 ordersRouter.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const { order, access } = await assertOrderAccess(String(req.params.id), req.user!);
-    res.json(toOrderDto(order, access));
+    const items = await prisma.orderItem.findMany({ where: { orderId: order.id }, ...ITEMS_IN_ORDER });
+    res.json({ ...toOrderDto(order, access), items: items.map(toItemView) });
   } catch (err) {
     next(err);
   }

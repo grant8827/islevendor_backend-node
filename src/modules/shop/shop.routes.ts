@@ -260,7 +260,9 @@ shopRouter.get('/:shopId/orders', requireAuth, requireRole(UserRole.STORE, UserR
       },
       include: {
         shopProduct: { select: { title: true } },
-        rating: true,
+        // Every item in the order, and the customer's rating of each.
+        items: { orderBy: { createdAt: 'asc' } },
+        ratings: true,
         refund: true,
         // Buyer name/phone — shown on the Packing Queue's printed shipping
         // label (see printLabel.js) alongside the delivery address.

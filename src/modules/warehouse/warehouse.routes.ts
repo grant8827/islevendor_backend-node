@@ -554,7 +554,9 @@ warehouseRouter.get('/:warehouseId/orders', requireAuth, requireRole(UserRole.WA
       include: {
         resellerStore: { select: { storeName: true } },
         storeListing: { select: { masterProduct: { select: { title: true } } } },
-        rating: true,
+        // Every item in the order, and the customer's rating of each.
+        items: { orderBy: { createdAt: 'asc' } },
+        ratings: true,
         refund: true,
         // Buyer name/phone — shown on the Packing Queue's printed shipping
         // label (see printLabel.js) alongside the delivery address.

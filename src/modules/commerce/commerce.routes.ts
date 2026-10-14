@@ -533,7 +533,9 @@ commerceRouter.get('/stores/:storeId/orders', requireAuth, requireRole(UserRole.
       },
       include: {
         storeListing: { select: { masterProduct: { select: { title: true } } } },
-        rating: true,
+        // Every item in the order, and the customer's rating of each.
+        items: { orderBy: { createdAt: 'asc' } },
+        ratings: true,
         refund: true,
         driver: { select: { fullName: true, phoneNumber: true, driverProfile: { select: { isOnline: true } } } },
         trackingEvents: { orderBy: { createdAt: 'asc' } },

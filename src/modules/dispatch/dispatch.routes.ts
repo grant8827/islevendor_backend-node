@@ -13,6 +13,7 @@ import { toOrderDto } from '../../lib/orderAccess.js';
 import { isAcceptedByOrderSeller, isEligibleDriver } from '../../lib/driverEligibility.js';
 import { assertApprovedSeller } from '../../lib/eligibility.js';
 import { releaseEscrowForOrder } from '../ledger/ledger.service.js';
+import { ITEMS_IN_ORDER, toItemView } from '../../lib/orderItems.js';
 import { consumePickupToken, issuePickupToken, verifyPickupToken } from '../../lib/pickupToken.js';
 
 export const dispatchRouter = Router();
@@ -271,10 +272,11 @@ dispatchRouter.post('/orders/:id/scan-pickup', requireAuth, requireRole(UserRole
         customer: { select: { fullName: true, phoneNumber: true } },
         storeListing: { select: { masterProduct: { select: { title: true } } } },
         shopProduct: { select: { title: true } },
+        items: ITEMS_IN_ORDER,
       },
     });
-    const { customer, storeListing, shopProduct, ...order_ } = full;
-    res.json({ ...toOrderDto(order_, 'DRIVER'), customer, storeListing, shopProduct });
+    const { customer, storeListing, shopProduct, items, ...order_ } = full;
+    res.json({ ...toOrderDto(order_, 'DRIVER'), customer, storeListing, shopProduct, items: items.map(toItemView) });
   } catch (err) {
     next(err);
   }

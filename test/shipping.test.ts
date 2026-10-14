@@ -67,7 +67,7 @@ describe('multi-item shipping', () => {
   });
 
   describe('checkout', () => {
-    it("places the whole cart and splits each seller's shipping across its orders", async () => {
+    it('puts everything from one seller in one order, with one shipping charge', async () => {
       const s1 = await shop(400);
       const s2 = await shop(400);
       const res = await checkout({
@@ -75,18 +75,25 @@ describe('multi-item shipping', () => {
         deliveryMethods: { [s1.key]: 'ISLEDASH', [s2.key]: 'SELLER_DELIVERY' },
       });
       assert.equal(res.status, 201);
-      const [first, second, third] = res.body;
+      assert.equal(res.body.length, 2, 'one order per seller');
+      const [first, second] = res.body;
 
-      // Seller 1, IsleDash: 300 for the first unit, 150 + 150 for the next two.
-      assert.deepEqual([Number(first.driverFeeJmd), Number(second.driverFeeJmd)], [300, 300]);
-      assert.equal(first.checkoutGroupId, second.checkoutGroupId);
-      assert.equal(Number(first.totalPaidJmd), 1050 + 300);
-      assert.equal(Number(second.totalPaidJmd), 2100 + 300);
+      // Seller 1, IsleDash, three units: 300 + 150 + 150, on one order.
+      assert.deepEqual(
+        first.items.map((i: any) => [i.shopProductId, i.quantity]),
+        [
+          [s1.a.id, 1],
+          [s1.b.id, 2],
+        ],
+      );
+      assert.equal(first.quantity, 3);
+      assert.equal(Number(first.driverFeeJmd), 600);
+      assert.equal(Number(first.totalPaidJmd), 1050 + 2100 + 600);
 
       // Seller 2, its own delivery: a single item pays the full fee.
-      assert.equal(Number(third.sellerDeliveryFeeJmd), 400);
-      assert.equal(Number(third.driverFeeJmd), 0);
-      assert.notEqual(third.checkoutGroupId, first.checkoutGroupId);
+      assert.equal(second.items.length, 1);
+      assert.equal(Number(second.sellerDeliveryFeeJmd), 400);
+      assert.equal(Number(second.driverFeeJmd), 0);
     });
 
     it('places nothing if any item fails', async () => {

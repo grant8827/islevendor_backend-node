@@ -607,9 +607,10 @@ model ShopProduct {
   isActive        Boolean  @default(true) @map("is_active")
   createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
 
-  shop    Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
-  orders  Order[]
-  ratings ProductRating[]
+  shop       Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  orders     Order[]
+  orderItems OrderItem[]
+  ratings    ProductRating[]
 
   @@map("shop_products")
 }
@@ -624,6 +625,7 @@ model StoreListing {
   store         ResellerStore   @relation(fields: [storeId], references: [id], onDelete: Cascade)
   masterProduct MasterProduct   @relation(fields: [masterProductId], references: [id], onDelete: Cascade)
   orders        Order[]
+  orderItems    OrderItem[]
   ratings       ProductRating[]
 
   // NOTE: the CHECK (retail_price_jmd > wholesale_price_jmd) constraint from the
@@ -714,10 +716,10 @@ model Order {
   shopId          String? @map("shop_id") @db.Uuid
   driverId        String? @map("driver_id") @db.Uuid
 
-  // Which exact item this order is for — same "exactly one side set" pattern
-  // as the seller FKs above. Added so a DELIVERED order can prove a customer
-  // actually bought (and can now rate) a specific product; earlier orders
-  // predate this and simply have both null (never rateable).
+  // The first item and the total number of units, kept so older clients
+  // that show one product per order still have something to show. The
+  // order's actual contents are `items` (OrderItem) — an order can hold
+  // several items, everything bought from one business in one checkout.
   storeListingId String? @map("store_listing_id") @db.Uuid
   shopProductId  String? @map("shop_product_id") @db.Uuid
   quantity       Int     @default(1)
@@ -762,9 +764,9 @@ model Order {
   storeListing   StoreListing?        @relation(fields: [storeListingId], references: [id])
   shopProduct    ShopProduct?         @relation(fields: [shopProductId], references: [id])
   ledgerTxns     LedgerTransaction[]
-  // At most one — the orderId unique constraint on ProductRating makes this
-  // a true 1:1, not a list (see that model for why: one rating per purchase).
-  rating         ProductRating?
+  items          OrderItem[]
+  // One per item the customer has rated (see ProductRating).
+  ratings        ProductRating[]
   // At most one — same one-row-per-order reasoning as rating above (the
   // orderId unique constraint on Refund makes this a true 1:1).
   refund         Refund?
@@ -785,6 +787,31 @@ model Order {
 // a driver posts manually without changing the status (see dispatch.routes.ts's
 // POST /orders/:id/note) — e.g. "stuck in traffic", "buyer not answering".
 // ─────────────────────────────────────────────────────────────────────────
+
+// One product line in an order (see Order.items). Title and image are a
+// snapshot from when it was bought; the money fields are this line's share
+// of the order's totals, before delivery.
+model OrderItem {
+  id                    String   @id @default(uuid()) @db.Uuid
+  orderId               String   @map("order_id") @db.Uuid
+  storeListingId        String?  @map("store_listing_id") @db.Uuid
+  shopProductId         String?  @map("shop_product_id") @db.Uuid
+  title                 String
+  imageUrl              String?  @map("image_url")
+  quantity              Int
+  goodsTotalJmd         Decimal  @map("goods_total_jmd") @db.Decimal(12, 2)
+  wholesaleTotalJmd     Decimal  @map("wholesale_total_jmd") @db.Decimal(12, 2)
+  resellerMarginJmd     Decimal  @map("reseller_margin_jmd") @db.Decimal(12, 2)
+  platformCommissionJmd Decimal  @map("platform_commission_jmd") @db.Decimal(12, 2)
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  order        Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  storeListing StoreListing? @relation(fields: [storeListingId], references: [id], onDelete: SetNull)
+  shopProduct  ShopProduct?  @relation(fields: [shopProductId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@map("order_items")
+}
 
 model OrderTrackingEvent {
   id        String      @id @default(uuid()) @db.Uuid
@@ -813,7 +840,7 @@ model OrderTrackingEvent {
 model ProductRating {
   id             String   @id @default(uuid()) @db.Uuid
   customerId     String   @map("customer_id") @db.Uuid
-  orderId        String   @unique @map("order_id") @db.Uuid
+  orderId        String   @map("order_id") @db.Uuid
   // Exactly one of these is set, mirroring Order.storeListingId/shopProductId
   // — whichever one the qualifying order was for.
   storeListingId String?  @map("store_listing_id") @db.Uuid
@@ -833,6 +860,9 @@ model ProductRating {
   storeListing StoreListing? @relation(fields: [storeListingId], references: [id], onDelete: Cascade)
   shopProduct  ShopProduct?  @relation(fields: [shopProductId], references: [id], onDelete: Cascade)
 
+  // One rating per item per order — buying the same item again earns another.
+  @@unique([orderId, storeListingId])
+  @@unique([orderId, shopProductId])
   @@map("product_ratings")
 }
 
