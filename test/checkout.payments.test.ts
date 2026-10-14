@@ -138,6 +138,7 @@ describe('paying at checkout', () => {
     const status = (await call('GET', `/payments/${payment.id}`, customer)).body;
     assert.equal(status.status, 'PAID');
     assert.equal(status.canRetry, false);
+    assert.equal(status.cardFeePaidBy, 'merchant');
     assert.equal(status.orders[0].id, orders[0].id);
     assert.equal(status.orders[0].status, 'PACKING');
     assert.equal((await call('POST', `/payments/${payment.id}/retry`, customer)).status, 409);

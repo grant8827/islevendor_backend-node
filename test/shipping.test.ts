@@ -57,6 +57,7 @@ describe('multi-item shipping', () => {
       assert.equal(optionFee(res.body, s.key, 'SELLER_DELIVERY'), '800.00', '400 + 200 + 200');
       assert.equal(optionFee(res.body, s.key, 'PICKUP'), '0.00');
 
+      assert.equal(res.body.cardFeePaidBy, 'merchant', 'merchant_absorb: the cart total is what the card is charged');
       const option = res.body.sellers[0].options.find((o: any) => o.method === 'SELLER_DELIVERY');
       assert.deepEqual([option.firstItemFeeJmd, option.extraItemFeeJmd], ['400.00', '200.00']);
     });

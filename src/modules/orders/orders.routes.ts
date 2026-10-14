@@ -19,6 +19,7 @@ import {
   type DeliverySettings,
 } from '../../lib/deliveryOptions.js';
 import { getIsleDashRate } from '../../lib/platformSettings.js';
+import { env } from '../../env.js';
 import { startCheckoutPayment } from '../payments/payments.service.js';
 import { requestOrigin } from '../payments/payments.routes.js';
 import { ITEMS_IN_ORDER, summarizeItems, toItemView } from '../../lib/orderItems.js';
@@ -282,6 +283,8 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
   });
 }
 
+const CARD_FEE_PAID_BY = { customer_pay: 'customer', merchant_absorb: 'merchant', split: 'split' } as const;
+
 // IsleVendor's current IsleDash pricing — shown to sellers on their
 // Shipping tab so they know what customers pay when they pick IsleDash.
 ordersRouter.get('/isledash-rate', async (_req, res, next) => {
@@ -339,7 +342,9 @@ ordersRouter.post('/quote', async (req, res, next) => {
       return { key, name: group[0].sellerName, units, options: deliveryOptionsFor(group[0].seller, isleDashRate, Math.max(units, 1)) };
     });
 
-    res.json({ items: lines, sellers });
+    // Who pays WiPay's card fee (WIPAY_FEE_STRUCTURE) — the cart says so
+    // before the customer leaves for WiPay, where any fee is added.
+    res.json({ items: lines, sellers, cardFeePaidBy: CARD_FEE_PAID_BY[env.WIPAY_FEE_STRUCTURE] });
   } catch (err) {
     next(err);
   }

@@ -212,6 +212,8 @@ export async function paymentForCustomer(paymentId: string, customerId: string) 
     createdAt: payment.createdAt,
     paidAt: payment.paidAt,
     checkoutUrl: payment.status === 'PENDING' ? payment.checkoutUrl : null,
+    // With customer_pay or split, WiPay charged a card fee on top of amountJmd.
+    cardFeePaidBy: env.WIPAY_FEE_STRUCTURE === 'customer_pay' ? 'customer' : env.WIPAY_FEE_STRUCTURE === 'split' ? 'split' : 'merchant',
     orders: orders.map((o) => ({ id: o.id, status: o.status, totalPaidJmd: o.totalPaidJmd, sellerName: o.resellerStore?.storeName ?? o.shop?.shopName ?? null })),
     // Trying again makes sense while some orders are still unpaid and this
     // is the attempt they're on.
