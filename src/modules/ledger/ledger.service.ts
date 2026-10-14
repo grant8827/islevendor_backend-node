@@ -154,6 +154,11 @@ export async function processWiPayWebhook(rawPayload: unknown) {
     // own ledger account once a driver accepts the job.
     const platformHeldAmount = new Decimal(order.driverFeeJmd.toString()).plus(order.platformCommissionJmd.toString()).toFixed(2);
 
+    // On a SELLER_DELIVERY order the business delivers it itself, so its own
+    // delivery fee goes to whichever business packs it: the shop, or the
+    // warehouse behind a reseller listing. Zero for every other method.
+    const sellerDeliveryFee = new Decimal(order.sellerDeliveryFeeJmd.toString());
+
     let legs: { recipientAccountId: string; amountJmd: Prisma.Decimal | string }[];
     if (order.shopId) {
       // STORE order: the shop keeps resellerMarginJmd in full (it's the full
@@ -163,7 +168,7 @@ export async function processWiPayWebhook(rawPayload: unknown) {
         where: { accountType: 'STORE', user: { shops: { some: { id: order.shopId } } } },
       });
       legs = [
-        { recipientAccountId: shopAccount.id, amountJmd: order.resellerMarginJmd },
+        { recipientAccountId: shopAccount.id, amountJmd: new Decimal(order.resellerMarginJmd.toString()).plus(sellerDeliveryFee).toFixed(2) },
         { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
       ];
     } else {
@@ -178,7 +183,7 @@ export async function processWiPayWebhook(rawPayload: unknown) {
         }),
       ]);
       legs = [
-        { recipientAccountId: warehouseAccount.id, amountJmd: order.wholesaleTotalJmd },
+        { recipientAccountId: warehouseAccount.id, amountJmd: new Decimal(order.wholesaleTotalJmd.toString()).plus(sellerDeliveryFee).toFixed(2) },
         { recipientAccountId: resellerAccount.id, amountJmd: order.resellerMarginJmd },
         { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
       ];
@@ -331,5 +336,34 @@ export async function withdrawBalance(userId: string) {
       throw new HttpError(409, 'Nothing available to withdraw');
     }
     return payouts;
+  });
+}
+
+/**
+ * Escrow release: moves every leg of a just-delivered order from pending to
+ * available, so it can be withdrawn (see withdrawBalance). Call inside the
+ * same transaction that moved the order to DELIVERED — that conditional
+ * transition is what guarantees this runs once per order. Moves the balance
+ * columns and the escrow_state label together; refundOrder decides which
+ * column to subtract from based on escrow_state, so they must agree.
+ *
+ * Does nothing while ENABLE_ESCROW_RELEASE is off.
+ */
+export async function releaseEscrowForOrder(tx: Prisma.TransactionClient, orderId: string) {
+  if (!env.ENABLE_ESCROW_RELEASE) return;
+  const legs = await tx.ledgerTransaction.findMany({
+    where: { orderId, escrowState: 'HELD_IN_ESCROW', reversedAt: null, payoutId: null },
+    orderBy: { recipientAccountId: 'asc' },
+  });
+  for (const leg of legs) {
+    await tx.$executeRaw`
+      UPDATE ledger_accounts
+      SET pending_balance_jmd = pending_balance_jmd - ${leg.amountJmd}, available_balance_jmd = available_balance_jmd + ${leg.amountJmd}
+      WHERE id = ${leg.recipientAccountId}::uuid;
+    `;
+  }
+  await tx.ledgerTransaction.updateMany({
+    where: { id: { in: legs.map((leg) => leg.id) } },
+    data: { escrowState: 'AVAILABLE' },
   });
 }

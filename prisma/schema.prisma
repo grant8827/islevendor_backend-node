@@ -246,6 +246,19 @@ model Warehouse {
   // (see below).
   resellerCommissionPercent Int @default(20) @map("reseller_commission_percent")
 
+  // ── Delivery options this business offers customers at checkout (see
+  // src/lib/deliveryOptions.ts). A reseller's orders ship from the
+  // warehouse, so these live on warehouses and shops, not reseller stores.
+  offersIsleDash       Boolean  @default(true) @map("offers_isledash")
+  offersSellerDelivery Boolean  @default(false) @map("offers_seller_delivery")
+  // The business's own delivery: what it charges, and anything the customer
+  // should know ("Kingston and St. Andrew only, same day before 3pm").
+  sellerDeliveryFeeJmd Decimal? @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  sellerDeliveryNote   String?  @map("seller_delivery_note")
+  // Customer collects it themselves — always free.
+  offersPickup         Boolean  @default(false) @map("offers_pickup")
+  pickupInstructions   String?  @map("pickup_instructions")
+
   user                 User                    @relation(fields: [userId], references: [id])
   products             MasterProduct[]
   orders               Order[]
@@ -550,6 +563,19 @@ model Shop {
   applicantStatus         ApplicantStatus             @default(PENDING_REVIEW) @map("applicant_status")
   referenceId             String?                     @unique @map("reference_id")
 
+  // ── Delivery options this business offers customers at checkout (see
+  // src/lib/deliveryOptions.ts). A reseller's orders ship from the
+  // warehouse, so these live on warehouses and shops, not reseller stores.
+  offersIsleDash       Boolean  @default(true) @map("offers_isledash")
+  offersSellerDelivery Boolean  @default(false) @map("offers_seller_delivery")
+  // The business's own delivery: what it charges, and anything the customer
+  // should know ("Kingston and St. Andrew only, same day before 3pm").
+  sellerDeliveryFeeJmd Decimal? @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  sellerDeliveryNote   String?  @map("seller_delivery_note")
+  // Customer collects it themselves — always free.
+  offersPickup         Boolean  @default(false) @map("offers_pickup")
+  pickupInstructions   String?  @map("pickup_instructions")
+
   user                 User                  @relation(fields: [userId], references: [id])
   products             ShopProduct[]
   orders               Order[]
@@ -645,6 +671,12 @@ model DeliveryApplication {
 // 5. ORDERS & DELIVERIES
 // ─────────────────────────────────────────────────────────────────────────
 
+enum DeliveryMethod {
+  ISLEDASH
+  SELLER_DELIVERY
+  PICKUP
+}
+
 enum OrderStatus {
   // Not in the original spec's enum: an order exists (stock is reserved) the
   // moment checkout starts, but it must not enter the warehouse's PACKING
@@ -694,15 +726,23 @@ model Order {
   driverFeeJmd          Decimal @map("driver_fee_jmd") @db.Decimal(12, 2)
   platformCommissionJmd Decimal @map("platform_commission_jmd") @db.Decimal(12, 2)
 
-  status                  OrderStatus @default(AWAITING_PAYMENT)
-  deliveryAddress         String      @map("delivery_address")
-  proofOfDeliveryImageUrl String?     @map("proof_of_delivery_image_url")
+  // How it reaches the customer, chosen at checkout. Only ISLEDASH orders
+  // go to drivers; the other two are completed by the seller (see
+  // dispatch.routes.ts's POST /orders/:id/complete).
+  deliveryMethod          DeliveryMethod @default(ISLEDASH) @map("delivery_method")
+  // The seller's own delivery charge on a SELLER_DELIVERY order — paid to the
+  // seller, unlike driverFeeJmd, which is held for an IsleDash driver. Zero
+  // for every other method.
+  sellerDeliveryFeeJmd    Decimal        @default(0) @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  status                  OrderStatus    @default(AWAITING_PAYMENT)
+  deliveryAddress         String         @map("delivery_address")
+  proofOfDeliveryImageUrl String?        @map("proof_of_delivery_image_url")
   // When the driver actually marked it DELIVERED — distinct from createdAt
   // (order placement time). Powers the driver's Delivered tab and lets the
   // seller-side Orders view show when it landed, not just that it did.
-  deliveredAt             DateTime?   @map("delivered_at") @db.Timestamptz
-  wipayTransactionId      String?     @unique @map("wipay_transaction_id")
-  createdAt               DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  deliveredAt             DateTime?      @map("delivered_at") @db.Timestamptz
+  wipayTransactionId      String?        @unique @map("wipay_transaction_id")
+  createdAt               DateTime       @default(now()) @map("created_at") @db.Timestamptz
 
   customer       User                 @relation("OrderCustomer", fields: [customerId], references: [id])
   driver         User?                @relation("OrderDriver", fields: [driverId], references: [id])

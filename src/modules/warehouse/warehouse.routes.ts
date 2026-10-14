@@ -10,6 +10,7 @@ import { createWithGeneratedSku } from '../../lib/sku.js';
 import { computeAffiliatePricing } from '../../lib/pricing.js';
 import { refundOrder } from '../ledger/ledger.service.js';
 import { assertWarehouseAccess, type WarehouseAccess } from '../../lib/warehouseAccess.js';
+import { DELIVERY_SETTINGS_SELECT, deliverySettingsSchema } from '../../lib/deliveryOptions.js';
 import { APPROVED_SELLER, assertApprovedSeller, assertHasPayoutDetails } from '../../lib/eligibility.js';
 import { registerStaffRoutes } from './warehouse.staff.js';
 
@@ -255,6 +256,12 @@ const NON_OWNER_WAREHOUSE_FIELDS = {
   operatingHours: true,
   resellerCommissionPercent: true,
   applicantStatus: true,
+  offersIsleDash: true,
+  offersSellerDelivery: true,
+  sellerDeliveryFeeJmd: true,
+  sellerDeliveryNote: true,
+  offersPickup: true,
+  pickupInstructions: true,
 } as const;
 
 warehouseRouter.get('/mine', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
@@ -291,6 +298,20 @@ warehouseRouter.patch('/:warehouseId', requireAuth, requireRole(UserRole.WAREHOU
     const { warehouse } = await assertWarehouseAccess(String(req.params.warehouseId), req.user!, { adminOnly: true });
 
     const updated = await prisma.warehouse.update({ where: { id: warehouse.id }, data: input });
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Which delivery options this warehouse offers customers — it packs and
+// ships its resellers' orders, so these apply to everything sold from its
+// stock. Owner or warehouse admin only, like the commission above.
+warehouseRouter.put('/:warehouseId/delivery-options', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const input = deliverySettingsSchema.parse(req.body);
+    const { warehouse } = await assertWarehouseAccess(String(req.params.warehouseId), req.user!, { adminOnly: true });
+    const updated = await prisma.warehouse.update({ where: { id: warehouse.id }, data: input, select: { id: true, ...DELIVERY_SETTINGS_SELECT } });
     res.json(updated);
   } catch (err) {
     next(err);

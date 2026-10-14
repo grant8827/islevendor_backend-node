@@ -146,7 +146,9 @@ export async function claimJobForDriver(io: Server, orderId: string, driverId: s
   // PICKED_UP tracking event (or vice versa).
   const claimed = await prisma.$transaction(async (tx) => {
     const result = await tx.order.updateMany({
-      where: { id: orderId, status: 'READY_FOR_PICKUP', driverId: null },
+      // Only IsleDash orders are a driver's to take — a pickup or the
+      // seller's own delivery never is, whatever a client sends.
+      where: { id: orderId, status: 'READY_FOR_PICKUP', driverId: null, deliveryMethod: 'ISLEDASH' },
       data: { driverId, status: 'PICKED_UP' },
     });
     if (result.count === 0) return false;

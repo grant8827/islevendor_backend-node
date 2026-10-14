@@ -5,6 +5,7 @@ import { UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
+import { DELIVERY_SETTINGS_SELECT, deliverySettingsSchema } from '../../lib/deliveryOptions.js';
 import { APPROVED_SELLER, assertApprovedSeller, assertHasPayoutDetails } from '../../lib/eligibility.js';
 import { imageUrlSchema } from '../../lib/validation.js';
 import { createWithGeneratedSku } from '../../lib/sku.js';
@@ -96,6 +97,18 @@ async function assertOwnsShop(shopId: string, userId: string, isAdmin: boolean) 
   if (shop.userId !== userId && !isAdmin) throw new HttpError(403, 'You do not own this shop');
   return shop;
 }
+
+// Which delivery options this shop offers its customers at checkout.
+shopRouter.put('/:shopId/delivery-options', requireAuth, requireRole(UserRole.STORE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const input = deliverySettingsSchema.parse(req.body);
+    const shop = await assertOwnsShop(String(req.params.shopId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const updated = await prisma.shop.update({ where: { id: shop.id }, data: input, select: { id: true, pickupAddress: true, ...DELIVERY_SETTINGS_SELECT } });
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
 
 const createProductSchema = z.object({
   shopId: z.string().uuid(),
