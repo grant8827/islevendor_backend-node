@@ -38,4 +38,11 @@ Object.assign(process.env, {
   ENABLE_INTERNAL_REFUNDS: 'false',
   ENABLE_ESCROW_RELEASE: 'false',
   SERVE_PUBLIC_UPLOADS: 'false',
+  // A fixed test-only key, so encrypted payout details round-trip in tests.
+  PAYOUT_DATA_KEY: Buffer.alloc(32, 7).toString('base64'),
+  ENABLE_AUTOMATED_PAYOUTS: 'false',
+  WIPAY_PAYOUT_API_URL: '',
+  WIPAY_PAYOUT_API_KEY: '',
+  WIPAY_PAYOUT_WEBHOOK_SECRET: '',
+  WIPAY_PAYOUTS_LIVE_AUTHORIZED: 'false',
 });

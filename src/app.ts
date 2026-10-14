@@ -31,7 +31,16 @@ app.set('trust proxy', true);
 
 app.use(helmet());
 app.use(cors({ origin: env.CORS_ORIGIN, credentials: true }));
-app.use(express.json());
+// The raw bytes are kept alongside the parsed body: a webhook signature is
+// computed over exactly what was sent (see ledger.service.ts's
+// processWiPayPayoutWebhook), not over a re-serialised object.
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      (req as express.Request & { rawBody?: Buffer }).rawBody = buf;
+    },
+  }),
+);
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'backend-node' }));
 

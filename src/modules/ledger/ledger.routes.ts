@@ -2,8 +2,9 @@ import { Router } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
-import { processWiPayWebhook, withdrawBalance } from './ledger.service.js';
+import { processWiPayPayoutWebhook, processWiPayWebhook, withdrawBalance } from './ledger.service.js';
 import { getPayoutTiming } from '../../lib/platformSettings.js';
+import { registerPayoutAccountRoutes } from './payoutAccount.routes.js';
 
 export const ledgerRouter = Router();
 
@@ -14,6 +15,20 @@ ledgerRouter.post('/webhooks/wipay', async (req, res, next) => {
   try {
     const result = await processWiPayWebhook(req.body);
     res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// WiPay's withdrawal notifications (withdrawal.* events) for automated
+// payouts. Authenticated by WiPay's signature, not a session — see
+// processWiPayPayoutWebhook. Answers 2xx only once the event is durably
+// handled, so WiPay retries anything that failed.
+ledgerRouter.post('/webhooks/wipay-payouts', async (req, res, next) => {
+  try {
+    const rawBody = (req as typeof req & { rawBody?: Buffer }).rawBody;
+    if (!rawBody) throw new HttpError(400, 'Expected a JSON body');
+    res.json(await processWiPayPayoutWebhook(rawBody, req.headers));
   } catch (err) {
     next(err);
   }
@@ -108,3 +123,5 @@ ledgerRouter.get('/payouts/me', requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
+registerPayoutAccountRoutes(ledgerRouter);

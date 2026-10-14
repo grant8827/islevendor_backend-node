@@ -8,7 +8,9 @@ import { HttpError } from '../../middleware/errorHandler.js';
 import { loadDocumentReferences, type ApplicantType } from '../../lib/kycDocuments.js';
 import { recordAuditEvent } from '../../lib/audit.js';
 import { getIsleDashRate, getPayoutTiming, setIsleDashRate, setPayoutTiming } from '../../lib/platformSettings.js';
-import { settlePayout, withdrawPlatformBalance } from '../ledger/ledger.service.js';
+import { approvePayout, checkWiPayPayout, settlePayout, submitPayoutToWiPay, withdrawPlatformBalance } from '../ledger/ledger.service.js';
+import { missingForAutomaticPayout, revealForPayout } from '../../lib/payoutAccounts.js';
+import { env } from '../../env.js';
 import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 
 // The superadmin console's API (frontend: pages/admin). Mostly read-side so
@@ -330,7 +332,7 @@ adminRouter.post('/ledger/platform/withdraw', async (req, res, next) => {
   }
 });
 
-const PAYOUT_DESTINATION = {
+const LEGACY_PAYOUT_DESTINATION = {
   payoutMethod: true,
   bankName: true,
   accountHolderName: true,
@@ -340,25 +342,34 @@ const PAYOUT_DESTINATION = {
 } as const;
 
 /**
- * Where a payout should be sent — the bank or Lynk details the owner gave
- * when they applied (their first business of the account's kind). Shown in
- * full here only: an admin needs the whole account number to pay it.
+ * Where a payout should be sent: the owner's payout details (decrypted —
+ * an admin needs the whole account number to pay it), or, for someone who
+ * hasn't saved any yet, what they gave at sign-up.
  */
 async function destinationFor(account: { userId: string | null; accountType: string }) {
   if (!account.userId) return null;
-  const where = { userId: account.userId, payoutMethod: { not: null } };
-  switch (account.accountType) {
-    case 'WAREHOUSE':
-      return prisma.warehouse.findFirst({ where, select: PAYOUT_DESTINATION });
-    case 'RESELLER':
-      return prisma.resellerStore.findFirst({ where, select: PAYOUT_DESTINATION });
-    case 'STORE':
-      return prisma.shop.findFirst({ where, select: PAYOUT_DESTINATION });
-    case 'DRIVER':
-      return prisma.driverProfile.findFirst({ where, select: PAYOUT_DESTINATION });
-    default:
-      return null;
+  const saved = await prisma.payoutAccount.findUnique({ where: { userId: account.userId } });
+  if (saved) {
+    const d = revealForPayout(saved);
+    return {
+      source: 'payout_account' as const,
+      payoutMethod: d.method,
+      bankName: d.bankName,
+      branchCode: d.bankBranch,
+      bankAccountType: d.bankAccountType,
+      accountHolderName: d.nameInBank,
+      accountNumber: d.accountNumber,
+      lynkWalletId: d.lynkWalletId,
+      readyForAutomaticPayout: missingForAutomaticPayout(saved).length === 0,
+    };
   }
+  const where = { userId: account.userId, payoutMethod: { not: null } };
+  const legacy =
+    (await prisma.warehouse.findFirst({ where, select: LEGACY_PAYOUT_DESTINATION })) ??
+    (await prisma.resellerStore.findFirst({ where, select: LEGACY_PAYOUT_DESTINATION })) ??
+    (await prisma.shop.findFirst({ where, select: LEGACY_PAYOUT_DESTINATION })) ??
+    (await prisma.driverProfile.findFirst({ where, select: LEGACY_PAYOUT_DESTINATION }));
+  return legacy ? { source: 'sign_up' as const, ...legacy, readyForAutomaticPayout: false } : null;
 }
 
 // Every payout request, oldest first while they wait to be paid (?status=
@@ -366,7 +377,7 @@ async function destinationFor(account: { userId: string | null; accountType: str
 // where to send it.
 adminRouter.get('/payouts', async (req, res, next) => {
   try {
-    const status = z.enum(['REQUESTED', 'PAID', 'FAILED']).default('REQUESTED').parse(req.query.status);
+    const status = z.enum(['REQUESTED', 'APPROVED', 'SUBMITTED', 'PROCESSING', 'PAID', 'FAILED']).default('REQUESTED').parse(req.query.status);
     const page = pageSchema.parse(req.query.page);
     const where = { status };
     const [total, payouts] = await Promise.all([
@@ -382,7 +393,7 @@ adminRouter.get('/payouts', async (req, res, next) => {
     const withDestinations = await Promise.all(
       payouts.map(async (p) => ({ ...p, destination: await destinationFor(p.ledgerAccount) })),
     );
-    res.json({ total, page, pageSize: PAGE_SIZE, payouts: withDestinations });
+    res.json({ total, page, pageSize: PAGE_SIZE, payouts: withDestinations, automatedPayoutsEnabled: env.ENABLE_AUTOMATED_PAYOUTS });
   } catch (err) {
     next(err);
   }
@@ -413,6 +424,58 @@ adminRouter.patch('/payouts/:id', async (req, res, next) => {
         tx,
       );
       return settled;
+    });
+    res.json(payout);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Approve a payout request — checked and OK to pay, by hand or through WiPay.
+adminRouter.post('/payouts/:id/approve', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const payout = await prisma.$transaction(async (tx) => {
+      const approved = await approvePayout(tx, id, req.user!.sub);
+      await recordAuditEvent(req, { action: 'payout.approved', targetType: 'payout', targetId: id, metadata: { amountJmd: approved.amountJmd.toFixed(2) } }, tx);
+      return approved;
+    });
+    res.json(payout);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Send an approved payout to the owner's bank through WiPay. Only while
+// ENABLE_AUTOMATED_PAYOUTS is on; marked PAID only when WiPay's own status
+// says the transfer completed.
+adminRouter.post('/payouts/:id/send-wipay', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    await recordAuditEvent(req, { action: 'payout.wipay_submission_started', targetType: 'payout', targetId: id });
+    const payout = await submitPayoutToWiPay(id, req.user!.sub);
+    await recordAuditEvent(req, {
+      action: 'payout.sent_to_wipay',
+      targetType: 'payout',
+      targetId: id,
+      metadata: { amountJmd: payout.amountJmd.toFixed(2), ...(payout.providerTransactionId ? { transactionId: payout.providerTransactionId } : {}) },
+    });
+    res.json(payout);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Ask WiPay where a payout stands — after a timeout, or to refresh status.
+adminRouter.post('/payouts/:id/check-wipay', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const payout = await checkWiPayPayout(id);
+    await recordAuditEvent(req, {
+      action: 'payout.checked_with_wipay',
+      targetType: 'payout',
+      targetId: id,
+      metadata: { status: payout.status, ...(payout.providerStatus !== null ? { wipayStatus: payout.providerStatus } : {}) },
     });
     res.json(payout);
   } catch (err) {

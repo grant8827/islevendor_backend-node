@@ -8,6 +8,17 @@ import { getSocketServer } from '../../lib/socket.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
 import { canWithdrawFrom } from '../../lib/eligibility.js';
+import { missingForAutomaticPayout, revealForPayout, snapshotOf } from '../../lib/payoutAccounts.js';
+import { WIPAY_ID_TYPES } from '../../lib/wipayBanks.js';
+import {
+  createSubBankedWithdrawal,
+  findWithdrawals,
+  interpretStatus,
+  retrieveWithdrawal,
+  WiPayRejectedError,
+  WiPayUncertainError,
+  type WiPayWithdrawal,
+} from '../../lib/wipayPayouts.js';
 import { addBusinessDays, getPayoutTiming } from '../../lib/platformSettings.js';
 
 export interface WiPayWebhookPayload {
@@ -370,13 +381,14 @@ async function requestPayouts(tx: Prisma.TransactionClient, accountIds: string[]
 }
 
 /**
- * Records how a payout request was settled, once an IsleVendor admin has
+ * Records how a payout was settled by hand, once an IsleVendor admin has
  * sent (or failed to send) the money outside the platform:
  *  - PAID: the money went out; `reference` is the bank/Lynk transfer reference.
  *  - FAILED: it didn't; the legs return to the account's available balance,
  *    so the owner can withdraw them again.
- * Only a REQUESTED payout can be settled, and only once — the conditional
- * update is the race-decider.
+ * Works on a REQUESTED or APPROVED payout, once — the conditional update is
+ * the race-decider. A payout already sent to WiPay is settled by WiPay's
+ * own status instead (see applyWiPayStatus), never by hand.
  */
 export async function settlePayout(
   tx: Prisma.TransactionClient,
@@ -385,22 +397,280 @@ export async function settlePayout(
   adminId: string,
 ) {
   const settled = await tx.payout.updateMany({
-    where: { id: payoutId, status: 'REQUESTED' },
-    data: { status: outcome.status, reference: outcome.reference ?? null, note: outcome.note ?? null, settledAt: new Date(), settledBy: adminId },
+    where: { id: payoutId, status: { in: ['REQUESTED', 'APPROVED'] } },
+    data: {
+      status: outcome.status,
+      channel: 'MANUAL',
+      reference: outcome.reference ?? null,
+      note: outcome.note ?? null,
+      settledAt: new Date(),
+      settledBy: adminId,
+    },
   });
   if (settled.count === 0) {
-    const exists = await tx.payout.count({ where: { id: payoutId } });
-    throw new HttpError(exists ? 409 : 404, exists ? 'This payout has already been settled' : 'Payout not found');
+    const existing = await tx.payout.findUnique({ where: { id: payoutId } });
+    if (!existing) throw new HttpError(404, 'Payout not found');
+    if (existing.status === 'SUBMITTED' || existing.status === 'PROCESSING') {
+      throw new HttpError(409, 'This payout was sent through WiPay — its outcome comes from WiPay. Use "Check with WiPay".');
+    }
+    throw new HttpError(409, 'This payout has already been settled');
   }
 
   const payout = await tx.payout.findUniqueOrThrow({ where: { id: payoutId } });
-  if (outcome.status === 'FAILED') {
-    await tx.ledgerTransaction.updateMany({ where: { payoutId }, data: { payoutId: null } });
-    await tx.$executeRaw`
-      UPDATE ledger_accounts SET available_balance_jmd = available_balance_jmd + ${payout.amountJmd} WHERE id = ${payout.ledgerAccountId}::uuid
-    `;
-  }
+  if (outcome.status === 'FAILED') await returnPayoutFunds(tx, payout);
   return payout;
+}
+
+/** A failed payout's money goes back: its legs are freed and the account's available balance restored. */
+async function returnPayoutFunds(tx: Prisma.TransactionClient, payout: { id: string; amountJmd: Prisma.Decimal; ledgerAccountId: string }) {
+  await tx.ledgerTransaction.updateMany({ where: { payoutId: payout.id }, data: { payoutId: null } });
+  await tx.$executeRaw`
+    UPDATE ledger_accounts SET available_balance_jmd = available_balance_jmd + ${payout.amountJmd} WHERE id = ${payout.ledgerAccountId}::uuid
+  `;
+}
+
+/**
+ * An admin approves a payout request: it's been checked and can be paid,
+ * by hand or (if enabled) through WiPay. Records where it's going, masked.
+ */
+export async function approvePayout(tx: Prisma.TransactionClient, payoutId: string, adminId: string) {
+  const payout = await tx.payout.findUnique({ where: { id: payoutId }, include: { ledgerAccount: true } });
+  if (!payout) throw new HttpError(404, 'Payout not found');
+  const destination = payout.ledgerAccount.userId ? await tx.payoutAccount.findUnique({ where: { userId: payout.ledgerAccount.userId } }) : null;
+
+  const approved = await tx.payout.updateMany({
+    where: { id: payoutId, status: 'REQUESTED' },
+    data: {
+      status: 'APPROVED',
+      approvedAt: new Date(),
+      approvedBy: adminId,
+      destinationSnapshot: destination ? snapshotOf(destination) : payout.ledgerAccount.accountType === 'PLATFORM' ? { owner: 'IsleVendor' } : Prisma.DbNull,
+    },
+  });
+  if (approved.count === 0) throw new HttpError(409, 'Only a payout waiting for approval can be approved');
+  return tx.payout.findUniqueOrThrow({ where: { id: payoutId } });
+}
+
+// ── Automated payouts through WiPay ─────────────────────────────────────────
+//
+// APPROVED -> SUBMITTED (we're about to ask WiPay; committed before the call
+// so two clicks can't both send) -> PROCESSING (WiPay accepted it) -> PAID
+// or FAILED by WiPay's own withdrawal status, never by our request being
+// accepted. If we can't tell whether WiPay accepted a submission (timeout,
+// 5xx), it stays SUBMITTED until checkWiPayPayout has looked it up in WiPay's
+// records — a payout is never sent twice on a guess.
+
+function assertAutomatedPayoutsEnabled() {
+  if (!env.ENABLE_AUTOMATED_PAYOUTS) throw new HttpError(503, 'Automatic WiPay payouts are switched off — pay this one by hand');
+}
+
+// How long after a submission WiPay's records are trusted to show it, before
+// "not there" is taken to mean it was never accepted.
+const SUBMISSION_SETTLE_MS = 15 * 60 * 1000;
+
+export async function submitPayoutToWiPay(payoutId: string, adminId: string) {
+  assertAutomatedPayoutsEnabled();
+
+  // Claim it: APPROVED -> SUBMITTED with a fresh submission key, committed
+  // before WiPay is called.
+  const { payout, account } = await prisma.$transaction(async (tx) => {
+    const current = await tx.payout.findUnique({ where: { id: payoutId }, include: { ledgerAccount: true } });
+    if (!current) throw new HttpError(404, 'Payout not found');
+    if (current.status !== 'APPROVED') throw new HttpError(409, 'Only an approved payout can be sent through WiPay');
+    if (!current.ledgerAccount.userId) throw new HttpError(409, "IsleVendor's own withdrawals are paid by hand");
+    const destination = await tx.payoutAccount.findUnique({ where: { userId: current.ledgerAccount.userId } });
+    const missing = destination ? missingForAutomaticPayout(destination) : ['payout details'];
+    if (missing.length) throw new HttpError(409, `This person's payout details aren't complete for WiPay: missing ${missing.join(', ')}`);
+
+    const claimed = await tx.payout.updateMany({
+      where: { id: payoutId, status: 'APPROVED' },
+      data: { status: 'SUBMITTED', channel: 'WIPAY', submissionKey: crypto.randomUUID(), submittedAt: new Date(), lastError: null, destinationSnapshot: snapshotOf(destination!) },
+    });
+    if (claimed.count === 0) throw new HttpError(409, 'This payout is already being sent');
+    return { payout: await tx.payout.findUniqueOrThrow({ where: { id: payoutId } }), account: destination! };
+  });
+
+  const details = revealForPayout(account);
+  try {
+    const withdrawal = await createSubBankedWithdrawal({
+      amountJmd: payout.amountJmd.toFixed(2),
+      email: details.email!,
+      phone: details.phone!,
+      bankName: details.bankName!,
+      bankAccount: details.accountNumber!,
+      bankAccountType: details.bankAccountType === 'SAVINGS' ? 'savings' : 'chequing',
+      bankBranch: details.bankBranch!,
+      nameInBank: details.nameInBank!,
+      idType: WIPAY_ID_TYPES[details.idType!].wipay,
+      idNumber: details.idNumber!,
+      data: JSON.stringify({ payoutId: payout.id, submissionKey: payout.submissionKey }),
+    });
+    // Accepted — which only means WiPay will try. It's PROCESSING until
+    // WiPay's status says otherwise.
+    return prisma.$transaction((tx) => recordWiPayWithdrawal(tx, payout.id, withdrawal));
+  } catch (err) {
+    if (err instanceof WiPayRejectedError) {
+      // Definitely not created: back to APPROVED, free to fix and send again.
+      await prisma.payout.update({
+        where: { id: payout.id },
+        data: { status: 'APPROVED', channel: null, submissionKey: null, submittedAt: null, lastError: `WiPay refused it: ${err.message}` },
+      });
+      throw new HttpError(422, `WiPay refused this payout: ${err.message}`);
+    }
+    if (err instanceof WiPayUncertainError) {
+      await prisma.payout.update({
+        where: { id: payout.id },
+        data: { lastError: `${err.message}. It may or may not have gone through — use "Check with WiPay" before doing anything else.` },
+      });
+      throw new HttpError(504, 'WiPay didn’t answer — the payout may or may not have been accepted. Use "Check with WiPay"; don’t send it again yet.');
+    }
+    throw err;
+  }
+}
+
+/**
+ * Asks WiPay where a payout stands and applies it. For a submission whose
+ * outcome we never heard, looks it up in WiPay's withdrawal history by our
+ * submission key first; only once enough time has passed and WiPay has no
+ * record of it is it released back to APPROVED to be sent again.
+ */
+export async function checkWiPayPayout(payoutId: string) {
+  const payout = await prisma.payout.findUnique({ where: { id: payoutId } });
+  if (!payout) throw new HttpError(404, 'Payout not found');
+  if (payout.channel !== 'WIPAY' || !['SUBMITTED', 'PROCESSING'].includes(payout.status)) {
+    throw new HttpError(409, 'This payout isn’t waiting on WiPay');
+  }
+
+  if (payout.providerTransactionId) {
+    const withdrawal = await retrieveWithdrawal(payout.providerTransactionId);
+    return prisma.$transaction((tx) => recordWiPayWithdrawal(tx, payout.id, withdrawal));
+  }
+
+  const found = (await findWithdrawals({ amountJmd: payout.amountJmd.toFixed(2), since: payout.submittedAt! })).find((w) =>
+    w.data?.includes(payout.submissionKey!),
+  );
+  if (found) return prisma.$transaction((tx) => recordWiPayWithdrawal(tx, payout.id, found));
+
+  if (Date.now() - payout.submittedAt!.getTime() < SUBMISSION_SETTLE_MS) {
+    throw new HttpError(409, 'WiPay doesn’t show this payout yet. Check again in a few minutes before sending it again.');
+  }
+  // Verified: WiPay never accepted it. Safe to send again, with a new key.
+  return prisma.payout.update({
+    where: { id: payout.id },
+    data: {
+      status: 'APPROVED',
+      channel: null,
+      submissionKey: null,
+      submittedAt: null,
+      providerCheckedAt: new Date(),
+      lastError: 'WiPay has no record of the earlier attempt, so it was never sent. It can be sent again.',
+    },
+  });
+}
+
+/**
+ * Applies a WiPay withdrawal record to its payout: WiPay's transaction id,
+ * status and fee, then — by that status alone — PAID (status 2), FAILED
+ * with the money returned to the owner (status 5), or still PROCESSING.
+ * Only moves a payout that's with WiPay, and only forward.
+ */
+export async function recordWiPayWithdrawal(tx: Prisma.TransactionClient, payoutId: string, withdrawal: WiPayWithdrawal) {
+  const payout = await tx.payout.findUniqueOrThrow({ where: { id: payoutId } });
+  const outcome = interpretStatus(withdrawal.status);
+  const provider = {
+    providerTransactionId: withdrawal.transaction_id ?? payout.providerTransactionId,
+    providerReference: withdrawal.reference ?? payout.providerReference,
+    providerStatus: withdrawal.status ?? payout.providerStatus,
+    providerStatusDescription: withdrawal.status_description ?? payout.providerStatusDescription,
+    providerFeeJmd: withdrawal.fee_amount ?? payout.providerFeeJmd,
+    providerCheckedAt: new Date(),
+    lastError: null,
+  };
+  const inFlight = { id: payoutId, status: { in: ['SUBMITTED', 'PROCESSING'] as ('SUBMITTED' | 'PROCESSING')[] } };
+
+  if (outcome === 'PAID') {
+    await tx.payout.updateMany({ where: inFlight, data: { ...provider, status: 'PAID', settledAt: new Date(), reference: provider.providerReference ?? provider.providerTransactionId } });
+  } else if (outcome === 'FAILED') {
+    const failed = await tx.payout.updateMany({
+      where: inFlight,
+      data: { ...provider, status: 'FAILED', settledAt: new Date(), note: `WiPay: ${withdrawal.status_description ?? 'returned to IsleVendor'}` },
+    });
+    if (failed.count === 1) await returnPayoutFunds(tx, payout);
+  } else {
+    await tx.payout.updateMany({ where: inFlight, data: { ...provider, status: 'PROCESSING' } });
+  }
+  return tx.payout.findUniqueOrThrow({ where: { id: payoutId } });
+}
+
+const WEBHOOK_TOLERANCE_SECONDS = 300;
+
+/**
+ * A withdrawal notification from WiPay. Verifies the signature (HMAC-SHA256
+ * of "<timestamp>.<raw body>" with the endpoint's signing secret, per
+ * https://docs.wipayfinancial.com/webhooks) and its age, skips an event
+ * already handled, then — rather than trusting the payload's status —
+ * fetches the withdrawal from WiPay and applies that.
+ *
+ * Returns normally once the event is durably handled (the caller answers
+ * 2xx); throws to make WiPay retry.
+ */
+export async function processWiPayPayoutWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>) {
+  if (!env.WIPAY_PAYOUT_WEBHOOK_SECRET) throw new HttpError(503, 'WiPay payout notifications are not configured');
+  const header = (name: string) => {
+    const v = headers[name];
+    return Array.isArray(v) ? v[0] : v;
+  };
+  const signature = header('x-wipay-webhook-signature') ?? '';
+  const timestamp = Number(header('x-wipay-webhook-timestamp'));
+  if (!signature.startsWith('sha256=') || !Number.isInteger(timestamp) || Math.abs(Date.now() / 1000 - timestamp) > WEBHOOK_TOLERANCE_SECONDS) {
+    throw new HttpError(400, 'Invalid or expired WiPay signature');
+  }
+  const expected = Buffer.from(crypto.createHmac('sha256', env.WIPAY_PAYOUT_WEBHOOK_SECRET).update(`${timestamp}.`).update(rawBody).digest('hex'));
+  const provided = Buffer.from(signature.slice('sha256='.length).toLowerCase());
+  if (expected.length !== provided.length || !crypto.timingSafeEqual(expected, provided)) {
+    throw new HttpError(400, 'Invalid or expired WiPay signature');
+  }
+
+  const envelope = z
+    .object({ id: z.string().min(1).max(255), event: z.string().max(100), data: z.record(z.unknown()).optional() })
+    .passthrough()
+    .parse(JSON.parse(rawBody.toString('utf8')));
+  if (await prisma.payoutWebhookEvent.findUnique({ where: { providerEventId: envelope.id } })) {
+    return { duplicate: true };
+  }
+
+  let payoutId: string | null = null;
+  let outcome = 'ignored';
+  if (envelope.event.startsWith('withdrawal.') && envelope.data) {
+    const transactionId = typeof envelope.data.transaction_id === 'string' ? envelope.data.transaction_id : null;
+    let fromData: string | null = null;
+    try {
+      fromData = typeof envelope.data.data === 'string' ? (JSON.parse(envelope.data.data).payoutId ?? null) : null;
+    } catch {
+      // Someone else's pass-through data — not one of ours.
+    }
+    const payout = await prisma.payout.findFirst({
+      where: { OR: [...(transactionId ? [{ providerTransactionId: transactionId }] : []), ...(fromData && /^[0-9a-f-]{36}$/i.test(fromData) ? [{ id: fromData }] : [])] },
+    });
+    if (!payout) {
+      outcome = 'unmatched';
+    } else if (payout.channel === 'WIPAY' && ['SUBMITTED', 'PROCESSING'].includes(payout.status)) {
+      // The notification says something changed; WiPay's own record says what.
+      const withdrawal = await retrieveWithdrawal(transactionId ?? payout.providerTransactionId!);
+      await prisma.$transaction((tx) => recordWiPayWithdrawal(tx, payout.id, withdrawal));
+      payoutId = payout.id;
+      outcome = 'applied';
+    } else {
+      payoutId = payout.id;
+      outcome = 'already_settled';
+    }
+  }
+
+  await prisma.payoutWebhookEvent.createMany({
+    data: [{ providerEventId: envelope.id, event: envelope.event, payoutId, outcome, payload: envelope as Prisma.InputJsonObject }],
+    skipDuplicates: true,
+  });
+  return { outcome };
 }
 
 /**

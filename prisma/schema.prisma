@@ -83,6 +83,7 @@ model User {
   trackingEventsPosted OrderTrackingEvent[] @relation("TrackingEventPoster")
   auditEvents          AuditEvent[]         @relation("AuditActor")
   applicationMessages  ApplicationMessage[] @relation("ApplicationMessageSender")
+  payoutAccount        PayoutAccount?
 
   @@map("users")
 }
@@ -1026,10 +1027,32 @@ model Refund {
 // integration exists), and nothing should until one does.
 enum PayoutStatus {
   REQUESTED
+  // An admin has checked the request and it can be paid.
+  APPROVED
+  // Sent to WiPay; whether WiPay accepted it isn't confirmed yet.
+  SUBMITTED
   PROCESSING
   PAID
   FAILED
   REVERSED
+}
+
+// How a payout was (or is being) sent: by an admin's own transfer, or
+// through WiPay's withdrawal API.
+enum PayoutChannel {
+  MANUAL
+  WIPAY
+}
+
+enum BankAccountType {
+  CHEQUING
+  SAVINGS
+}
+
+enum IdDocumentType {
+  DRIVER_PERMIT
+  NATIONAL_ID
+  PASSPORT
 }
 
 model Payout {
@@ -1047,7 +1070,25 @@ model Payout {
   // When the money should reach the owner's account at the latest — the
   // request date plus the payout time IsleVendor advertised at the time.
   expectedBy      DateTime?    @map("expected_by") @db.Date
-  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz
+
+  channel                   PayoutChannel?
+  approvedAt                DateTime?      @map("approved_at") @db.Timestamptz
+  approvedBy                String?        @map("approved_by") @db.Uuid
+  // Where it was sent, as it was at approval — masked, never the full number.
+  destinationSnapshot       Json?          @map("destination_snapshot")
+  // Our reference for a WiPay submission, sent in its pass-through data —
+  // how an uncertain submission is found again before any retry.
+  submissionKey             String?        @unique @map("submission_key") @db.Uuid
+  submittedAt               DateTime?      @map("submitted_at") @db.Timestamptz
+  providerTransactionId     String?        @unique @map("provider_transaction_id")
+  providerReference         String?        @map("provider_reference")
+  // WiPay's withdrawal status code (see lib/wipayPayouts.ts) and its wording.
+  providerStatus            Int?           @map("provider_status")
+  providerStatusDescription String?        @map("provider_status_description")
+  providerFeeJmd            Decimal?       @map("provider_fee_jmd") @db.Decimal(12, 2)
+  providerCheckedAt         DateTime?      @map("provider_checked_at") @db.Timestamptz
+  lastError                 String?        @map("last_error")
+  createdAt                 DateTime       @default(now()) @map("created_at") @db.Timestamptz
 
   ledgerAccount LedgerAccount       @relation(fields: [ledgerAccountId], references: [id], onDelete: Cascade)
   legs          LedgerTransaction[]
@@ -1129,4 +1170,47 @@ model PlatformSetting {
   updatedBy                String?  @map("updated_by") @db.Uuid
 
   @@map("platform_settings")
+}
+
+// Where one person's payouts go (see modules/ledger/payoutAccount.routes.ts).
+// Account and ID numbers are encrypted by the application (lib/crypto.ts,
+// PAYOUT_DATA_KEY) — only the last four digits are readable. The ID type
+// and number, email and phone are what WiPay needs to pay a bank account
+// automatically; manual payouts don't need them.
+model PayoutAccount {
+  id                     String           @id @default(uuid()) @db.Uuid
+  userId                 String           @unique @map("user_id") @db.Uuid
+  method                 PayoutMethod
+  // One of WiPay's supported Jamaican banks, by WiPay's name for it.
+  bankName               String?          @map("bank_name")
+  bankBranch             String?          @map("bank_branch")
+  bankAccountType        BankAccountType? @map("bank_account_type")
+  accountNumberEncrypted String?          @map("account_number_encrypted")
+  accountNumberLast4     String?          @map("account_number_last4")
+  nameInBank             String?          @map("name_in_bank")
+  lynkWalletId           String?          @map("lynk_wallet_id")
+  idType                 IdDocumentType?  @map("id_type")
+  idNumberEncrypted      String?          @map("id_number_encrypted")
+  email                  String?
+  phone                  String?
+  createdAt              DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt              DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("payout_accounts")
+}
+
+// One WiPay withdrawal notification, kept by WiPay's event id so a
+// redelivery is recognised and skipped.
+model PayoutWebhookEvent {
+  id              String   @id @default(uuid()) @db.Uuid
+  providerEventId String   @unique @map("provider_event_id")
+  event           String
+  payoutId        String?  @map("payout_id") @db.Uuid
+  outcome         String
+  payload         Json
+  receivedAt      DateTime @default(now()) @map("received_at") @db.Timestamptz
+
+  @@map("payout_webhook_events")
 }
