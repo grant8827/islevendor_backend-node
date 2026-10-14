@@ -418,6 +418,8 @@ ordersRouter.get('/mine', requireAuth, async (req, res, next) => {
           totalPaidJmd: o.totalPaidJmd,
           deliveryMethod: o.deliveryMethod,
           deliveryAddress: o.deliveryAddress,
+          // Where an unpaid order's "Pay now" goes (the payment status page).
+          checkoutPaymentId: o.checkoutPaymentId,
           sellerName: o.resellerStore?.storeName ?? o.shop?.shopName ?? null,
           items: o.items.map((item) => {
             const rating = ratingOf(item.storeListingId ?? item.shopProductId);
