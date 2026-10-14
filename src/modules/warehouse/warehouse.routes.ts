@@ -435,15 +435,19 @@ warehouseRouter.get('/:warehouseId/delivery-applications', requireAuth, requireR
         warehouseId: String(req.params.warehouseId),
         ...(status ? { status: status as 'PENDING' | 'APPROVED' | 'SUSPENDED' | 'REJECTED' } : {}),
       },
-      include: { driver: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } } },
+      include: {
+        driver: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } },
+        // Driver messages the business hasn't opened yet.
+        _count: { select: { messages: { where: { senderSide: 'DRIVER', readAt: null } } } },
+      },
       orderBy: { requestedAt: 'desc' },
     });
     // Payout/bank details are the driver's private info — never sent to the
     // warehouse/shop they deliver for.
     res.json(
-      applications.map(({ driver, ...rest }) => {
+      applications.map(({ driver, _count, ...rest }) => {
         const { payoutMethod, bankName, accountHolderName, accountNumber, branchCode, lynkWalletId, ...publicDriver } = driver;
-        return { ...rest, driver: publicDriver };
+        return { ...rest, driver: publicDriver, unreadMessages: _count.messages };
       }),
     );
   } catch (err) {
