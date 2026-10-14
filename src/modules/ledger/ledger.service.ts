@@ -21,43 +21,7 @@ import {
 } from '../../lib/wipayPayouts.js';
 import { addBusinessDays, getPayoutTiming } from '../../lib/platformSettings.js';
 
-export interface WiPayWebhookPayload {
-  order_id: string;
-  transaction_id: string;
-  hash: string;
-  status: string;
-  [key: string]: unknown;
-}
-
 const WIPAY_PROVIDER = 'WIPAY';
-
-/**
- * WiPay signs callbacks with an MD5 hash over a set of response fields + your
- * API key (see WiPay Jamaica merchant docs for the exact field order — this
- * is a placeholder until real sandbox credentials are wired in).
- */
-export function verifyWiPayHash(payload: WiPayWebhookPayload): boolean {
-  if (!env.WIPAY_API_KEY) {
-    console.error('[wipay] WIPAY_API_KEY is not configured; rejecting callback');
-    return false;
-  }
-  const expected = crypto
-    .createHash('md5')
-    .update(`${payload.transaction_id}${payload.order_id}${env.WIPAY_API_KEY}`)
-    .digest('hex');
-  return expected === payload.hash;
-}
-
-// Strict shape for the fields this code acts on. Anything else WiPay sends
-// is kept verbatim on the PaymentEvent row, but never trusted.
-const wipayWebhookSchema = z
-  .object({
-    order_id: z.string().uuid(),
-    transaction_id: z.string().min(1).max(128),
-    hash: z.string().min(1).max(128),
-    status: z.string().min(1).max(32),
-  })
-  .passthrough();
 
 /** Adds `amount` to an account's pending (in-escrow) balance. */
 async function creditPending(tx: Prisma.TransactionClient, accountId: string, amount: Prisma.Decimal | string) {
@@ -67,173 +31,167 @@ async function creditPending(tx: Prisma.TransactionClient, accountId: string, am
 }
 
 /**
- * Atomically:
- *  1. Verifies the WiPay signature.
- *  2. Records the callback as a PaymentEvent.
- *  3. Flips the order from AWAITING_PAYMENT -> PACKING.
- *  4. Records the HELD_IN_ESCROW ledger legs — three (warehouse/affiliate/
- *     platform) for an AFFILIATE order, two (shop/platform) for a STORE
- *     order, since a shop sells its own stock directly — and credits each
- *     recipient's pending balance.
- *  5. Notifies the seller (warehouse or shop) over WebSocket.
+ * Credits one order for a confirmed WiPay payment, inside the caller's
+ * transaction (see modules/payments, which verifies the payment first):
+ *  1. Records the event as a PaymentEvent keyed by WiPay's transaction and
+ *     this order, so a redelivery is a no-op.
+ *  2. Flips the order from AWAITING_PAYMENT -> PACKING.
+ *  3. Records the HELD_IN_ESCROW ledger legs — warehouse/affiliate/platform
+ *     for an AFFILIATE order, shop/platform for a STORE order — and credits
+ *     each recipient's pending balance.
  *
- * Exactly-once, however many callbacks arrive and however they interleave:
- *  - The same callback redelivered (or a transaction id replayed against a
- *    different order) hits the PaymentEvent unique key and stops at step 2.
- *  - Two *different* transactions for one order queue on the order's row
- *    lock; the first moves it out of AWAITING_PAYMENT, so the second's
- *    conditional `status = AWAITING_PAYMENT` update at step 3 matches zero
- *    rows and stops.
- *  Only the winner of step 3 ever reaches step 4, so ledger rows and account
- *  balances can't diverge.
+ * Exactly-once however callbacks interleave: the order row is locked first,
+ * the event key stops redeliveries, and the conditional AWAITING_PAYMENT
+ * transition stops a second transaction for an already-paid order — only
+ * its winner reaches the ledger. Returns whether this call credited it; the
+ * caller tells the seller once the transaction commits.
  */
-export async function processWiPayWebhook(rawPayload: unknown) {
-  if (!env.ENABLE_WIPAY_WEBHOOKS) {
-    throw new HttpError(503, 'WiPay webhook processing is temporarily disabled');
+export async function creditOrderPayment(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  event: { transactionId: string; status: string; payload: Prisma.InputJsonObject },
+) {
+  // Row-lock the order before anything else, so callbacks for one order
+  // are handled strictly one at a time. Not just tidiness: the PaymentEvent
+  // insert below takes a key-share lock on this row through its foreign
+  // key, and the status update further down needs a full row lock (it
+  // writes the uniquely-indexed wipay_transaction_id) — two callbacks each
+  // holding the first while waiting for the second would deadlock.
+  await tx.$queryRaw`SELECT id FROM orders WHERE id = ${orderId}::uuid FOR UPDATE`;
+  const order = await tx.order.findUnique({ where: { id: orderId } });
+  if (!order) throw new HttpError(404, 'Order not found for webhook payload');
+
+  // skipDuplicates (ON CONFLICT DO NOTHING) rather than a caught unique
+  // violation: a violation would abort this whole transaction. A concurrent
+  // delivery of the same event waits here until the first commits, then
+  // inserts nothing.
+  const recorded = await tx.paymentEvent.createMany({
+    data: [
+      {
+        provider: WIPAY_PROVIDER,
+        // One WiPay transaction can pay several orders, so the event key is
+        // the transaction and the order together.
+        providerEventId: `${event.transactionId}:${orderId}`,
+        orderId: order.id,
+        status: event.status,
+        payload: event.payload,
+      },
+    ],
+    skipDuplicates: true,
+  });
+  if (recorded.count === 0) {
+    return { skipped: true as const, reason: 'duplicate webhook delivery' };
   }
-  const payload = wipayWebhookSchema.parse(rawPayload);
-  if (!verifyWiPayHash(payload)) {
-    throw new HttpError(400, 'Invalid WiPay signature');
+  const setOutcome = (outcome: PaymentEventOutcome) =>
+    tx.paymentEvent.update({
+      where: { provider_providerEventId: { provider: WIPAY_PROVIDER, providerEventId: `${event.transactionId}:${orderId}` } },
+      data: { outcome },
+    });
+
+  if (event.status !== 'success') {
+    // Nothing to credit — leave the order in AWAITING_PAYMENT for the
+    // customer to retry, or let a cleanup job cancel it after a timeout.
+    await setOutcome('IGNORED_NOT_SUCCESS');
+    return { skipped: true as const, reason: 'payment not successful' };
   }
 
-  const result = await prisma.$transaction(async (tx) => {
-    // Row-lock the order before anything else, so callbacks for one order
-    // are handled strictly one at a time. Not just tidiness: the PaymentEvent
-    // insert below takes a key-share lock on this row through its foreign
-    // key, and the status update further down needs a full row lock (it
-    // writes the uniquely-indexed wipay_transaction_id) — two callbacks each
-    // holding the first while waiting for the second would deadlock.
-    await tx.$queryRaw`SELECT id FROM orders WHERE id = ${payload.order_id}::uuid FOR UPDATE`;
-    const order = await tx.order.findUnique({ where: { id: payload.order_id } });
-    if (!order) throw new HttpError(404, 'Order not found for webhook payload');
+  const won = await tx.order.updateMany({
+    where: { id: order.id, status: 'AWAITING_PAYMENT' },
+    data: { status: 'PACKING', wipayTransactionId: event.transactionId },
+  });
+  if (won.count === 0) {
+    // A second successful transaction against an order that's already paid
+    // (or cancelled/refunded): money may have been taken twice. Nothing is
+    // credited; the recorded event is what reconciliation works from.
+    await setOutcome('IGNORED_ORDER_NOT_AWAITING_PAYMENT');
+    console.error(
+      `[wipay] payment ${event.transactionId} for order ${order.id} ignored — order is not awaiting payment; needs reconciliation`,
+    );
+    return { skipped: true as const, reason: 'order is not awaiting payment' };
+  }
+  await logTrackingEvent(tx, order.id, 'PACKING', { note: 'Payment confirmed — now packing' });
 
-    // skipDuplicates (ON CONFLICT DO NOTHING) rather than a caught unique
-    // violation: a violation would abort this whole transaction. A concurrent
-    // delivery of the same event waits here until the first commits, then
-    // inserts nothing.
-    const recorded = await tx.paymentEvent.createMany({
-      data: [
-        {
-          provider: WIPAY_PROVIDER,
-          providerEventId: payload.transaction_id,
-          orderId: order.id,
-          status: payload.status,
-          payload: payload as Prisma.InputJsonObject,
-        },
-      ],
-      skipDuplicates: true,
+  const platformAccount = await tx.ledgerAccount.findFirstOrThrow({ where: { accountType: 'PLATFORM' } });
+
+  // No driver is assigned yet at payment time, so the driver's fee has
+  // nowhere of its own to go — it's held on the platform account *combined
+  // with* platform commission in a single leg (not two), because the
+  // ledger's unique key is (order_id, recipient_account_id): two separate
+  // rows against the same recipient would collide. Phase 4 (dispatch) must
+  // split the driver's cut out of this combined balance into the driver's
+  // own ledger account once a driver accepts the job.
+  const platformHeldAmount = new Decimal(order.driverFeeJmd.toString()).plus(order.platformCommissionJmd.toString()).toFixed(2);
+
+  // On a SELLER_DELIVERY order the business delivers it itself, so its own
+  // delivery fee goes to whichever business packs it: the shop, or the
+  // warehouse behind a reseller listing. Zero for every other method.
+  const sellerDeliveryFee = new Decimal(order.sellerDeliveryFeeJmd.toString());
+
+  let legs: { recipientAccountId: string; amountJmd: Prisma.Decimal | string }[];
+  if (order.shopId) {
+    // STORE order: the shop keeps resellerMarginJmd in full (it's the full
+    // item revenue for a shop order, see orders.routes.ts), no separate
+    // wholesale/warehouse leg exists.
+    const shopAccount = await tx.ledgerAccount.findFirstOrThrow({
+      where: { accountType: 'STORE', user: { shops: { some: { id: order.shopId } } } },
     });
-    if (recorded.count === 0) {
-      return { skipped: true as const, reason: 'duplicate webhook delivery' };
-    }
-    const setOutcome = (outcome: PaymentEventOutcome) =>
-      tx.paymentEvent.update({
-        where: { provider_providerEventId: { provider: WIPAY_PROVIDER, providerEventId: payload.transaction_id } },
-        data: { outcome },
-      });
-
-    if (payload.status !== 'success') {
-      // Nothing to credit — leave the order in AWAITING_PAYMENT for the
-      // customer to retry, or let a cleanup job cancel it after a timeout.
-      await setOutcome('IGNORED_NOT_SUCCESS');
-      return { skipped: true as const, reason: 'payment not successful' };
-    }
-
-    const won = await tx.order.updateMany({
-      where: { id: order.id, status: 'AWAITING_PAYMENT' },
-      data: { status: 'PACKING', wipayTransactionId: payload.transaction_id },
+    legs = [
+      { recipientAccountId: shopAccount.id, amountJmd: new Decimal(order.resellerMarginJmd.toString()).plus(sellerDeliveryFee).toFixed(2) },
+      { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
+    ];
+  } else {
+    // AFFILIATE order: warehouse (wholesale) + affiliate (margin) +
+    // driver/platform combined.
+    const warehouseAccount = await tx.ledgerAccount.findFirstOrThrow({
+      where: { accountType: 'WAREHOUSE', user: { warehouses: { some: { id: order.warehouseId! } } } },
     });
-    if (won.count === 0) {
-      // A second successful transaction against an order that's already paid
-      // (or cancelled/refunded): money may have been taken twice. Nothing is
-      // credited; the recorded event is what reconciliation works from.
-      await setOutcome('IGNORED_ORDER_NOT_AWAITING_PAYMENT');
-      console.error(
-        `[wipay] success callback ${payload.transaction_id} for order ${order.id} ignored — order is not awaiting payment; needs reconciliation`,
-      );
-      return { skipped: true as const, reason: 'order is not awaiting payment' };
-    }
-    await logTrackingEvent(tx, order.id, 'PACKING', { note: 'Payment confirmed — now packing' });
+    const store = await tx.resellerStore.findUniqueOrThrow({ where: { id: order.resellerStoreId! }, select: { houseWarehouseId: true } });
+    const warehouseLeg = new Decimal(order.wholesaleTotalJmd.toString()).plus(sellerDeliveryFee);
 
-    const platformAccount = await tx.ledgerAccount.findFirstOrThrow({ where: { accountType: 'PLATFORM' } });
-
-    // No driver is assigned yet at payment time, so the driver's fee has
-    // nowhere of its own to go — it's held on the platform account *combined
-    // with* platform commission in a single leg (not two), because the
-    // ledger's unique key is (order_id, recipient_account_id): two separate
-    // rows against the same recipient would collide. Phase 4 (dispatch) must
-    // split the driver's cut out of this combined balance into the driver's
-    // own ledger account once a driver accepts the job.
-    const platformHeldAmount = new Decimal(order.driverFeeJmd.toString()).plus(order.platformCommissionJmd.toString()).toFixed(2);
-
-    // On a SELLER_DELIVERY order the business delivers it itself, so its own
-    // delivery fee goes to whichever business packs it: the shop, or the
-    // warehouse behind a reseller listing. Zero for every other method.
-    const sellerDeliveryFee = new Decimal(order.sellerDeliveryFeeJmd.toString());
-
-    let legs: { recipientAccountId: string; amountJmd: Prisma.Decimal | string }[];
-    if (order.shopId) {
-      // STORE order: the shop keeps resellerMarginJmd in full (it's the full
-      // item revenue for a shop order, see orders.routes.ts), no separate
-      // wholesale/warehouse leg exists.
-      const shopAccount = await tx.ledgerAccount.findFirstOrThrow({
-        where: { accountType: 'STORE', user: { shops: { some: { id: order.shopId } } } },
-      });
+    if (store.houseWarehouseId) {
+      // Sold on the warehouse's own house store: there's no reseller, so
+      // the margin is the warehouse's too — one leg for both.
       legs = [
-        { recipientAccountId: shopAccount.id, amountJmd: new Decimal(order.resellerMarginJmd.toString()).plus(sellerDeliveryFee).toFixed(2) },
+        { recipientAccountId: warehouseAccount.id, amountJmd: warehouseLeg.plus(order.resellerMarginJmd.toString()).toFixed(2) },
         { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
       ];
     } else {
-      // AFFILIATE order: warehouse (wholesale) + affiliate (margin) +
-      // driver/platform combined.
-      const warehouseAccount = await tx.ledgerAccount.findFirstOrThrow({
-        where: { accountType: 'WAREHOUSE', user: { warehouses: { some: { id: order.warehouseId! } } } },
+      const resellerAccount = await tx.ledgerAccount.findFirstOrThrow({
+        where: { accountType: 'RESELLER', user: { resellerStore: { id: order.resellerStoreId! } } },
       });
-      const store = await tx.resellerStore.findUniqueOrThrow({ where: { id: order.resellerStoreId! }, select: { houseWarehouseId: true } });
-      const warehouseLeg = new Decimal(order.wholesaleTotalJmd.toString()).plus(sellerDeliveryFee);
-
-      if (store.houseWarehouseId) {
-        // Sold on the warehouse's own house store: there's no reseller, so
-        // the margin is the warehouse's too — one leg for both.
-        legs = [
-          { recipientAccountId: warehouseAccount.id, amountJmd: warehouseLeg.plus(order.resellerMarginJmd.toString()).toFixed(2) },
-          { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
-        ];
-      } else {
-        const resellerAccount = await tx.ledgerAccount.findFirstOrThrow({
-          where: { accountType: 'RESELLER', user: { resellerStore: { id: order.resellerStoreId! } } },
-        });
-        legs = [
-          { recipientAccountId: warehouseAccount.id, amountJmd: warehouseLeg.toFixed(2) },
-          { recipientAccountId: resellerAccount.id, amountJmd: order.resellerMarginJmd },
-          { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
-        ];
-      }
+      legs = [
+        { recipientAccountId: warehouseAccount.id, amountJmd: warehouseLeg.toFixed(2) },
+        { recipientAccountId: resellerAccount.id, amountJmd: order.resellerMarginJmd },
+        { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
+      ];
     }
-
-    // Deliberately no skipDuplicates: this order just won the transition out
-    // of AWAITING_PAYMENT, so legs can't already exist — if they somehow do,
-    // failing (and rolling the whole thing back) beats crediting balances
-    // for rows that were never inserted. Funds only move pending -> available
-    // on delivery confirmation (see dispatch.routes.ts).
-    await tx.ledgerTransaction.createMany({
-      data: legs.map((leg) => ({ orderId: order.id, escrowState: 'HELD_IN_ESCROW' as const, ...leg })),
-    });
-    // Sorted so every transaction takes account row locks in the same order.
-    for (const leg of [...legs].sort((a, b) => a.recipientAccountId.localeCompare(b.recipientAccountId))) {
-      await creditPending(tx, leg.recipientAccountId, leg.amountJmd);
-    }
-
-    await setOutcome('APPLIED');
-    return { order: await tx.order.findUniqueOrThrow({ where: { id: order.id } }) };
-  });
-
-  if (!('skipped' in result)) {
-    const { order } = result;
-    const room = order.shopId ? `shop_${order.shopId}` : `warehouse_${order.warehouseId}`;
-    getSocketServer().to(room).emit('NEW_ORDER_TO_PACK', { orderId: order.id });
   }
-  return result;
+
+  // Deliberately no skipDuplicates: this order just won the transition out
+  // of AWAITING_PAYMENT, so legs can't already exist — if they somehow do,
+  // failing (and rolling the whole thing back) beats crediting balances
+  // for rows that were never inserted. Funds only move pending -> available
+  // on delivery confirmation (see dispatch.routes.ts).
+  await tx.ledgerTransaction.createMany({
+    data: legs.map((leg) => ({ orderId: order.id, escrowState: 'HELD_IN_ESCROW' as const, ...leg })),
+  });
+  // Sorted so every transaction takes account row locks in the same order.
+  for (const leg of [...legs].sort((a, b) => a.recipientAccountId.localeCompare(b.recipientAccountId))) {
+    await creditPending(tx, leg.recipientAccountId, leg.amountJmd);
+  }
+
+  await setOutcome('APPLIED');
+  return { order: await tx.order.findUniqueOrThrow({ where: { id: order.id } }) };
+}
+
+/** Tells the seller an order is paid and ready to pack — call after the crediting transaction commits. */
+export function notifySellerOfPaidOrder(order: { id: string; shopId: string | null; warehouseId: string | null }) {
+  const room = order.shopId ? `shop_${order.shopId}` : `warehouse_${order.warehouseId}`;
+  try {
+    getSocketServer().to(room).emit('NEW_ORDER_TO_PACK', { orderId: order.id });
+  } catch {
+    // No socket server (a script) — the seller sees it on their next load.
+  }
 }
 
 /**

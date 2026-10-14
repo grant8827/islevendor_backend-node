@@ -2,23 +2,11 @@ import { Router } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
-import { processWiPayPayoutWebhook, processWiPayWebhook, withdrawBalance } from './ledger.service.js';
+import { processWiPayPayoutWebhook, withdrawBalance } from './ledger.service.js';
 import { getPayoutTiming } from '../../lib/platformSettings.js';
 import { registerPayoutAccountRoutes } from './payoutAccount.routes.js';
 
 export const ledgerRouter = Router();
-
-// WiPay posts here on payment.success / payment.failed. No auth middleware —
-// authenticity comes from the hash check inside processWiPayWebhook, not a
-// session token (WiPay's servers don't have one).
-ledgerRouter.post('/webhooks/wipay', async (req, res, next) => {
-  try {
-    const result = await processWiPayWebhook(req.body);
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
-});
 
 // WiPay's withdrawal notifications (withdrawal.* events) for automated
 // payouts. Authenticated by WiPay's signature, not a session — see

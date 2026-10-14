@@ -2,6 +2,7 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  payOrders,
   api,
   createLedgerAccount,
   createUser,
@@ -119,12 +120,10 @@ describe('warehouse house store', () => {
           deliveryMethods: { [`warehouse:${w.warehouseId}`]: 'ISLEDASH' },
           deliveryAddress: '1 Customer Lane',
         })
-      ).body;
+      ).body.orders;
       assert.equal(Number(order.totalPaidJmd), 2500 + 300 + 150);
 
-      const transaction_id = `txn-${randomUUID()}`;
-      const hash = createHash('md5').update(`${transaction_id}${order.id}test-wipay-key`).digest('hex');
-      assert.equal((await call('POST', '/ledger/webhooks/wipay', undefined, { order_id: order.id, transaction_id, hash, status: 'success' })).status, 200);
+      await payOrders(server, [order.id]);
 
       const legs = await prisma.ledgerTransaction.findMany({ where: { orderId: order.id }, include: { recipientAccount: true } });
       const byType = Object.fromEntries(legs.map((l) => [l.recipientAccount.accountType, Number(l.amountJmd)]));

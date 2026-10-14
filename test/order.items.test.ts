@@ -2,6 +2,7 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  payOrders,
   api,
   createLedgerAccount,
   createResellerStore,
@@ -34,7 +35,11 @@ describe('multi-item orders', () => {
   });
 
   const call = (method: string, path: string, user?: TestUser, body?: unknown) => api(server, path, { method, token: user?.token, body });
-  const checkout = (body: object) => call('POST', '/orders/checkout', customer, { deliveryAddress: '1 Customer Lane', ...body });
+  // The placed orders (checkout also reports how payment started).
+  const checkout = async (body: object) => {
+    const res = await call('POST', '/orders/checkout', customer, { deliveryAddress: '1 Customer Lane', ...body });
+    return { ...res, body: res.status === 201 ? res.body.orders : res.body };
+  };
 
   async function shopWithTwoItems() {
     const owner = await createUser('STORE');
@@ -86,9 +91,7 @@ describe('multi-item orders', () => {
     assert.equal((await checkout({ items: [s.line(s.kettle)], deliveryMethods: { [s.key]: 'SELLER_DELIVERY' } })).status, 400);
 
     const [placed] = (await checkout({ items: [s.line(s.kettle), s.line(s.toaster, 2)], deliveryMethods: { [s.key]: 'ISLEDASH' } })).body;
-    const transaction_id = `txn-${randomUUID()}`;
-    const hash = createHash('md5').update(`${transaction_id}${placed.id}test-wipay-key`).digest('hex');
-    assert.equal((await call('POST', '/ledger/webhooks/wipay', undefined, { order_id: placed.id, transaction_id, hash, status: 'success' })).status, 200);
+    await payOrders(server, [placed.id]);
 
     const legs = await prisma.ledgerTransaction.findMany({ where: { orderId: placed.id }, include: { recipientAccount: true } });
     const byType = Object.fromEntries(legs.map((l) => [l.recipientAccount.accountType, Number(l.amountJmd)]));

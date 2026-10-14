@@ -2,6 +2,7 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  payOrders,
   acceptDriver,
   api,
   createDriver,
@@ -61,10 +62,8 @@ describe('payouts', () => {
         deliveryMethods: { [`shop:${shopId}`]: 'ISLEDASH' },
         deliveryAddress: '1 Customer Lane',
       })
-    ).body;
-    const transaction_id = `txn-${randomUUID()}`;
-    const hash = createHash('md5').update(`${transaction_id}${order.id}test-wipay-key`).digest('hex');
-    assert.equal((await call('POST', '/ledger/webhooks/wipay', undefined, { order_id: order.id, transaction_id, hash, status: 'success' })).status, 200);
+    ).body.orders;
+    await payOrders(server, [order.id]);
     await prisma.order.update({ where: { id: order.id }, data: { status: 'PICKED_UP', driverId: driver.id } });
     return { orderId: order.id as string, driver, owner };
   }

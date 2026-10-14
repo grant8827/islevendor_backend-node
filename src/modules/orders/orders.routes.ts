@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { z } from 'zod';
 import { Decimal } from 'decimal.js';
 import { Prisma, UserRole } from '@prisma/client';
@@ -19,6 +19,8 @@ import {
   type DeliverySettings,
 } from '../../lib/deliveryOptions.js';
 import { getIsleDashRate } from '../../lib/platformSettings.js';
+import { startCheckoutPayment } from '../payments/payments.service.js';
+import { requestOrigin } from '../payments/payments.routes.js';
 import { ITEMS_IN_ORDER, summarizeItems, toItemView } from '../../lib/orderItems.js';
 
 export const ordersRouter = Router();
@@ -291,6 +293,20 @@ ordersRouter.get('/isledash-rate', async (_req, res, next) => {
   }
 });
 
+/**
+ * Starts the WiPay payment for just-placed orders, or explains why it
+ * couldn't — payments switched off, or WiPay unreachable. Never throws: the
+ * orders are already saved and payable later from the customer's account.
+ */
+async function paymentFor(req: Request, orderIds: string[]) {
+  try {
+    const payment = await startCheckoutPayment(req.user!.sub, orderIds, requestOrigin(req));
+    return { id: payment.id, status: payment.status, checkoutUrl: payment.checkoutUrl, message: payment.message };
+  } catch (err) {
+    return { id: null, status: 'NOT_STARTED' as const, checkoutUrl: null, message: err instanceof HttpError ? err.message : 'Payment couldn’t be started' };
+  }
+}
+
 const quoteSchema = z.object({ items: z.array(lineSchema).min(1).max(50) });
 
 // The cart's view of itself, priced by the server: what each line costs
@@ -333,9 +349,9 @@ ordersRouter.post('/quote', async (req, res, next) => {
 ordersRouter.post('/checkout', requireAuth, requireRole(UserRole.CUSTOMER, UserRole.ADMIN), async (req, res, next) => {
   try {
     const orders = await placeCheckout(req.user!.sub, checkoutSchema.parse(req.body));
-    // TODO(Phase 3): initiate one WiPay hosted checkout session for the whole
-    // cart here and return its redirect URL alongside the orders.
-    res.status(201).json(orders);
+    // One WiPay payment for the whole cart. The orders are placed either way:
+    // if paying can't start, the customer can pay for them later.
+    res.status(201).json({ orders, payment: await paymentFor(req, orders.map((o) => o.id)) });
   } catch (err) {
     next(err);
   }
@@ -366,7 +382,8 @@ ordersRouter.post('/', requireAuth, requireRole(UserRole.CUSTOMER, UserRole.ADMI
       deliveryMethods: { [resolved.sellerKey]: deliveryMethod },
       deliveryAddress,
     });
-    res.status(201).json(order);
+    const payment = await paymentFor(req, [order.id]);
+    res.status(201).json({ ...order, checkoutUrl: payment?.checkoutUrl ?? null, paymentId: payment?.id ?? null });
   } catch (err) {
     next(err);
   }

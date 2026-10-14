@@ -34,6 +34,12 @@ Object.assign(process.env, {
   WIPAY_ACCOUNT_NUMBER: '',
   WIPAY_API_KEY: '',
   ENABLE_WIPAY_WEBHOOKS: 'false',
+  // Nothing listens here: a test that starts a payment without its own fake
+  // WiPay gets a quick connection failure, never a call to WiPay's real sandbox.
+  WIPAY_PAYMENT_URL: 'http://127.0.0.1:9/plugins/payments/request',
+  WIPAY_RESPONSE_URL: 'http://localhost/api/webhooks/wipay',
+  WIPAY_WEBHOOK_SECRET: '',
+  PUBLIC_WEB_URL: 'http://localhost:5173',
   ENABLE_WITHDRAWALS: 'false',
   ENABLE_INTERNAL_REFUNDS: 'false',
   ENABLE_ESCROW_RELEASE: 'false',

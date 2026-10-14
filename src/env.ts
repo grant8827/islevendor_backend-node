@@ -27,7 +27,25 @@ const envSchema = z.object({
     .enum(['sandbox', 'live', 'production'])
     .default('sandbox')
     .transform((value) => (value === 'production' ? 'live' : value)),
+  // Customer payments through WiPay's hosted checkout (modules/payments).
+  // While off, checkout still places orders but no payment is started or
+  // credited. Named for the callback it originally guarded.
   ENABLE_WIPAY_WEBHOOKS: booleanFromEnv,
+  // e.g. https://jm.wipayfinancial.com/plugins/payments/request (live) or
+  // https://jmsb.wipayfinancial.com/plugins/payments/request (sandbox).
+  WIPAY_PAYMENT_URL: optionalString(z.string().url()),
+  // Where WiPay sends the customer back: this API's /api/webhooks/wipay.
+  WIPAY_RESPONSE_URL: optionalString(z.string().url()),
+  WIPAY_COUNTRY_CODE: z.string().regex(/^[A-Z]{2}$/).default('JM'),
+  WIPAY_CURRENCY: z.string().regex(/^[A-Z]{3}$/).default('JMD'),
+  WIPAY_FEE_STRUCTURE: z.enum(['merchant_absorb', 'customer_pay', 'split']).default('merchant_absorb'),
+  WIPAY_ORIGIN: z.string().regex(/^[a-zA-Z0-9_-]{1,32}$/).default('IsleVendor'),
+  // Signing secret for WiPay's Payments API webhook (payment.* events), if
+  // one is registered. Optional — the customer's return already confirms a
+  // payment; this catches the ones whose browser never came back.
+  WIPAY_WEBHOOK_SECRET: optionalString(z.string()),
+  // The marketplace website, where a customer lands after paying.
+  PUBLIC_WEB_URL: optionalString(z.string().url()),
   ENABLE_WITHDRAWALS: booleanFromEnv,
   ENABLE_INTERNAL_REFUNDS: booleanFromEnv,
   ENABLE_ESCROW_RELEASE: booleanFromEnv,
@@ -88,8 +106,14 @@ if (candidate.ENABLE_AUTOMATED_PAYOUTS) {
     safetyErrors.push("WiPay's live payout API is forbidden outside NODE_ENV=production");
   }
 }
-if (candidate.ENABLE_WIPAY_WEBHOOKS && (!candidate.WIPAY_ACCOUNT_NUMBER || !candidate.WIPAY_API_KEY)) {
-  safetyErrors.push('enabled WiPay webhooks require WIPAY_ACCOUNT_NUMBER and WIPAY_API_KEY');
+if (candidate.ENABLE_WIPAY_WEBHOOKS && candidate.WIPAY_ENV === 'live' && (!candidate.WIPAY_ACCOUNT_NUMBER || !candidate.WIPAY_API_KEY)) {
+  safetyErrors.push('live WiPay payments require WIPAY_ACCOUNT_NUMBER and WIPAY_API_KEY');
+}
+if (candidate.WIPAY_PAYMENT_URL && new URL(candidate.WIPAY_PAYMENT_URL).hostname.endsWith('wipayfinancial.com')) {
+  const sandboxHost = new URL(candidate.WIPAY_PAYMENT_URL).hostname.includes('sb.');
+  if (sandboxHost !== (candidate.WIPAY_ENV === 'sandbox')) {
+    safetyErrors.push(`WIPAY_PAYMENT_URL is WiPay's ${sandboxHost ? 'sandbox' : 'live'} address but WIPAY_ENV is ${candidate.WIPAY_ENV}`);
+  }
 }
 
 if (safetyErrors.length > 0) {

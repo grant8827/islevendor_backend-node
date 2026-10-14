@@ -84,6 +84,7 @@ model User {
   auditEvents          AuditEvent[]         @relation("AuditActor")
   applicationMessages  ApplicationMessage[] @relation("ApplicationMessageSender")
   payoutAccount        PayoutAccount?
+  checkoutPayments     CheckoutPayment[]    @relation("CheckoutPayments")
 
   @@map("users")
 }
@@ -807,7 +808,11 @@ model Order {
   // (order placement time). Powers the driver's Delivered tab and lets the
   // seller-side Orders view show when it landed, not just that it did.
   deliveredAt             DateTime?      @map("delivered_at") @db.Timestamptz
-  wipayTransactionId      String?        @unique @map("wipay_transaction_id")
+  // WiPay's transaction for the payment that paid this order — shared by
+  // every order paid in the same checkout.
+  wipayTransactionId      String?        @map("wipay_transaction_id")
+  // The current payment attempt for this order (see CheckoutPayment).
+  checkoutPaymentId       String?        @map("checkout_payment_id") @db.Uuid
   createdAt               DateTime       @default(now()) @map("created_at") @db.Timestamptz
 
   customer       User                 @relation("OrderCustomer", fields: [customerId], references: [id])
@@ -827,7 +832,11 @@ model Order {
   trackingEvents OrderTrackingEvent[]
   paymentEvents  PaymentEvent[]
 
+  checkoutPayment CheckoutPayment? @relation(fields: [checkoutPaymentId], references: [id], onDelete: SetNull)
+
   @@index([checkoutGroupId])
+  @@index([checkoutPaymentId])
+  @@index([wipayTransactionId])
   @@map("orders")
 }
 
@@ -1213,4 +1222,39 @@ model PayoutWebhookEvent {
   receivedAt      DateTime @default(now()) @map("received_at") @db.Timestamptz
 
   @@map("payout_webhook_events")
+}
+
+enum CheckoutPaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  // Replaced by a newer attempt for the same orders (the customer tried again).
+  SUPERSEDED
+  // WiPay says it was paid, but every order was already paid by another
+  // attempt — the customer may have been charged twice and needs a refund.
+  DUPLICATE
+}
+
+// One attempt to pay for a checkout through WiPay's hosted checkout. Covers
+// every order the customer placed together (orderIds); WiPay knows it by
+// `reference`. See src/modules/payments.
+model CheckoutPayment {
+  id                 String                @id @default(uuid()) @db.Uuid
+  customerId         String                @map("customer_id") @db.Uuid
+  reference          String                @unique
+  orderIds           String[]              @map("order_ids") @db.Uuid
+  // The total sent to WiPay — what its success hash is checked against.
+  amountJmd          Decimal               @map("amount_jmd") @db.Decimal(12, 2)
+  status             CheckoutPaymentStatus @default(PENDING)
+  wipayTransactionId String?               @unique @map("wipay_transaction_id")
+  checkoutUrl        String?               @map("checkout_url")
+  message            String?
+  createdAt          DateTime              @default(now()) @map("created_at") @db.Timestamptz
+  paidAt             DateTime?             @map("paid_at") @db.Timestamptz
+
+  customer User    @relation("CheckoutPayments", fields: [customerId], references: [id])
+  orders   Order[]
+
+  @@index([customerId, createdAt])
+  @@map("checkout_payments")
 }

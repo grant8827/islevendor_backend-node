@@ -2,6 +2,7 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  payOrders,
   acceptDriver,
   api,
   closeSockets,
@@ -65,11 +66,7 @@ describe('delivery options', () => {
   }
 
   const checkout = (body: object) => call('POST', '/orders', customer, body);
-  const pay = (orderId: string) => {
-    const transaction_id = `txn-${randomUUID()}`;
-    const hash = createHash('md5').update(`${transaction_id}${orderId}test-wipay-key`).digest('hex');
-    return call('POST', '/ledger/webhooks/wipay', undefined, { order_id: orderId, transaction_id, hash, status: 'success' });
-  };
+  const pay = (orderId: string) => payOrders(server, [orderId]);
 
   describe('seller settings', () => {
     it('lets the owner choose what to offer, and validates it', async () => {
@@ -199,7 +196,8 @@ describe('delivery options', () => {
     it("pays the seller's delivery fee to the seller, and holds only the commission for the platform", async () => {
       const shop = await shopSelling();
       const order = (await checkout({ ...shop.line, deliveryMethod: 'SELLER_DELIVERY', deliveryAddress: '1 Customer Lane' })).body;
-      assert.equal((await pay(order.id)).status, 200);
+      assert.equal((await pay(order.id)).payment.status, 'PENDING');
+      assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).status, 'PACKING');
 
       const legs = await prisma.ledgerTransaction.findMany({ where: { orderId: order.id }, include: { recipientAccount: true } });
       const byType = Object.fromEntries(legs.map((l) => [l.recipientAccount.accountType, Number(l.amountJmd)]));

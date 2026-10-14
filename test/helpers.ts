@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import type { OrderStatus, UserRole } from '@prisma/client';
 import { io as connectSocket, type Socket } from 'socket.io-client';
@@ -176,4 +176,50 @@ export async function ensurePlatformAccount() {
     (await prisma.ledgerAccount.findFirst({ where: { accountType: 'PLATFORM' } })) ??
     (await prisma.ledgerAccount.create({ data: { accountType: 'PLATFORM' } }))
   );
+}
+
+/**
+ * A WiPay payment attempt for orders already placed, as if WiPay had
+ * created its checkout session (which assigns the transaction id up front).
+ */
+export async function createCheckoutPayment(orderIds: string[], transactionId = `SB-${randomUUID()}`) {
+  const orders = await prisma.order.findMany({ where: { id: { in: orderIds } } });
+  const amount = orders.reduce((sum, o) => sum + Number(o.totalPaidJmd), 0);
+  const payment = await prisma.checkoutPayment.create({
+    data: {
+      customerId: orders[0].customerId,
+      reference: `T${randomUUID().replace(/-/g, '').slice(0, 15).toUpperCase()}`,
+      orderIds,
+      amountJmd: amount.toFixed(2),
+      wipayTransactionId: transactionId,
+      checkoutUrl: 'https://jmsb.wipayfinancial.com/checkout/test',
+    },
+  });
+  await prisma.order.updateMany({ where: { id: { in: orderIds } }, data: { checkoutPaymentId: payment.id } });
+  return payment;
+}
+
+export const WIPAY_TEST_KEY = 'test-wipay-key';
+
+/** WiPay's success hash: md5(transaction_id + original total + API key). */
+export function wipayHash(transactionId: string, amountJmd: { toString(): string } | number, key = WIPAY_TEST_KEY) {
+  return createHash('md5').update(`${transactionId}${Number(amountJmd.toString()).toFixed(2)}${key}`).digest('hex');
+}
+
+/** WiPay sending the customer back (GET /api/webhooks/wipay). Doesn't follow the redirect. */
+export async function wipayReturn(server: TestServer, query: Record<string, string>) {
+  const res = await fetch(`${server.baseUrl}/api/webhooks/wipay?${new URLSearchParams(query)}`, { redirect: 'manual' });
+  return { status: res.status, location: res.headers.get('location') };
+}
+
+/** Pays for orders the way a customer would: a payment attempt, then a verified success return. */
+export async function payOrders(server: TestServer, orderIds: string[]) {
+  const payment = await createCheckoutPayment(orderIds);
+  const res = await wipayReturn(server, {
+    status: 'success',
+    order_id: payment.reference,
+    transaction_id: payment.wipayTransactionId!,
+    hash: wipayHash(payment.wipayTransactionId!, payment.amountJmd),
+  });
+  return { ...res, payment };
 }

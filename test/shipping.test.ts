@@ -41,7 +41,11 @@ describe('multi-item shipping', () => {
   const quote = (items: object[]) => call('POST', '/orders/quote', undefined, { items });
   const optionFee = (body: any, key: string, method: string) =>
     body.sellers.find((s: any) => s.key === key).options.find((o: any) => o.method === method).feeJmd;
-  const checkout = (body: object) => call('POST', '/orders/checkout', customer, { deliveryAddress: '1 Customer Lane', ...body });
+  // The placed orders (checkout also reports how payment started).
+  const checkout = async (body: object) => {
+    const res = await call('POST', '/orders/checkout', customer, { deliveryAddress: '1 Customer Lane', ...body });
+    return { ...res, body: res.status === 201 ? res.body.orders : res.body };
+  };
 
   describe('quote', () => {
     it('charges the first item in full and each further item half, counting every unit', async () => {
