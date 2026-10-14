@@ -123,8 +123,14 @@ describe('payouts', () => {
 
     it('lists waiting requests with where to send the money', async () => {
       const { driver, payoutId } = await driverPayout();
-      const res = await call('GET', '/admin/payouts', admin);
-      const row = res.body.payouts.find((p: any) => p.id === payoutId);
+      // The queue is oldest-first and the test database accumulates requests
+      // across runs, so look through every page.
+      let row: any;
+      for (let page = 1; !row; page += 1) {
+        const res = await call('GET', `/admin/payouts?page=${page}`, admin);
+        assert.ok(res.body.payouts.length > 0, 'request not found in the queue');
+        row = res.body.payouts.find((p: any) => p.id === payoutId);
+      }
       assert.equal(Number(row.amountJmd), 300);
       assert.equal(row.ledgerAccount.user.id, driver.id);
       assert.deepEqual(
