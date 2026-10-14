@@ -1037,11 +1037,19 @@ model Payout {
   ledgerAccountId String       @map("ledger_account_id") @db.Uuid
   amountJmd       Decimal      @map("amount_jmd") @db.Decimal(12, 2)
   status          PayoutStatus @default(REQUESTED)
+  // Settlement, recorded by an IsleVendor admin after sending the money
+  // outside the platform: the bank/Lynk transfer reference for PAID, or why
+  // it FAILED. Null while REQUESTED.
+  reference       String?
+  note            String?
+  settledAt       DateTime?    @map("settled_at") @db.Timestamptz
+  settledBy       String?      @map("settled_by") @db.Uuid
   createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz
 
   ledgerAccount LedgerAccount       @relation(fields: [ledgerAccountId], references: [id], onDelete: Cascade)
   legs          LedgerTransaction[]
 
+  @@index([status, createdAt])
   @@map("payouts")
 }
 

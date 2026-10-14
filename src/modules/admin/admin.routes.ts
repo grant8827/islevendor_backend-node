@@ -8,6 +8,7 @@ import { HttpError } from '../../middleware/errorHandler.js';
 import { loadDocumentReferences, type ApplicantType } from '../../lib/kycDocuments.js';
 import { recordAuditEvent } from '../../lib/audit.js';
 import { getIsleDashRate, setIsleDashRate } from '../../lib/platformSettings.js';
+import { settlePayout, withdrawPlatformBalance } from '../ledger/ledger.service.js';
 import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 
 // The superadmin console's API (frontend: pages/admin). Mostly read-side so
@@ -284,6 +285,136 @@ adminRouter.get('/orders', async (req, res, next) => {
       }),
     ]);
     res.json({ total, page, pageSize: PAGE_SIZE, orders });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Money: IsleVendor's own balance, and payout requests ───────────────────
+
+// IsleVendor's PLATFORM ledger account: what's held in escrow and what's
+// available, recent entries behind those numbers, and its own withdrawals.
+adminRouter.get('/ledger/platform', async (_req, res, next) => {
+  try {
+    const account = await prisma.ledgerAccount.findFirst({ where: { accountType: 'PLATFORM' } });
+    if (!account) return res.json({ account: null, entries: [], payouts: [] });
+    const [entries, payouts] = await Promise.all([
+      prisma.ledgerTransaction.findMany({
+        where: { recipientAccountId: account.id },
+        orderBy: { createdAt: 'desc' },
+        take: PAGE_SIZE,
+        include: { order: { select: { id: true, status: true, deliveryMethod: true } } },
+      }),
+      prisma.payout.findMany({ where: { ledgerAccountId: account.id }, orderBy: { createdAt: 'desc' }, take: PAGE_SIZE }),
+    ]);
+    res.json({ account, entries, payouts });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// IsleVendor withdraws its available balance — a REQUESTED payout like any
+// seller's, settled the same way below. Audited.
+adminRouter.post('/ledger/platform/withdraw', async (req, res, next) => {
+  try {
+    const [payout] = await withdrawPlatformBalance();
+    await recordAuditEvent(req, {
+      action: 'ledger.platform_withdrawal_requested',
+      targetType: 'payout',
+      targetId: payout.id,
+      metadata: { amountJmd: payout.amountJmd.toFixed(2) },
+    });
+    res.status(201).json(payout);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const PAYOUT_DESTINATION = {
+  payoutMethod: true,
+  bankName: true,
+  accountHolderName: true,
+  accountNumber: true,
+  branchCode: true,
+  lynkWalletId: true,
+} as const;
+
+/**
+ * Where a payout should be sent — the bank or Lynk details the owner gave
+ * when they applied (their first business of the account's kind). Shown in
+ * full here only: an admin needs the whole account number to pay it.
+ */
+async function destinationFor(account: { userId: string | null; accountType: string }) {
+  if (!account.userId) return null;
+  const where = { userId: account.userId, payoutMethod: { not: null } };
+  switch (account.accountType) {
+    case 'WAREHOUSE':
+      return prisma.warehouse.findFirst({ where, select: PAYOUT_DESTINATION });
+    case 'RESELLER':
+      return prisma.resellerStore.findFirst({ where, select: PAYOUT_DESTINATION });
+    case 'STORE':
+      return prisma.shop.findFirst({ where, select: PAYOUT_DESTINATION });
+    case 'DRIVER':
+      return prisma.driverProfile.findFirst({ where, select: PAYOUT_DESTINATION });
+    default:
+      return null;
+  }
+}
+
+// Every payout request, oldest first while they wait to be paid (?status=
+// REQUESTED, the default), newest first otherwise — with who it's for and
+// where to send it.
+adminRouter.get('/payouts', async (req, res, next) => {
+  try {
+    const status = z.enum(['REQUESTED', 'PAID', 'FAILED']).default('REQUESTED').parse(req.query.status);
+    const page = pageSchema.parse(req.query.page);
+    const where = { status };
+    const [total, payouts] = await Promise.all([
+      prisma.payout.count({ where }),
+      prisma.payout.findMany({
+        where,
+        orderBy: { createdAt: status === 'REQUESTED' ? 'asc' : 'desc' },
+        skip: (page - 1) * PAGE_SIZE,
+        take: PAGE_SIZE,
+        include: { ledgerAccount: { include: { user: { select: { id: true, fullName: true, email: true, phoneNumber: true } } } } },
+      }),
+    ]);
+    const withDestinations = await Promise.all(
+      payouts.map(async (p) => ({ ...p, destination: await destinationFor(p.ledgerAccount) })),
+    );
+    res.json({ total, page, pageSize: PAGE_SIZE, payouts: withDestinations });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const settleSchema = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('PAID'), reference: z.string().trim().min(1, 'Enter the transfer reference').max(200), note: z.string().trim().max(1000).optional() }),
+  z.object({ status: z.literal('FAILED'), note: z.string().trim().min(1, 'Say why it failed').max(1000), reference: z.string().trim().max(200).optional() }),
+]);
+
+// Record that a payout was sent (PAID, with the transfer reference) or
+// couldn't be (FAILED — the money returns to the owner's available
+// balance). Settling and its audit record are one transaction.
+adminRouter.patch('/payouts/:id', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const outcome = settleSchema.parse(req.body);
+    const payout = await prisma.$transaction(async (tx) => {
+      const settled = await settlePayout(tx, id, outcome, req.user!.sub);
+      await recordAuditEvent(
+        req,
+        {
+          action: outcome.status === 'PAID' ? 'payout.paid' : 'payout.failed',
+          targetType: 'payout',
+          targetId: id,
+          metadata: { amountJmd: settled.amountJmd.toFixed(2), ...(outcome.reference ? { reference: outcome.reference } : {}), ...(outcome.note ? { note: outcome.note } : {}) },
+        },
+        tx,
+      );
+      return settled;
+    });
+    res.json(payout);
   } catch (err) {
     next(err);
   }

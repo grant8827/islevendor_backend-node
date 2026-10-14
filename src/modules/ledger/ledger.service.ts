@@ -290,8 +290,8 @@ export async function refundOrder(orderId: string, initiatedByUserId: string, re
  * Funds still HELD_IN_ESCROW are never touched — they aren't the seller's
  * until the order is delivered.
  *
- * A Payout is a request, not a payment: there's no bank/Lynk disbursement
- * wired up yet, so nothing here (or anywhere) marks one PAID.
+ * A Payout is a request, not a payment: an IsleVendor admin sends the money
+ * outside the platform and records it with settlePayout.
  */
 export async function withdrawBalance(userId: string) {
   if (!env.ENABLE_WITHDRAWALS) {
@@ -305,48 +305,96 @@ export async function withdrawBalance(userId: string) {
         throw new HttpError(403, 'Withdrawals open once IsleVendor has approved your account');
       }
     }
-
-    const payouts = [];
-    for (const account of accounts) {
-      // Row-lock the account first: a second withdrawal racing this one
-      // waits here, then sees these legs already attached to a payout.
-      await tx.$queryRaw`SELECT id FROM ledger_accounts WHERE id = ${account.id}::uuid FOR UPDATE`;
-
-      const legs = await tx.ledgerTransaction.findMany({
-        where: { recipientAccountId: account.id, escrowState: 'AVAILABLE', reversedAt: null, payoutId: null },
-      });
-      const total = legs.reduce((sum, leg) => sum.plus(leg.amountJmd.toString()), new Decimal(0));
-      if (total.lessThanOrEqualTo(0)) continue;
-
-      // The guard in the WHERE clause is what keeps the balance from ever
-      // going negative. Legs adding up to more than the cached balance means
-      // the two have drifted apart — stop and leave it for reconciliation
-      // rather than pay out against either number.
-      const debited = await tx.$executeRaw`
-        UPDATE ledger_accounts
-        SET available_balance_jmd = available_balance_jmd - ${total.toFixed(2)}::numeric
-        WHERE id = ${account.id}::uuid AND available_balance_jmd >= ${total.toFixed(2)}::numeric
-      `;
-      if (debited === 0) {
-        console.error(`[ledger] account ${account.id}: available legs total ${total.toFixed(2)} exceeds available balance; needs reconciliation`);
-        throw new HttpError(409, 'Your balance is under review — please contact support before withdrawing');
-      }
-
-      const payout = await tx.payout.create({
-        data: { ledgerAccountId: account.id, amountJmd: total.toFixed(2) },
-      });
-      await tx.ledgerTransaction.updateMany({
-        where: { id: { in: legs.map((leg) => leg.id) } },
-        data: { payoutId: payout.id },
-      });
-      payouts.push(payout);
-    }
-
-    if (payouts.length === 0) {
-      throw new HttpError(409, 'Nothing available to withdraw');
-    }
-    return payouts;
+    return requestPayouts(tx, accounts.map((a) => a.id));
   });
+}
+
+/**
+ * IsleVendor's own withdrawal from the PLATFORM account: its commission and
+ * anything else released to it. Driver fees aren't in here once delivered —
+ * they move to the driver's own account (see releaseEscrowForOrder).
+ */
+export async function withdrawPlatformBalance() {
+  if (!env.ENABLE_WITHDRAWALS) {
+    throw new HttpError(503, 'Withdrawals are temporarily disabled');
+  }
+  return prisma.$transaction(async (tx) => {
+    const platform = await tx.ledgerAccount.findFirstOrThrow({ where: { accountType: 'PLATFORM' } });
+    return requestPayouts(tx, [platform.id]);
+  });
+}
+
+/** One REQUESTED payout per account with anything available. Throws 409 if there's nothing. */
+async function requestPayouts(tx: Prisma.TransactionClient, accountIds: string[]) {
+  const payouts = [];
+  for (const accountId of accountIds) {
+    // Row-lock the account first: a second withdrawal racing this one
+    // waits here, then sees these legs already attached to a payout.
+    await tx.$queryRaw`SELECT id FROM ledger_accounts WHERE id = ${accountId}::uuid FOR UPDATE`;
+
+    const legs = await tx.ledgerTransaction.findMany({
+      where: { recipientAccountId: accountId, escrowState: 'AVAILABLE', reversedAt: null, payoutId: null },
+    });
+    const total = legs.reduce((sum, leg) => sum.plus(leg.amountJmd.toString()), new Decimal(0));
+    if (total.lessThanOrEqualTo(0)) continue;
+
+    // The guard in the WHERE clause is what keeps the balance from ever
+    // going negative. Legs adding up to more than the cached balance means
+    // the two have drifted apart — stop and leave it for reconciliation
+    // rather than pay out against either number.
+    const debited = await tx.$executeRaw`
+      UPDATE ledger_accounts
+      SET available_balance_jmd = available_balance_jmd - ${total.toFixed(2)}::numeric
+      WHERE id = ${accountId}::uuid AND available_balance_jmd >= ${total.toFixed(2)}::numeric
+    `;
+    if (debited === 0) {
+      console.error(`[ledger] account ${accountId}: available legs total ${total.toFixed(2)} exceeds available balance; needs reconciliation`);
+      throw new HttpError(409, 'Your balance is under review — please contact support before withdrawing');
+    }
+
+    const payout = await tx.payout.create({ data: { ledgerAccountId: accountId, amountJmd: total.toFixed(2) } });
+    await tx.ledgerTransaction.updateMany({ where: { id: { in: legs.map((leg) => leg.id) } }, data: { payoutId: payout.id } });
+    payouts.push(payout);
+  }
+
+  if (payouts.length === 0) {
+    throw new HttpError(409, 'Nothing available to withdraw');
+  }
+  return payouts;
+}
+
+/**
+ * Records how a payout request was settled, once an IsleVendor admin has
+ * sent (or failed to send) the money outside the platform:
+ *  - PAID: the money went out; `reference` is the bank/Lynk transfer reference.
+ *  - FAILED: it didn't; the legs return to the account's available balance,
+ *    so the owner can withdraw them again.
+ * Only a REQUESTED payout can be settled, and only once — the conditional
+ * update is the race-decider.
+ */
+export async function settlePayout(
+  tx: Prisma.TransactionClient,
+  payoutId: string,
+  outcome: { status: 'PAID'; reference: string; note?: string } | { status: 'FAILED'; note: string; reference?: string },
+  adminId: string,
+) {
+  const settled = await tx.payout.updateMany({
+    where: { id: payoutId, status: 'REQUESTED' },
+    data: { status: outcome.status, reference: outcome.reference ?? null, note: outcome.note ?? null, settledAt: new Date(), settledBy: adminId },
+  });
+  if (settled.count === 0) {
+    const exists = await tx.payout.count({ where: { id: payoutId } });
+    throw new HttpError(exists ? 409 : 404, exists ? 'This payout has already been settled' : 'Payout not found');
+  }
+
+  const payout = await tx.payout.findUniqueOrThrow({ where: { id: payoutId } });
+  if (outcome.status === 'FAILED') {
+    await tx.ledgerTransaction.updateMany({ where: { payoutId }, data: { payoutId: null } });
+    await tx.$executeRaw`
+      UPDATE ledger_accounts SET available_balance_jmd = available_balance_jmd + ${payout.amountJmd} WHERE id = ${payout.ledgerAccountId}::uuid
+    `;
+  }
+  return payout;
 }
 
 /**
@@ -361,14 +409,29 @@ export async function withdrawBalance(userId: string) {
  */
 export async function releaseEscrowForOrder(tx: Prisma.TransactionClient, orderId: string) {
   if (!env.ENABLE_ESCROW_RELEASE) return;
+  const order = await tx.order.findUniqueOrThrow({ where: { id: orderId }, select: { driverId: true, driverFeeJmd: true } });
   const legs = await tx.ledgerTransaction.findMany({
     where: { orderId, escrowState: 'HELD_IN_ESCROW', reversedAt: null, payoutId: null },
+    include: { recipientAccount: { select: { accountType: true } } },
     orderBy: { recipientAccountId: 'asc' },
   });
+
+  // The IsleDash fee was held on the platform's leg at payment time, before
+  // anyone knew who'd deliver. Now the driver is known, it becomes theirs:
+  // the platform leg shrinks by the fee and the driver gets a leg of their
+  // own, so the platform's available balance is only ever IsleVendor's.
+  const driverFee = new Decimal(order.driverFeeJmd.toString());
+  const driverAccountId = order.driverId && driverFee.greaterThan(0) ? (await driverLedgerAccount(tx, order.driverId)).id : null;
+
   for (const leg of legs) {
+    let available = new Decimal(leg.amountJmd.toString());
+    if (driverAccountId && leg.recipientAccount.accountType === 'PLATFORM') {
+      available = available.minus(driverFee);
+      await tx.ledgerTransaction.update({ where: { id: leg.id }, data: { amountJmd: available.toFixed(2) } });
+    }
     await tx.$executeRaw`
       UPDATE ledger_accounts
-      SET pending_balance_jmd = pending_balance_jmd - ${leg.amountJmd}, available_balance_jmd = available_balance_jmd + ${leg.amountJmd}
+      SET pending_balance_jmd = pending_balance_jmd - ${leg.amountJmd}, available_balance_jmd = available_balance_jmd + ${available.toFixed(2)}::numeric
       WHERE id = ${leg.recipientAccountId}::uuid;
     `;
   }
@@ -376,4 +439,21 @@ export async function releaseEscrowForOrder(tx: Prisma.TransactionClient, orderI
     where: { id: { in: legs.map((leg) => leg.id) } },
     data: { escrowState: 'AVAILABLE' },
   });
+
+  if (driverAccountId && legs.some((leg) => leg.recipientAccount.accountType === 'PLATFORM')) {
+    await tx.ledgerTransaction.create({
+      data: { orderId, recipientAccountId: driverAccountId, amountJmd: driverFee.toFixed(2), escrowState: 'AVAILABLE' },
+    });
+    await tx.$executeRaw`
+      UPDATE ledger_accounts SET available_balance_jmd = available_balance_jmd + ${driverFee.toFixed(2)}::numeric WHERE id = ${driverAccountId}::uuid
+    `;
+  }
+}
+
+/** The driver's ledger account — created now if their sign-up predates it. */
+async function driverLedgerAccount(tx: Prisma.TransactionClient, driverUserId: string) {
+  return (
+    (await tx.ledgerAccount.findFirst({ where: { userId: driverUserId, accountType: 'DRIVER' } })) ??
+    (await tx.ledgerAccount.create({ data: { userId: driverUserId, accountType: 'DRIVER' } }))
+  );
 }
