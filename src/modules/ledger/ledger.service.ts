@@ -8,6 +8,7 @@ import { getSocketServer } from '../../lib/socket.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
 import { canWithdrawFrom } from '../../lib/eligibility.js';
+import { addBusinessDays, getPayoutTiming } from '../../lib/platformSettings.js';
 
 export interface WiPayWebhookPayload {
   order_id: string;
@@ -326,6 +327,9 @@ export async function withdrawPlatformBalance() {
 
 /** One REQUESTED payout per account with anything available. Throws 409 if there's nothing. */
 async function requestPayouts(tx: Prisma.TransactionClient, accountIds: string[]) {
+  // Each payout is stamped with the date it should arrive by, from the
+  // payout time IsleVendor advertises right now.
+  const timing = await getPayoutTiming(tx);
   const payouts = [];
   for (const accountId of accountIds) {
     // Row-lock the account first: a second withdrawal racing this one
@@ -352,7 +356,9 @@ async function requestPayouts(tx: Prisma.TransactionClient, accountIds: string[]
       throw new HttpError(409, 'Your balance is under review — please contact support before withdrawing');
     }
 
-    const payout = await tx.payout.create({ data: { ledgerAccountId: accountId, amountJmd: total.toFixed(2) } });
+    const payout = await tx.payout.create({
+      data: { ledgerAccountId: accountId, amountJmd: total.toFixed(2), expectedBy: addBusinessDays(new Date(), timing.maxBusinessDays) },
+    });
     await tx.ledgerTransaction.updateMany({ where: { id: { in: legs.map((leg) => leg.id) } }, data: { payoutId: payout.id } });
     payouts.push(payout);
   }

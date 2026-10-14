@@ -3,6 +3,7 @@ import { prisma } from '../../lib/prisma.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { processWiPayWebhook, withdrawBalance } from './ledger.service.js';
+import { getPayoutTiming } from '../../lib/platformSettings.js';
 
 export const ledgerRouter = Router();
 
@@ -40,6 +41,16 @@ ledgerRouter.get('/transactions/me', requireAuth, async (req, res, next) => {
       orderBy: { createdAt: 'desc' },
     });
     res.json(transactions);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// How long a withdrawal usually takes to reach the owner's bank — shown on
+// every dashboard's Payouts tab before they withdraw.
+ledgerRouter.get('/payout-timing', requireAuth, async (_req, res, next) => {
+  try {
+    res.json(await getPayoutTiming());
   } catch (err) {
     next(err);
   }

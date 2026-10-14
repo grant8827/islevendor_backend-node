@@ -1044,6 +1044,9 @@ model Payout {
   note            String?
   settledAt       DateTime?    @map("settled_at") @db.Timestamptz
   settledBy       String?      @map("settled_by") @db.Uuid
+  // When the money should reach the owner's account at the latest — the
+  // request date plus the payout time IsleVendor advertised at the time.
+  expectedBy      DateTime?    @map("expected_by") @db.Date
   createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz
 
   ledgerAccount LedgerAccount       @relation(fields: [ledgerAccountId], references: [id], onDelete: Cascade)
@@ -1117,6 +1120,11 @@ model PlatformSetting {
   // further item from the same seller in one checkout costs.
   isleDashBaseFeeJmd       Decimal  @default(300) @map("isledash_base_fee_jmd") @db.Decimal(12, 2)
   isleDashExtraItemPercent Int      @default(50) @map("isledash_extra_item_percent")
+  // How long a withdrawal usually takes to reach the owner's bank once
+  // requested, in business days. Payouts are sent by hand (see the admin
+  // Payouts queue), so this is IsleVendor's own promise, not a provider's.
+  payoutMinBusinessDays    Int      @default(2) @map("payout_min_business_days")
+  payoutMaxBusinessDays    Int      @default(5) @map("payout_max_business_days")
   updatedAt                DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
   updatedBy                String?  @map("updated_by") @db.Uuid
 

@@ -7,7 +7,7 @@ import { requireCurrentAdmin } from '../../middleware/requireAdmin.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { loadDocumentReferences, type ApplicantType } from '../../lib/kycDocuments.js';
 import { recordAuditEvent } from '../../lib/audit.js';
-import { getIsleDashRate, setIsleDashRate } from '../../lib/platformSettings.js';
+import { getIsleDashRate, getPayoutTiming, setIsleDashRate, setPayoutTiming } from '../../lib/platformSettings.js';
 import { settlePayout, withdrawPlatformBalance } from '../ledger/ledger.service.js';
 import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 
@@ -457,6 +457,37 @@ adminRouter.put('/settings/isledash', async (req, res, next) => {
       );
     });
     res.json({ baseFeeJmd: input.baseFeeJmd.toFixed(2), extraItemPercent: input.extraItemPercent });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.get('/settings/payouts', async (_req, res, next) => {
+  try {
+    res.json(await getPayoutTiming());
+  } catch (err) {
+    next(err);
+  }
+});
+
+const payoutTimingSchema = z
+  .object({
+    minBusinessDays: z.number().int().min(0).max(30),
+    maxBusinessDays: z.number().int().min(1).max(30),
+  })
+  .refine((t) => t.minBusinessDays <= t.maxBusinessDays, { message: 'The shortest time can’t be longer than the longest', path: ['minBusinessDays'] });
+
+// How long withdrawals take to reach people's banks, as IsleVendor promises
+// it on every Payouts tab. Applies to withdrawals requested from now on.
+adminRouter.put('/settings/payouts', async (req, res, next) => {
+  try {
+    const input = payoutTimingSchema.parse(req.body);
+    await prisma.$transaction(async (tx) => {
+      const before = await getPayoutTiming(tx);
+      await setPayoutTiming(input, req.user!.sub, tx);
+      await recordAuditEvent(req, { action: 'settings.payout_timing_changed', targetType: 'platform_settings', targetId: 'default', metadata: { before: { ...before }, after: input } }, tx);
+    });
+    res.json(input);
   } catch (err) {
     next(err);
   }
