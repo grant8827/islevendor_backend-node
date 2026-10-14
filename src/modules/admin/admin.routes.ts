@@ -28,7 +28,7 @@ adminRouter.get('/overview', async (_req, res, next) => {
     const pending = { applicantStatus: ApplicantStatus.PENDING_REVIEW };
     const [warehouses, resellers, vendors, drivers, usersByRole, ordersByStatus] = await Promise.all([
       prisma.warehouse.count({ where: pending }),
-      prisma.resellerStore.count({ where: pending }),
+      prisma.resellerStore.count({ where: { ...pending, houseWarehouseId: null } }),
       prisma.shop.count({ where: pending }),
       prisma.driverProfile.count({ where: pending }),
       prisma.user.groupBy({ by: ['role'], _count: true }),
@@ -79,7 +79,8 @@ adminRouter.get('/applicants', async (req, res, next) => {
 
     const [warehouses, resellers, vendors, drivers] = await Promise.all([
       wants('warehouse') ? prisma.warehouse.findMany({ where, include: { user: applicantUserSelect } }) : [],
-      wants('reseller') ? prisma.resellerStore.findMany({ where, include: { user: applicantUserSelect } }) : [],
+      // A warehouse's own house store isn't an application — only independent resellers' stores are.
+      wants('reseller') ? prisma.resellerStore.findMany({ where: { ...where, houseWarehouseId: null }, include: { user: applicantUserSelect } }) : [],
       wants('small-vendor') ? prisma.shop.findMany({ where, include: { user: applicantUserSelect } }) : [],
       wants('driver') ? prisma.driverProfile.findMany({ where, include: { user: applicantUserSelect } }) : [],
     ]);
@@ -100,7 +101,7 @@ adminRouter.get('/applicants', async (req, res, next) => {
 
     const applicants: ApplicantSummary[] = [
       ...warehouses.map((w) => summary('warehouse', w, { name: w.name, parish: w.parish, flags: [] })),
-      ...resellers.map((r) => summary('reseller', r, { name: r.storeName, parish: r.parish, flags: flagsOf({ 'Photo ID': r.idDocVerificationStatus }) })),
+      ...resellers.map((r) => summary('reseller', { ...r, user: r.user! }, { name: r.storeName, parish: r.parish, flags: flagsOf({ 'Photo ID': r.idDocVerificationStatus }) })),
       ...vendors.map((v) => summary('small-vendor', v, { name: v.shopName, parish: v.parish, flags: flagsOf({ 'Photo ID': v.govIdVerificationStatus }) })),
       ...drivers.map((d) =>
         summary('driver', d, {

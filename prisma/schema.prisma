@@ -269,6 +269,7 @@ model Warehouse {
   authorizations       ResellerAuthorization[]
   deliveryApplications DeliveryApplication[]
   vacancies            Vacancy[]
+  houseStore           ResellerStore?          @relation("HouseStore")
   members              WarehouseMember[]
 
   @@map("warehouses")
@@ -397,10 +398,16 @@ enum StoreHeroMode {
 }
 
 model ResellerStore {
-  id        String @id @default(uuid()) @db.Uuid
-  userId    String @unique @map("user_id") @db.Uuid
-  storeName String @map("store_name")
-  slug      String @unique
+  id               String  @id @default(uuid()) @db.Uuid
+  // Exactly one of userId / houseWarehouseId is set (a database check
+  // enforces it): an independent reseller's store, or a warehouse's own
+  // "house" store that sells its stock directly (see
+  // warehouse.routes.ts's /:warehouseId/store routes). A house store has no
+  // reseller behind it — the warehouse runs it and is paid its margin.
+  userId           String? @unique @map("user_id") @db.Uuid
+  houseWarehouseId String? @unique @map("house_warehouse_id") @db.Uuid
+  storeName        String  @map("store_name")
+  slug             String  @unique
 
   // ── ISLE-102: reseller partner onboarding fields ──
   resellerType            ResellerType?               @map("reseller_type")
@@ -442,7 +449,8 @@ model ResellerStore {
   heroColor    String?       @map("hero_color")
   heroImageUrl String?       @map("hero_image_url")
 
-  user           User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user           User?                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  houseWarehouse Warehouse?              @relation("HouseStore", fields: [houseWarehouseId], references: [id], onDelete: Cascade)
   listings       StoreListing[]
   orders         Order[]
   authorizations ResellerAuthorization[]

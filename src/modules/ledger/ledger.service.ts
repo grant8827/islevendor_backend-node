@@ -174,19 +174,29 @@ export async function processWiPayWebhook(rawPayload: unknown) {
     } else {
       // AFFILIATE order: warehouse (wholesale) + affiliate (margin) +
       // driver/platform combined.
-      const [warehouseAccount, resellerAccount] = await Promise.all([
-        tx.ledgerAccount.findFirstOrThrow({
-          where: { accountType: 'WAREHOUSE', user: { warehouses: { some: { id: order.warehouseId! } } } },
-        }),
-        tx.ledgerAccount.findFirstOrThrow({
+      const warehouseAccount = await tx.ledgerAccount.findFirstOrThrow({
+        where: { accountType: 'WAREHOUSE', user: { warehouses: { some: { id: order.warehouseId! } } } },
+      });
+      const store = await tx.resellerStore.findUniqueOrThrow({ where: { id: order.resellerStoreId! }, select: { houseWarehouseId: true } });
+      const warehouseLeg = new Decimal(order.wholesaleTotalJmd.toString()).plus(sellerDeliveryFee);
+
+      if (store.houseWarehouseId) {
+        // Sold on the warehouse's own house store: there's no reseller, so
+        // the margin is the warehouse's too — one leg for both.
+        legs = [
+          { recipientAccountId: warehouseAccount.id, amountJmd: warehouseLeg.plus(order.resellerMarginJmd.toString()).toFixed(2) },
+          { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
+        ];
+      } else {
+        const resellerAccount = await tx.ledgerAccount.findFirstOrThrow({
           where: { accountType: 'RESELLER', user: { resellerStore: { id: order.resellerStoreId! } } },
-        }),
-      ]);
-      legs = [
-        { recipientAccountId: warehouseAccount.id, amountJmd: new Decimal(order.wholesaleTotalJmd.toString()).plus(sellerDeliveryFee).toFixed(2) },
-        { recipientAccountId: resellerAccount.id, amountJmd: order.resellerMarginJmd },
-        { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
-      ];
+        });
+        legs = [
+          { recipientAccountId: warehouseAccount.id, amountJmd: warehouseLeg.toFixed(2) },
+          { recipientAccountId: resellerAccount.id, amountJmd: order.resellerMarginJmd },
+          { recipientAccountId: platformAccount.id, amountJmd: platformHeldAmount },
+        ];
+      }
     }
 
     // Deliberately no skipDuplicates: this order just won the transition out

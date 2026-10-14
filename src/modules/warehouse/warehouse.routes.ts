@@ -13,6 +13,7 @@ import { assertWarehouseAccess, type WarehouseAccess } from '../../lib/warehouse
 import { DELIVERY_SETTINGS_SELECT, deliverySettingsSchema } from '../../lib/deliveryOptions.js';
 import { APPROVED_SELLER, assertApprovedSeller, assertHasPayoutDetails } from '../../lib/eligibility.js';
 import { registerStaffRoutes } from './warehouse.staff.js';
+import { registerHouseStoreRoutes } from './warehouse.houseStore.js';
 
 export const warehouseRouter = Router();
 
@@ -635,3 +636,4 @@ warehouseRouter.get('/:warehouseId/feedback', requireAuth, requireRole(UserRole.
 });
 
 registerStaffRoutes(warehouseRouter);
+registerHouseStoreRoutes(warehouseRouter);
