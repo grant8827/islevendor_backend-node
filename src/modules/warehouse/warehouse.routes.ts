@@ -10,7 +10,10 @@ import { createWithGeneratedSku } from '../../lib/sku.js';
 import { computeAffiliatePricing } from '../../lib/pricing.js';
 import { refundOrder } from '../ledger/ledger.service.js';
 import { assertWarehouseAccess, type WarehouseAccess } from '../../lib/warehouseAccess.js';
+import { DELIVERY_SETTINGS_SELECT, deliverySettingsSchema } from '../../lib/deliveryOptions.js';
+import { APPROVED_SELLER, assertApprovedSeller, assertHasPayoutDetails } from '../../lib/eligibility.js';
 import { registerStaffRoutes } from './warehouse.staff.js';
+import { registerHouseStoreRoutes } from './warehouse.houseStore.js';
 
 export const warehouseRouter = Router();
 
@@ -36,6 +39,11 @@ warehouseRouter.post('/', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.
     // it was added to — see User.staffOfUserId in schema.prisma.
     const me = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { staffOfUserId: true } });
     if (me?.staffOfUserId) throw new HttpError(403, "Staff accounts can't create warehouses");
+    // Payouts for every warehouse go to the owner's one ledger account, so
+    // the bank details from their onboarding application cover this one too.
+    // The new warehouse itself starts PENDING_REVIEW (the column default)
+    // and waits for IsleVendor's approval like any other application.
+    await assertHasPayoutDetails(req.user!.sub);
 
     // Raw INSERT bypasses Prisma Client's id generation (its @default(uuid())
     // is applied client-side, not as a DB DEFAULT) — generate it ourselves.
@@ -56,10 +64,12 @@ warehouseRouter.post('/', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.
   }
 });
 
-// Browse all registered warehouses — used by resellers deciding who to apply to.
+// Browse every IsleVendor-approved warehouse — used by resellers deciding
+// who to apply to, and by drivers looking for businesses to deliver for.
 warehouseRouter.get('/', async (req, res, next) => {
   try {
     const warehouses = await prisma.warehouse.findMany({
+      where: APPROVED_SELLER,
       select: {
         id: true,
         name: true,
@@ -132,7 +142,8 @@ warehouseRouter.post('/products', requireAuth, requireRole(UserRole.WAREHOUSE, U
     // belongs to is an explicit choice on the add-product form, not
     // implied by whichever warehouse happens to be selected in the
     // dashboard's switcher — see warehouse/ProductsPanel.jsx.
-    await assertWarehouseAccess(input.warehouseId, req.user!);
+    const { warehouse } = await assertWarehouseAccess(input.warehouseId, req.user!);
+    assertApprovedSeller(warehouse, 'warehouse');
 
     const product = await createWithGeneratedSku(input.category, (sku) =>
       prisma.masterProduct.create({
@@ -246,6 +257,12 @@ const NON_OWNER_WAREHOUSE_FIELDS = {
   operatingHours: true,
   resellerCommissionPercent: true,
   applicantStatus: true,
+  offersIsleDash: true,
+  offersSellerDelivery: true,
+  sellerDeliveryFeeJmd: true,
+  sellerDeliveryNote: true,
+  offersPickup: true,
+  pickupInstructions: true,
 } as const;
 
 warehouseRouter.get('/mine', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
@@ -282,6 +299,20 @@ warehouseRouter.patch('/:warehouseId', requireAuth, requireRole(UserRole.WAREHOU
     const { warehouse } = await assertWarehouseAccess(String(req.params.warehouseId), req.user!, { adminOnly: true });
 
     const updated = await prisma.warehouse.update({ where: { id: warehouse.id }, data: input });
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Which delivery options this warehouse offers customers — it packs and
+// ships its resellers' orders, so these apply to everything sold from its
+// stock. Owner or warehouse admin only, like the commission above.
+warehouseRouter.put('/:warehouseId/delivery-options', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const input = deliverySettingsSchema.parse(req.body);
+    const { warehouse } = await assertWarehouseAccess(String(req.params.warehouseId), req.user!, { adminOnly: true });
+    const updated = await prisma.warehouse.update({ where: { id: warehouse.id }, data: input, select: { id: true, ...DELIVERY_SETTINGS_SELECT } });
     res.json(updated);
   } catch (err) {
     next(err);
@@ -405,15 +436,19 @@ warehouseRouter.get('/:warehouseId/delivery-applications', requireAuth, requireR
         warehouseId: String(req.params.warehouseId),
         ...(status ? { status: status as 'PENDING' | 'APPROVED' | 'SUSPENDED' | 'REJECTED' } : {}),
       },
-      include: { driver: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } } },
+      include: {
+        driver: { include: { user: { select: { fullName: true, email: true, phoneNumber: true } } } },
+        // Driver messages the business hasn't opened yet.
+        _count: { select: { messages: { where: { senderSide: 'DRIVER', readAt: null } } } },
+      },
       orderBy: { requestedAt: 'desc' },
     });
     // Payout/bank details are the driver's private info — never sent to the
     // warehouse/shop they deliver for.
     res.json(
-      applications.map(({ driver, ...rest }) => {
+      applications.map(({ driver, _count, ...rest }) => {
         const { payoutMethod, bankName, accountHolderName, accountNumber, branchCode, lynkWalletId, ...publicDriver } = driver;
-        return { ...rest, driver: publicDriver };
+        return { ...rest, driver: publicDriver, unreadMessages: _count.messages };
       }),
     );
   } catch (err) {
@@ -467,6 +502,7 @@ warehouseRouter.put('/:warehouseId/resellers/:storeId/grants', requireAuth, requ
     const storeId = String(req.params.storeId);
 
     const { warehouse } = await assertWarehouseAccess(warehouseId, req.user!);
+    assertApprovedSeller(warehouse, 'warehouse');
     await assertResellerRelationship(warehouseId, storeId);
 
     const product = await prisma.masterProduct.findUnique({ where: { id: input.masterProductId } });
@@ -523,7 +559,9 @@ warehouseRouter.get('/:warehouseId/orders', requireAuth, requireRole(UserRole.WA
       include: {
         resellerStore: { select: { storeName: true } },
         storeListing: { select: { masterProduct: { select: { title: true } } } },
-        rating: true,
+        // Every item in the order, and the customer's rating of each.
+        items: { orderBy: { createdAt: 'asc' } },
+        ratings: true,
         refund: true,
         // Buyer name/phone — shown on the Packing Queue's printed shipping
         // label (see printLabel.js) alongside the delivery address.
@@ -598,3 +636,4 @@ warehouseRouter.get('/:warehouseId/feedback', requireAuth, requireRole(UserRole.
 });
 
 registerStaffRoutes(warehouseRouter);
+registerHouseStoreRoutes(warehouseRouter);

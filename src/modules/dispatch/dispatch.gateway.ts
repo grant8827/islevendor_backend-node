@@ -1,9 +1,8 @@
 import type { Server, Socket } from 'socket.io';
-import jwt from 'jsonwebtoken';
-import { env } from '../../env.js';
 import { prisma } from '../../lib/prisma.js';
 import { redis, DRIVER_GEO_KEY } from '../../lib/redis.js';
-import type { AuthTokenPayload } from '../../middleware/auth.js';
+import { verifyAuthToken, type AuthTokenPayload } from '../../middleware/auth.js';
+import { userRoom } from '../../lib/sessions.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
 import { resolveWarehouseAccess } from '../../lib/warehouseAccess.js';
 import { isEligibleDriver } from '../../lib/driverEligibility.js';
@@ -24,11 +23,11 @@ function isUuid(value: unknown): value is string {
 }
 
 export function registerDispatchGateway(io: Server) {
-  io.use((socket, next) => {
+  io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token as string | undefined;
     if (!token) return next(new Error('Missing auth token'));
     try {
-      (socket.data as { user: AuthTokenPayload }).user = jwt.verify(token, env.JWT_SECRET) as AuthTokenPayload;
+      (socket.data as { user: AuthTokenPayload }).user = await verifyAuthToken(token);
       next();
     } catch {
       next(new Error('Invalid auth token'));
@@ -37,6 +36,11 @@ export function registerDispatchGateway(io: Server) {
 
   io.on('connection', (socket: Socket) => {
     const user = (socket.data as { user: AuthTokenPayload }).user;
+
+    // Lets lib/sessions.ts drop every connection a user has when their
+    // sessions are revoked — the handshake check alone would leave an
+    // already-open socket running on a dead token.
+    socket.join(userRoom(user.sub));
 
     if (user.role === 'DRIVER') {
       socket.join(`driver_${user.sub}`);
@@ -142,7 +146,9 @@ export async function claimJobForDriver(io: Server, orderId: string, driverId: s
   // PICKED_UP tracking event (or vice versa).
   const claimed = await prisma.$transaction(async (tx) => {
     const result = await tx.order.updateMany({
-      where: { id: orderId, status: 'READY_FOR_PICKUP', driverId: null },
+      // Only IsleDash orders are a driver's to take — a pickup or the
+      // seller's own delivery never is, whatever a client sends.
+      where: { id: orderId, status: 'READY_FOR_PICKUP', driverId: null, deliveryMethod: 'ISLEDASH' },
       data: { driverId, status: 'PICKED_UP' },
     });
     if (result.count === 0) return false;

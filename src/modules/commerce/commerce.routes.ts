@@ -6,6 +6,7 @@ import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { computeAffiliatePricing } from '../../lib/pricing.js';
 import { imageUrlSchema } from '../../lib/validation.js';
+import { APPROVED_SELLER, assertApprovedSeller, assertHasPayoutDetails } from '../../lib/eligibility.js';
 
 export const commerceRouter = Router();
 
@@ -27,6 +28,8 @@ commerceRouter.post('/stores', requireAuth, requireRole(UserRole.RESELLER, UserR
       prisma.shop.findUnique({ where: { slug: input.slug } }),
     ]);
     if (existingStore || existingShop) throw new HttpError(409, 'That store slug is already taken');
+    // Starts PENDING_REVIEW (the column default) until IsleVendor approves it.
+    await assertHasPayoutDetails(req.user!.sub);
 
     const store = await prisma.resellerStore.create({
       data: { userId: req.user!.sub, storeName: input.storeName, slug: input.slug },
@@ -121,10 +124,14 @@ commerceRouter.get('/listings', async (req, res, next) => {
       prisma.storeListing.findMany({
         where: {
           isActive: true,
+          // Both businesses behind an affiliate listing must be approved by
+          // IsleVendor: the reseller selling it and the warehouse stocking it.
+          store: APPROVED_SELLER,
           // A suspended master product shouldn't be buyable even if an
           // affiliate still has it listed — the warehouse isn't selling it.
           masterProduct: {
             isActive: true,
+            warehouse: APPROVED_SELLER,
             ...(category && category !== 'All' ? { category } : {}),
             ...(q ? { title: { contains: q, mode: 'insensitive' } } : {}),
           },
@@ -138,6 +145,7 @@ commerceRouter.get('/listings', async (req, res, next) => {
       prisma.shopProduct.findMany({
         where: {
           isActive: true,
+          shop: APPROVED_SELLER,
           ...(category && category !== 'All' ? { category } : {}),
           ...(q ? { title: { contains: q, mode: 'insensitive' } } : {}),
         },
@@ -163,8 +171,8 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
     const affiliateListing = await prisma.storeListing.findUnique({
       where: { id },
       include: {
-        masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
-        store: { select: { storeName: true, slug: true } },
+        masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true, applicantStatus: true } } } },
+        store: { select: { storeName: true, slug: true, applicantStatus: true } },
       },
     });
 
@@ -172,7 +180,12 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
     let category: string;
 
     if (affiliateListing) {
-      if (!affiliateListing.isActive || !affiliateListing.masterProduct.isActive) {
+      if (
+        !affiliateListing.isActive ||
+        !affiliateListing.masterProduct.isActive ||
+        affiliateListing.store.applicantStatus !== 'APPROVED' ||
+        affiliateListing.masterProduct.warehouse.applicantStatus !== 'APPROVED'
+      ) {
         throw new HttpError(404, 'This item is no longer available');
       }
       listing = normalizeAffiliateListing(affiliateListing);
@@ -180,9 +193,11 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
     } else {
       const shopProduct = await prisma.shopProduct.findUnique({
         where: { id },
-        include: { shop: { select: { shopName: true, slug: true, parish: true } } },
+        include: { shop: { select: { shopName: true, slug: true, parish: true, applicantStatus: true } } },
       });
-      if (!shopProduct || !shopProduct.isActive) throw new HttpError(404, 'This item is no longer available');
+      if (!shopProduct || !shopProduct.isActive || shopProduct.shop.applicantStatus !== 'APPROVED') {
+        throw new HttpError(404, 'This item is no longer available');
+      }
       listing = normalizeShopProduct(shopProduct);
       category = shopProduct.category;
     }
@@ -190,7 +205,7 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
     const RAIL_LIMIT = 8;
     const [recommendedAffiliate, recommendedShop, sellerAffiliate, sellerShop, ratingRow] = await Promise.all([
       prisma.storeListing.findMany({
-        where: { isActive: true, id: { not: id }, masterProduct: { isActive: true, category } },
+        where: { isActive: true, id: { not: id }, store: APPROVED_SELLER, masterProduct: { isActive: true, category, warehouse: APPROVED_SELLER } },
         include: {
           masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
           store: { select: { storeName: true, slug: true } },
@@ -199,7 +214,7 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
         take: RAIL_LIMIT,
       }),
       prisma.shopProduct.findMany({
-        where: { isActive: true, id: { not: id }, category },
+        where: { isActive: true, id: { not: id }, category, shop: APPROVED_SELLER },
         include: { shop: { select: { shopName: true, slug: true, parish: true } } },
         orderBy: { createdAt: 'desc' },
         take: RAIL_LIMIT,
@@ -210,7 +225,7 @@ commerceRouter.get('/listings/:id', async (req, res, next) => {
       // in the other table).
       listing.kind === 'AFFILIATE'
         ? prisma.storeListing.findMany({
-            where: { isActive: true, id: { not: id }, storeId: listing.storeId, masterProduct: { isActive: true } },
+            where: { isActive: true, id: { not: id }, storeId: listing.storeId, masterProduct: { isActive: true, warehouse: APPROVED_SELLER } },
             include: {
               masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
               store: { select: { storeName: true, slug: true } },
@@ -277,8 +292,9 @@ commerceRouter.get('/stores/:slug', async (req, res, next) => {
   try {
     const slug = String(req.params.slug);
 
+    // A store IsleVendor hasn't approved has no public storefront yet.
     const store = await prisma.resellerStore.findUnique({
-      where: { slug },
+      where: { slug, ...APPROVED_SELLER },
       select: {
         id: true,
         storeName: true,
@@ -290,7 +306,7 @@ commerceRouter.get('/stores/:slug', async (req, res, next) => {
         heroColor: true,
         heroImageUrl: true,
         listings: {
-          where: { isActive: true, masterProduct: { isActive: true } },
+          where: { isActive: true, masterProduct: { isActive: true, warehouse: APPROVED_SELLER } },
           include: {
             masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
             store: { select: { storeName: true, slug: true } },
@@ -304,7 +320,7 @@ commerceRouter.get('/stores/:slug', async (req, res, next) => {
     }
 
     const shop = await prisma.shop.findUnique({
-      where: { slug },
+      where: { slug, ...APPROVED_SELLER },
       select: {
         id: true,
         shopName: true,
@@ -371,12 +387,14 @@ commerceRouter.post('/stores/:storeId/listings', requireAuth, requireRole(UserRo
     if (store.userId !== req.user!.sub && req.user!.role !== UserRole.ADMIN) {
       throw new HttpError(403, 'You do not own this store');
     }
+    assertApprovedSeller(store, 'reseller');
 
     const product = await prisma.masterProduct.findUnique({
       where: { id: input.masterProductId },
-      include: { warehouse: { select: { resellerCommissionPercent: true } } },
+      include: { warehouse: { select: { resellerCommissionPercent: true, applicantStatus: true } } },
     });
     if (!product) throw new HttpError(404, 'Master product not found');
+    assertApprovedSeller(product.warehouse, 'warehouse');
 
     const { retailTotalJmd } = computeAffiliatePricing({
       wholesalePriceJmd: product.wholesalePriceJmd.toString(),
@@ -515,7 +533,9 @@ commerceRouter.get('/stores/:storeId/orders', requireAuth, requireRole(UserRole.
       },
       include: {
         storeListing: { select: { masterProduct: { select: { title: true } } } },
-        rating: true,
+        // Every item in the order, and the customer's rating of each.
+        items: { orderBy: { createdAt: 'asc' } },
+        ratings: true,
         refund: true,
         driver: { select: { fullName: true, phoneNumber: true, driverProfile: { select: { isOnline: true } } } },
         trackingEvents: { orderBy: { createdAt: 'asc' } },

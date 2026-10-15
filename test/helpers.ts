@@ -1,8 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import type { OrderStatus, UserRole } from '@prisma/client';
 import { io as connectSocket, type Socket } from 'socket.io-client';
 import { createServer } from '../src/app.js';
+import { refreshPaySettings } from '../src/lib/platformSettings.js';
 import { prisma } from '../src/lib/prisma.js';
 import { redis } from '../src/lib/redis.js';
 import { signAuthToken } from '../src/middleware/auth.js';
@@ -17,6 +18,7 @@ export interface TestServer {
 /** Boots the real app on an ephemeral port. Call `close` in an `after` hook. */
 export async function startServer(): Promise<TestServer> {
   const { httpServer, io } = createServer();
+  await refreshPaySettings();
   await new Promise<void>((resolve) => httpServer.listen(0, resolve));
   const { port } = httpServer.address() as AddressInfo;
   return {
@@ -48,6 +50,12 @@ export async function createUser(role: UserRole): Promise<TestUser> {
   return { id: user.id, role, token: signAuthToken({ sub: user.id, role }) };
 }
 
+/** Records that a business has accepted this driver as one of its couriers. */
+export async function acceptDriver(driver: TestUser, business: { warehouseId: string } | { shopId: string }) {
+  const profile = await prisma.driverProfile.findUniqueOrThrow({ where: { userId: driver.id } });
+  await prisma.deliveryApplication.create({ data: { driverId: profile.id, status: 'APPROVED', decidedAt: new Date(), ...business } });
+}
+
 export async function createDriver(opts: { isKycApproved?: boolean; applicantStatus?: 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED' } = {}) {
   const user = await createUser('DRIVER');
   await prisma.driverProfile.create({
@@ -62,29 +70,33 @@ export async function createDriver(opts: { isKycApproved?: boolean; applicantSta
 
 // Warehouse/Shop have a PostGIS `location` column Prisma can't write, so —
 // like the app's own create routes — these go through raw SQL.
-export async function createWarehouse(ownerId: string): Promise<string> {
+type ApplicantStatus = 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED';
+
+// Approved by IsleVendor unless a test says otherwise — most tests are about
+// something other than the approval gate.
+export async function createWarehouse(ownerId: string, applicantStatus: ApplicantStatus = 'APPROVED'): Promise<string> {
   const id = randomUUID();
   await prisma.$executeRaw`
-    INSERT INTO warehouses (id, user_id, name, address_line, parish, location)
+    INSERT INTO warehouses (id, user_id, name, address_line, parish, location, applicant_status)
     VALUES (${id}::uuid, ${ownerId}::uuid, 'Test Warehouse', '1 Test Road', 'Kingston',
-            ST_SetSRID(ST_MakePoint(-76.79, 18.01), 4326))
+            ST_SetSRID(ST_MakePoint(-76.79, 18.01), 4326), ${applicantStatus}::"ApplicantStatus")
   `;
   return id;
 }
 
-export async function createShop(ownerId: string): Promise<string> {
+export async function createShop(ownerId: string, applicantStatus: ApplicantStatus = 'APPROVED'): Promise<string> {
   const id = randomUUID();
   await prisma.$executeRaw`
-    INSERT INTO shops (id, user_id, shop_name, slug, address_line, parish, location)
+    INSERT INTO shops (id, user_id, shop_name, slug, address_line, parish, location, applicant_status)
     VALUES (${id}::uuid, ${ownerId}::uuid, 'Test Shop', ${`shop-${id}`}, '2 Test Road', 'Kingston',
-            ST_SetSRID(ST_MakePoint(-76.79, 18.01), 4326))
+            ST_SetSRID(ST_MakePoint(-76.79, 18.01), 4326), ${applicantStatus}::"ApplicantStatus")
   `;
   return id;
 }
 
-export async function createResellerStore(ownerId: string): Promise<string> {
+export async function createResellerStore(ownerId: string, applicantStatus: ApplicantStatus = 'APPROVED'): Promise<string> {
   const store = await prisma.resellerStore.create({
-    data: { userId: ownerId, storeName: 'Test Store', slug: `store-${randomUUID()}` },
+    data: { userId: ownerId, storeName: 'Test Store', slug: `store-${randomUUID()}`, applicantStatus },
   });
   return store.id;
 }
@@ -166,4 +178,50 @@ export async function ensurePlatformAccount() {
     (await prisma.ledgerAccount.findFirst({ where: { accountType: 'PLATFORM' } })) ??
     (await prisma.ledgerAccount.create({ data: { accountType: 'PLATFORM' } }))
   );
+}
+
+/**
+ * A WiPay payment attempt for orders already placed, as if WiPay had
+ * created its checkout session (which assigns the transaction id up front).
+ */
+export async function createCheckoutPayment(orderIds: string[], transactionId = `SB-${randomUUID()}`) {
+  const orders = await prisma.order.findMany({ where: { id: { in: orderIds } } });
+  const amount = orders.reduce((sum, o) => sum + Number(o.totalPaidJmd), 0);
+  const payment = await prisma.checkoutPayment.create({
+    data: {
+      customerId: orders[0].customerId,
+      reference: `T${randomUUID().replace(/-/g, '').slice(0, 15).toUpperCase()}`,
+      orderIds,
+      amountJmd: amount.toFixed(2),
+      wipayTransactionId: transactionId,
+      checkoutUrl: 'https://jmsb.wipayfinancial.com/checkout/test',
+    },
+  });
+  await prisma.order.updateMany({ where: { id: { in: orderIds } }, data: { checkoutPaymentId: payment.id } });
+  return payment;
+}
+
+export const WIPAY_TEST_KEY = 'test-wipay-key';
+
+/** WiPay's success hash: md5(transaction_id + original total + API key). */
+export function wipayHash(transactionId: string, amountJmd: { toString(): string } | number, key = WIPAY_TEST_KEY) {
+  return createHash('md5').update(`${transactionId}${Number(amountJmd.toString()).toFixed(2)}${key}`).digest('hex');
+}
+
+/** WiPay sending the customer back (GET /api/webhooks/wipay). Doesn't follow the redirect. */
+export async function wipayReturn(server: TestServer, query: Record<string, string>) {
+  const res = await fetch(`${server.baseUrl}/api/webhooks/wipay?${new URLSearchParams(query)}`, { redirect: 'manual' });
+  return { status: res.status, location: res.headers.get('location') };
+}
+
+/** Pays for orders the way a customer would: a payment attempt, then a verified success return. */
+export async function payOrders(server: TestServer, orderIds: string[]) {
+  const payment = await createCheckoutPayment(orderIds);
+  const res = await wipayReturn(server, {
+    status: 'success',
+    order_id: payment.reference,
+    transaction_id: payment.wipayTransactionId!,
+    hash: wipayHash(payment.wipayTransactionId!, payment.amountJmd),
+  });
+  return { ...res, payment };
 }

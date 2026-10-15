@@ -69,9 +69,11 @@ describe('superadmin console API', () => {
     it('is closed to a token that claims ADMIN for an account that is not one', async () => {
       const stale: TestUser = { ...customer, token: signAuthToken({ sub: customer.id, role: 'ADMIN' }) };
       const gone: TestUser = { ...customer, token: signAuthToken({ sub: randomUUID(), role: 'ADMIN' }) };
-      for (const user of [stale, gone]) {
-        for (const route of routes) assert.equal((await get(route, user)).status, 403, route);
-        assert.equal((await decide('driver', driverProfileId, { decision: 'APPROVED' }, user)).status, 403);
+      // A real account that isn't an admin is refused; an account that no
+      // longer exists isn't even authenticated.
+      for (const [user, expected] of [[stale, 403], [gone, 401]] as const) {
+        for (const route of routes) assert.equal((await get(route, user)).status, expected, route);
+        assert.equal((await decide('driver', driverProfileId, { decision: 'APPROVED' }, user)).status, expected);
       }
       assert.equal((await prisma.driverProfile.findUniqueOrThrow({ where: { id: driverProfileId } })).applicantStatus, 'PENDING_REVIEW');
     });

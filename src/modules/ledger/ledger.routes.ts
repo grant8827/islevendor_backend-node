@@ -2,17 +2,21 @@ import { Router } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
-import { processWiPayWebhook, withdrawBalance } from './ledger.service.js';
+import { processWiPayPayoutWebhook, withdrawBalance } from './ledger.service.js';
+import { getPayoutTiming } from '../../lib/platformSettings.js';
+import { registerPayoutAccountRoutes } from './payoutAccount.routes.js';
 
 export const ledgerRouter = Router();
 
-// WiPay posts here on payment.success / payment.failed. No auth middleware —
-// authenticity comes from the hash check inside processWiPayWebhook, not a
-// session token (WiPay's servers don't have one).
-ledgerRouter.post('/webhooks/wipay', async (req, res, next) => {
+// WiPay's withdrawal notifications (withdrawal.* events) for automated
+// payouts. Authenticated by WiPay's signature, not a session — see
+// processWiPayPayoutWebhook. Answers 2xx only once the event is durably
+// handled, so WiPay retries anything that failed.
+ledgerRouter.post('/webhooks/wipay-payouts', async (req, res, next) => {
   try {
-    const result = await processWiPayWebhook(req.body);
-    res.json(result);
+    const rawBody = (req as typeof req & { rawBody?: Buffer }).rawBody;
+    if (!rawBody) throw new HttpError(400, 'Expected a JSON body');
+    res.json(await processWiPayPayoutWebhook(rawBody, req.headers));
   } catch (err) {
     next(err);
   }
@@ -40,6 +44,16 @@ ledgerRouter.get('/transactions/me', requireAuth, async (req, res, next) => {
       orderBy: { createdAt: 'desc' },
     });
     res.json(transactions);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// How long a withdrawal usually takes to reach the owner's bank — shown on
+// every dashboard's Payouts tab before they withdraw.
+ledgerRouter.get('/payout-timing', requireAuth, async (_req, res, next) => {
+  try {
+    res.json(await getPayoutTiming());
   } catch (err) {
     next(err);
   }
@@ -97,3 +111,5 @@ ledgerRouter.get('/payouts/me', requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
+registerPayoutAccountRoutes(ledgerRouter);

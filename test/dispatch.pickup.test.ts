@@ -1,6 +1,7 @@
 import { after, before, describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  acceptDriver,
   api,
   createDriver,
   createOrder,
@@ -37,6 +38,12 @@ describe('QR pickup claims', () => {
 
   after(() => server.close());
 
+  /** An approved driver this warehouse has accepted as one of its couriers. */
+  const courier = async () => {
+    const driver = await createDriver();
+    await acceptDriver(driver, { warehouseId });
+    return driver;
+  };
   const readyOrder = () => createOrder({ customerId: customer.id, warehouseId, status: 'READY_FOR_PICKUP' });
   const issue = (orderId: string, user: TestUser = warehouseOwner) =>
     api(server, `/dispatch/orders/${orderId}/pickup-token`, { method: 'POST', token: user.token });
@@ -62,7 +69,7 @@ describe('QR pickup claims', () => {
 
   describe('scanning', () => {
     it('lets an approved driver with the label token claim the package', async () => {
-      const driver = await createDriver();
+      const driver = await courier();
       const order = await readyOrder();
       const { token } = (await issue(order.id)).body;
 
@@ -75,7 +82,7 @@ describe('QR pickup claims', () => {
     });
 
     it('denies a claim with only the order id', async () => {
-      const driver = await createDriver();
+      const driver = await courier();
       const order = await readyOrder();
       await issue(order.id);
 
@@ -84,7 +91,7 @@ describe('QR pickup claims', () => {
     });
 
     it('denies a forged, tampered or wrong-order token', async () => {
-      const driver = await createDriver();
+      const driver = await courier();
       const [order, otherOrder] = await Promise.all([readyOrder(), readyOrder()]);
       const { token } = (await issue(order.id)).body as { token: string };
       const { token: otherToken } = (await issue(otherOrder.id)).body as { token: string };
@@ -103,7 +110,7 @@ describe('QR pickup claims', () => {
     });
 
     it('denies an expired token', async () => {
-      const driver = await createDriver();
+      const driver = await courier();
       const order = await readyOrder();
 
       // Issue the token as if the label had been printed 25 hours ago.
@@ -116,7 +123,7 @@ describe('QR pickup claims', () => {
     });
 
     it('denies a token that has already been used', async () => {
-      const [first, second] = await Promise.all([createDriver(), createDriver()]);
+      const [first, second] = await Promise.all([courier(), courier()]);
       const order = await readyOrder();
       const { token } = (await issue(order.id)).body;
       assert.equal((await scan(order.id, first, token)).status, 200);
@@ -128,13 +135,27 @@ describe('QR pickup claims', () => {
     });
 
     it('invalidates the previous label when a new one is printed', async () => {
-      const driver = await createDriver();
+      const driver = await courier();
       const order = await readyOrder();
       const { token: oldToken } = (await issue(order.id)).body;
       const { token: newToken } = (await issue(order.id)).body;
 
       assert.equal((await scan(order.id, driver, oldToken)).status, 403);
       assert.equal((await scan(order.id, driver, newToken)).status, 200);
+    });
+
+    it('denies an approved driver this business has not accepted, even with the label', async () => {
+      const stranger = await createDriver();
+      const order = await readyOrder();
+      const { token } = (await issue(order.id)).body;
+
+      const res = await scan(order.id, stranger, token);
+      assert.equal(res.status, 403);
+      assert.match(res.body.error, /accepted drivers/);
+      assert.equal(await assignedDriver(order.id), null);
+
+      // The token wasn't burned by the refused attempt.
+      assert.equal((await scan(order.id, await courier(), token)).status, 200);
     });
 
     it('denies drivers who are not approved, and every non-driver role', async () => {
@@ -150,7 +171,7 @@ describe('QR pickup claims', () => {
     });
 
     it('lets the assigned driver rescan without a token, and nobody else', async () => {
-      const [driver, other] = await Promise.all([createDriver(), createDriver()]);
+      const [driver, other] = await Promise.all([courier(), courier()]);
       const order = await readyOrder();
       const { token } = (await issue(order.id)).body;
       assert.equal((await scan(order.id, driver, token)).status, 200);
@@ -161,7 +182,7 @@ describe('QR pickup claims', () => {
     });
 
     it('assigns exactly one driver when several scan the same label at once', async () => {
-      const drivers = await Promise.all(Array.from({ length: 6 }, () => createDriver()));
+      const drivers = await Promise.all(Array.from({ length: 6 }, () => courier()));
       const order = await readyOrder();
       const { token } = (await issue(order.id)).body;
 

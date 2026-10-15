@@ -16,17 +16,11 @@ datasource db {
 
 // ─────────────────────────────────────────────────────────────────────────
 // 0. ONBOARDING / KYC APPLICANT STATUS
-// Shared across Warehouse, ResellerStore, Shop, and DriverProfile. Defaults
-// to APPROVED on each model so the pre-existing "quick setup" dashboard
-// forms (WarehouseSetupForm, StoreSetupForm, ShopSetupForm — which create a
-// row for an already-authenticated user with no review step) keep behaving
-// exactly as before. The new public onboarding endpoints (see
-// modules/onboarding) explicitly set PENDING_REVIEW instead — that's the
-// only thing that actually gates anything on this field today; there is no
-// enforcement yet stopping a PENDING_REVIEW row from operating normally
-// (listing products, accepting dispatches, etc.) — see onboarding.routes.ts
-// for the admin approve/reject endpoints and the follow-up needed to
-// actually gate access on this status.
+// Shared across Warehouse, ResellerStore, Shop, and DriverProfile. Every
+// new row starts PENDING_REVIEW, whichever form created it, and IsleVendor's
+// admin approves or rejects it (modules/admin, onboarding.routes.ts's
+// decision endpoint). Until APPROVED it can't list, sell, dispatch or
+// withdraw — see lib/eligibility.ts and lib/driverEligibility.ts.
 // ─────────────────────────────────────────────────────────────────────────
 
 enum ApplicantStatus {
@@ -67,6 +61,10 @@ model User {
   // owner's admins may reset its password. Null for every self-registered
   // account.
   staffOfUserId String?  @map("staff_of_user_id") @db.Uuid
+  // Bumped to sign the user out everywhere — a login token is only accepted
+  // while the version it was issued under still matches (see
+  // middleware/auth.ts and lib/sessions.ts).
+  tokenVersion  Int      @default(0) @map("token_version")
 
   staffOf              User?             @relation("StaffOwner", fields: [staffOfUserId], references: [id], onDelete: SetNull)
   staffAccounts        User[]            @relation("StaffOwner")
@@ -84,6 +82,9 @@ model User {
   refundsIssued        Refund[]             @relation("RefundInitiator")
   trackingEventsPosted OrderTrackingEvent[] @relation("TrackingEventPoster")
   auditEvents          AuditEvent[]         @relation("AuditActor")
+  applicationMessages  ApplicationMessage[] @relation("ApplicationMessageSender")
+  payoutAccount        PayoutAccount?
+  checkoutPayments     CheckoutPayment[]    @relation("CheckoutPayments")
 
   @@map("users")
 }
@@ -237,7 +238,7 @@ model Warehouse {
   // Existing WarehouseSetupForm (dashboard quick-setup) rows keep the
   // APPROVED default — see the ApplicantStatus doc comment above. The new
   // ISLE-105 onboarding endpoint explicitly overrides this to PENDING_REVIEW.
-  applicantStatus   ApplicantStatus @default(APPROVED) @map("applicant_status")
+  applicantStatus   ApplicantStatus @default(PENDING_REVIEW) @map("applicant_status")
   referenceId       String?         @unique @map("reference_id")
 
   // The warehouse's own call, not a platform-wide constant: what percentage
@@ -248,12 +249,29 @@ model Warehouse {
   // (see below).
   resellerCommissionPercent Int @default(20) @map("reseller_commission_percent")
 
+  // ── Delivery options this business offers customers at checkout (see
+  // src/lib/deliveryOptions.ts). A reseller's orders ship from the
+  // warehouse, so these live on warehouses and shops, not reseller stores.
+  offersIsleDash                 Boolean  @default(true) @map("offers_isledash")
+  offersSellerDelivery           Boolean  @default(false) @map("offers_seller_delivery")
+  // The business's own delivery: what it charges, and anything the customer
+  // should know ("Kingston and St. Andrew only, same day before 3pm").
+  sellerDeliveryFeeJmd           Decimal? @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  sellerDeliveryNote             String?  @map("seller_delivery_note")
+  // Each further item in the same checkout costs this % of the fee (the
+  // first is charged in full). 50 = "first item full, each extra half".
+  sellerDeliveryExtraItemPercent Int      @default(50) @map("seller_delivery_extra_item_percent")
+  // Customer collects it themselves — always free.
+  offersPickup                   Boolean  @default(false) @map("offers_pickup")
+  pickupInstructions             String?  @map("pickup_instructions")
+
   user                 User                    @relation(fields: [userId], references: [id])
   products             MasterProduct[]
   orders               Order[]
   authorizations       ResellerAuthorization[]
   deliveryApplications DeliveryApplication[]
   vacancies            Vacancy[]
+  houseStore           ResellerStore?          @relation("HouseStore")
   members              WarehouseMember[]
 
   @@map("warehouses")
@@ -382,10 +400,16 @@ enum StoreHeroMode {
 }
 
 model ResellerStore {
-  id        String @id @default(uuid()) @db.Uuid
-  userId    String @unique @map("user_id") @db.Uuid
-  storeName String @map("store_name")
-  slug      String @unique
+  id               String  @id @default(uuid()) @db.Uuid
+  // Exactly one of userId / houseWarehouseId is set (a database check
+  // enforces it): an independent reseller's store, or a warehouse's own
+  // "house" store that sells its stock directly (see
+  // warehouse.routes.ts's /:warehouseId/store routes). A house store has no
+  // reseller behind it — the warehouse runs it and is paid its margin.
+  userId           String? @unique @map("user_id") @db.Uuid
+  houseWarehouseId String? @unique @map("house_warehouse_id") @db.Uuid
+  storeName        String  @map("store_name")
+  slug             String  @unique
 
   // ── ISLE-102: reseller partner onboarding fields ──
   resellerType            ResellerType?               @map("reseller_type")
@@ -415,7 +439,7 @@ model ResellerStore {
   slaAcceptedAt           DateTime?                   @map("sla_accepted_at") @db.Timestamptz
   // See Warehouse.applicantStatus for why this defaults to APPROVED —
   // same reasoning re: the existing StoreSetupForm quick-setup path.
-  applicantStatus         ApplicantStatus             @default(APPROVED) @map("applicant_status")
+  applicantStatus         ApplicantStatus             @default(PENDING_REVIEW) @map("applicant_status")
   referenceId             String?                     @unique @map("reference_id")
 
   // The banner across the top of this store's public storefront and its
@@ -427,7 +451,8 @@ model ResellerStore {
   heroColor    String?       @map("hero_color")
   heroImageUrl String?       @map("hero_image_url")
 
-  user           User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user           User?                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  houseWarehouse Warehouse?              @relation("HouseStore", fields: [houseWarehouseId], references: [id], onDelete: Cascade)
   listings       StoreListing[]
   orders         Order[]
   authorizations ResellerAuthorization[]
@@ -549,8 +574,24 @@ model Shop {
   // See Warehouse.applicantStatus — same "keep the quick-setup path
   // unaffected" reasoning re: ShopSetupForm. Fast-track review target is
   // 12–24 hrs, surfaced to the applicant, not enforced here.
-  applicantStatus         ApplicantStatus             @default(APPROVED) @map("applicant_status")
+  applicantStatus         ApplicantStatus             @default(PENDING_REVIEW) @map("applicant_status")
   referenceId             String?                     @unique @map("reference_id")
+
+  // ── Delivery options this business offers customers at checkout (see
+  // src/lib/deliveryOptions.ts). A reseller's orders ship from the
+  // warehouse, so these live on warehouses and shops, not reseller stores.
+  offersIsleDash                 Boolean  @default(true) @map("offers_isledash")
+  offersSellerDelivery           Boolean  @default(false) @map("offers_seller_delivery")
+  // The business's own delivery: what it charges, and anything the customer
+  // should know ("Kingston and St. Andrew only, same day before 3pm").
+  sellerDeliveryFeeJmd           Decimal? @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  sellerDeliveryNote             String?  @map("seller_delivery_note")
+  // Each further item in the same checkout costs this % of the fee (the
+  // first is charged in full). 50 = "first item full, each extra half".
+  sellerDeliveryExtraItemPercent Int      @default(50) @map("seller_delivery_extra_item_percent")
+  // Customer collects it themselves — always free.
+  offersPickup                   Boolean  @default(false) @map("offers_pickup")
+  pickupInstructions             String?  @map("pickup_instructions")
 
   user                 User                  @relation(fields: [userId], references: [id])
   products             ShopProduct[]
@@ -577,9 +618,10 @@ model ShopProduct {
   isActive        Boolean  @default(true) @map("is_active")
   createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
 
-  shop    Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
-  orders  Order[]
-  ratings ProductRating[]
+  shop       Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  orders     Order[]
+  orderItems OrderItem[]
+  ratings    ProductRating[]
 
   @@map("shop_products")
 }
@@ -594,6 +636,7 @@ model StoreListing {
   store         ResellerStore   @relation(fields: [storeId], references: [id], onDelete: Cascade)
   masterProduct MasterProduct   @relation(fields: [masterProductId], references: [id], onDelete: Cascade)
   orders        Order[]
+  orderItems    OrderItem[]
   ratings       ProductRating[]
 
   // NOTE: the CHECK (retail_price_jmd > wholesale_price_jmd) constraint from the
@@ -624,9 +667,15 @@ model DeliveryApplication {
   warehouseId String? @map("warehouse_id") @db.Uuid
   shopId      String? @map("shop_id") @db.Uuid
 
-  status      AuthorizationStatus @default(PENDING)
-  requestedAt DateTime            @default(now()) @map("requested_at") @db.Timestamptz
-  decidedAt   DateTime?           @map("decided_at") @db.Timestamptz
+  status            AuthorizationStatus @default(PENDING)
+  requestedAt       DateTime            @default(now()) @map("requested_at") @db.Timestamptz
+  decidedAt         DateTime?           @map("decided_at") @db.Timestamptz
+  // The in-person interview currently scheduled, if any (a reschedule
+  // overwrites it; `messages` keeps every version), and when the business
+  // last asked the driver for more information.
+  interviewAt       DateTime?           @map("interview_at") @db.Timestamptz
+  interviewLocation String?             @map("interview_location")
+  infoRequestedAt   DateTime?           @map("info_requested_at") @db.Timestamptz
 
   driver    DriverProfile @relation(fields: [driverId], references: [id], onDelete: Cascade)
   warehouse Warehouse?    @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
@@ -638,6 +687,8 @@ model DeliveryApplication {
   // @@unique([storeId, warehouseId])). Postgres treats NULL as distinct in a
   // unique index, so each constraint only ever governs the rows where that
   // particular side is actually set.
+  messages ApplicationMessage[]
+
   @@unique([driverId, warehouseId])
   @@unique([driverId, shopId])
   @@map("delivery_applications")
@@ -646,6 +697,48 @@ model DeliveryApplication {
 // ─────────────────────────────────────────────────────────────────────────
 // 5. ORDERS & DELIVERIES
 // ─────────────────────────────────────────────────────────────────────────
+
+enum DeliveryMethod {
+  ISLEDASH
+  SELLER_DELIVERY
+  PICKUP
+}
+
+enum MessageSide {
+  BUSINESS
+  DRIVER
+}
+
+enum ApplicationMessageKind {
+  MESSAGE
+  INTERVIEW_SCHEDULED
+  INFO_REQUESTED
+  DECISION
+}
+
+// One message in a business's conversation with a driver who applied to
+// deliver for it (see delivery.routes.ts). `senderSide` says which side
+// wrote it — anyone on a warehouse's team writes as the BUSINESS.
+model ApplicationMessage {
+  id                String                 @id @default(uuid()) @db.Uuid
+  applicationId     String                 @map("application_id") @db.Uuid
+  senderUserId      String?                @map("sender_user_id") @db.Uuid
+  senderSide        MessageSide            @map("sender_side")
+  kind              ApplicationMessageKind @default(MESSAGE)
+  body              String
+  // For INTERVIEW_SCHEDULED: when and where, as offered in this message.
+  interviewAt       DateTime?              @map("interview_at") @db.Timestamptz
+  interviewLocation String?                @map("interview_location")
+  // When the other side first opened it.
+  readAt            DateTime?              @map("read_at") @db.Timestamptz
+  createdAt         DateTime               @default(now()) @map("created_at") @db.Timestamptz
+
+  application DeliveryApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  sender      User?               @relation("ApplicationMessageSender", fields: [senderUserId], references: [id], onDelete: SetNull)
+
+  @@index([applicationId, createdAt])
+  @@map("application_messages")
+}
 
 enum OrderStatus {
   // Not in the original spec's enum: an order exists (stock is reserved) the
@@ -678,10 +771,10 @@ model Order {
   shopId          String? @map("shop_id") @db.Uuid
   driverId        String? @map("driver_id") @db.Uuid
 
-  // Which exact item this order is for — same "exactly one side set" pattern
-  // as the seller FKs above. Added so a DELIVERED order can prove a customer
-  // actually bought (and can now rate) a specific product; earlier orders
-  // predate this and simply have both null (never rateable).
+  // The first item and the total number of units, kept so older clients
+  // that show one product per order still have something to show. The
+  // order's actual contents are `items` (OrderItem) — an order can hold
+  // several items, everything bought from one business in one checkout.
   storeListingId String? @map("store_listing_id") @db.Uuid
   shopProductId  String? @map("shop_product_id") @db.Uuid
   quantity       Int     @default(1)
@@ -696,15 +789,31 @@ model Order {
   driverFeeJmd          Decimal @map("driver_fee_jmd") @db.Decimal(12, 2)
   platformCommissionJmd Decimal @map("platform_commission_jmd") @db.Decimal(12, 2)
 
-  status                  OrderStatus @default(AWAITING_PAYMENT)
-  deliveryAddress         String      @map("delivery_address")
-  proofOfDeliveryImageUrl String?     @map("proof_of_delivery_image_url")
+  // How it reaches the customer, chosen at checkout. Only ISLEDASH orders
+  // go to drivers; the other two are completed by the seller (see
+  // dispatch.routes.ts's POST /orders/:id/complete).
+  deliveryMethod          DeliveryMethod @default(ISLEDASH) @map("delivery_method")
+  // The seller's own delivery charge on a SELLER_DELIVERY order — paid to the
+  // seller, unlike driverFeeJmd, which is held for an IsleDash driver. Zero
+  // for every other method.
+  sellerDeliveryFeeJmd    Decimal        @default(0) @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  // Orders for one seller placed in the same checkout share one shipping
+  // charge — first item full, extras at the multi-item rate — split across
+  // them; this ties them together. Null for orders placed one at a time.
+  checkoutGroupId         String?        @map("checkout_group_id") @db.Uuid
+  status                  OrderStatus    @default(AWAITING_PAYMENT)
+  deliveryAddress         String         @map("delivery_address")
+  proofOfDeliveryImageUrl String?        @map("proof_of_delivery_image_url")
   // When the driver actually marked it DELIVERED — distinct from createdAt
   // (order placement time). Powers the driver's Delivered tab and lets the
   // seller-side Orders view show when it landed, not just that it did.
-  deliveredAt             DateTime?   @map("delivered_at") @db.Timestamptz
-  wipayTransactionId      String?     @unique @map("wipay_transaction_id")
-  createdAt               DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  deliveredAt             DateTime?      @map("delivered_at") @db.Timestamptz
+  // WiPay's transaction for the payment that paid this order — shared by
+  // every order paid in the same checkout.
+  wipayTransactionId      String?        @map("wipay_transaction_id")
+  // The current payment attempt for this order (see CheckoutPayment).
+  checkoutPaymentId       String?        @map("checkout_payment_id") @db.Uuid
+  createdAt               DateTime       @default(now()) @map("created_at") @db.Timestamptz
 
   customer       User                 @relation("OrderCustomer", fields: [customerId], references: [id])
   driver         User?                @relation("OrderDriver", fields: [driverId], references: [id])
@@ -714,15 +823,20 @@ model Order {
   storeListing   StoreListing?        @relation(fields: [storeListingId], references: [id])
   shopProduct    ShopProduct?         @relation(fields: [shopProductId], references: [id])
   ledgerTxns     LedgerTransaction[]
-  // At most one — the orderId unique constraint on ProductRating makes this
-  // a true 1:1, not a list (see that model for why: one rating per purchase).
-  rating         ProductRating?
+  items          OrderItem[]
+  // One per item the customer has rated (see ProductRating).
+  ratings        ProductRating[]
   // At most one — same one-row-per-order reasoning as rating above (the
   // orderId unique constraint on Refund makes this a true 1:1).
   refund         Refund?
   trackingEvents OrderTrackingEvent[]
   paymentEvents  PaymentEvent[]
 
+  checkoutPayment CheckoutPayment? @relation(fields: [checkoutPaymentId], references: [id], onDelete: SetNull)
+
+  @@index([checkoutGroupId])
+  @@index([checkoutPaymentId])
+  @@index([wipayTransactionId])
   @@map("orders")
 }
 
@@ -736,6 +850,31 @@ model Order {
 // a driver posts manually without changing the status (see dispatch.routes.ts's
 // POST /orders/:id/note) — e.g. "stuck in traffic", "buyer not answering".
 // ─────────────────────────────────────────────────────────────────────────
+
+// One product line in an order (see Order.items). Title and image are a
+// snapshot from when it was bought; the money fields are this line's share
+// of the order's totals, before delivery.
+model OrderItem {
+  id                    String   @id @default(uuid()) @db.Uuid
+  orderId               String   @map("order_id") @db.Uuid
+  storeListingId        String?  @map("store_listing_id") @db.Uuid
+  shopProductId         String?  @map("shop_product_id") @db.Uuid
+  title                 String
+  imageUrl              String?  @map("image_url")
+  quantity              Int
+  goodsTotalJmd         Decimal  @map("goods_total_jmd") @db.Decimal(12, 2)
+  wholesaleTotalJmd     Decimal  @map("wholesale_total_jmd") @db.Decimal(12, 2)
+  resellerMarginJmd     Decimal  @map("reseller_margin_jmd") @db.Decimal(12, 2)
+  platformCommissionJmd Decimal  @map("platform_commission_jmd") @db.Decimal(12, 2)
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  order        Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  storeListing StoreListing? @relation(fields: [storeListingId], references: [id], onDelete: SetNull)
+  shopProduct  ShopProduct?  @relation(fields: [shopProductId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@map("order_items")
+}
 
 model OrderTrackingEvent {
   id        String      @id @default(uuid()) @db.Uuid
@@ -764,7 +903,7 @@ model OrderTrackingEvent {
 model ProductRating {
   id             String   @id @default(uuid()) @db.Uuid
   customerId     String   @map("customer_id") @db.Uuid
-  orderId        String   @unique @map("order_id") @db.Uuid
+  orderId        String   @map("order_id") @db.Uuid
   // Exactly one of these is set, mirroring Order.storeListingId/shopProductId
   // — whichever one the qualifying order was for.
   storeListingId String?  @map("store_listing_id") @db.Uuid
@@ -784,6 +923,9 @@ model ProductRating {
   storeListing StoreListing? @relation(fields: [storeListingId], references: [id], onDelete: Cascade)
   shopProduct  ShopProduct?  @relation(fields: [shopProductId], references: [id], onDelete: Cascade)
 
+  // One rating per item per order — buying the same item again earns another.
+  @@unique([orderId, storeListingId])
+  @@unique([orderId, shopProductId])
   @@map("product_ratings")
 }
 
@@ -894,10 +1036,32 @@ model Refund {
 // integration exists), and nothing should until one does.
 enum PayoutStatus {
   REQUESTED
+  // An admin has checked the request and it can be paid.
+  APPROVED
+  // Sent to WiPay; whether WiPay accepted it isn't confirmed yet.
+  SUBMITTED
   PROCESSING
   PAID
   FAILED
   REVERSED
+}
+
+// How a payout was (or is being) sent: by an admin's own transfer, or
+// through WiPay's withdrawal API.
+enum PayoutChannel {
+  MANUAL
+  WIPAY
+}
+
+enum BankAccountType {
+  CHEQUING
+  SAVINGS
+}
+
+enum IdDocumentType {
+  DRIVER_PERMIT
+  NATIONAL_ID
+  PASSPORT
 }
 
 model Payout {
@@ -905,11 +1069,40 @@ model Payout {
   ledgerAccountId String       @map("ledger_account_id") @db.Uuid
   amountJmd       Decimal      @map("amount_jmd") @db.Decimal(12, 2)
   status          PayoutStatus @default(REQUESTED)
-  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  // Settlement, recorded by an IsleVendor admin after sending the money
+  // outside the platform: the bank/Lynk transfer reference for PAID, or why
+  // it FAILED. Null while REQUESTED.
+  reference       String?
+  note            String?
+  settledAt       DateTime?    @map("settled_at") @db.Timestamptz
+  settledBy       String?      @map("settled_by") @db.Uuid
+  // When the money should reach the owner's account at the latest — the
+  // request date plus the payout time IsleVendor advertised at the time.
+  expectedBy      DateTime?    @map("expected_by") @db.Date
+
+  channel                   PayoutChannel?
+  approvedAt                DateTime?      @map("approved_at") @db.Timestamptz
+  approvedBy                String?        @map("approved_by") @db.Uuid
+  // Where it was sent, as it was at approval — masked, never the full number.
+  destinationSnapshot       Json?          @map("destination_snapshot")
+  // Our reference for a WiPay submission, sent in its pass-through data —
+  // how an uncertain submission is found again before any retry.
+  submissionKey             String?        @unique @map("submission_key") @db.Uuid
+  submittedAt               DateTime?      @map("submitted_at") @db.Timestamptz
+  providerTransactionId     String?        @unique @map("provider_transaction_id")
+  providerReference         String?        @map("provider_reference")
+  // WiPay's withdrawal status code (see lib/wipayPayouts.ts) and its wording.
+  providerStatus            Int?           @map("provider_status")
+  providerStatusDescription String?        @map("provider_status_description")
+  providerFeeJmd            Decimal?       @map("provider_fee_jmd") @db.Decimal(12, 2)
+  providerCheckedAt         DateTime?      @map("provider_checked_at") @db.Timestamptz
+  lastError                 String?        @map("last_error")
+  createdAt                 DateTime       @default(now()) @map("created_at") @db.Timestamptz
 
   ledgerAccount LedgerAccount       @relation(fields: [ledgerAccountId], references: [id], onDelete: Cascade)
   legs          LedgerTransaction[]
 
+  @@index([status, createdAt])
   @@map("payouts")
 }
 
@@ -966,4 +1159,127 @@ model AuditEvent {
   @@index([targetType, targetId, createdAt])
   @@index([actorId, createdAt])
   @@map("audit_events")
+}
+
+// Platform-wide settings an IsleVendor admin manages. A single row, id
+// "default" (see lib/platformSettings.ts, which falls back to the same
+// defaults if it's ever missing).
+model PlatformSetting {
+  id                        String   @id
+  // IsleDash delivery: the fee for the first item, and what % of it each
+  // further item from the same seller in one checkout costs.
+  isleDashBaseFeeJmd        Decimal  @default(300) @map("isledash_base_fee_jmd") @db.Decimal(12, 2)
+  isleDashExtraItemPercent  Int      @default(50) @map("isledash_extra_item_percent")
+  // How long a withdrawal usually takes to reach the owner's bank once
+  // requested, in business days. Payouts are sent by hand (see the admin
+  // Payouts queue), so this is IsleVendor's own promise, not a provider's.
+  payoutMinBusinessDays     Int      @default(2) @map("payout_min_business_days")
+  payoutMaxBusinessDays     Int      @default(5) @map("payout_max_business_days")
+  // IsleVendor Pay switches an admin can flip without a deploy. Each only
+  // narrows its environment switch (ENABLE_WIPAY_WEBHOOKS,
+  // ENABLE_AUTOMATED_PAYOUTS); neither can turn on what the deploy has off.
+  paymentsEnabled           Boolean  @default(true) @map("payments_enabled")
+  automatedPayoutsEnabled   Boolean  @default(false) @map("automated_payouts_enabled")
+  // Who pays WiPay's card fee; null = WIPAY_FEE_STRUCTURE from the environment.
+  wipayFeeStructure         String?  @map("wipay_fee_structure")
+  // IsleVendor's commission on every item sold, % of the seller's price.
+  platformCommissionPercent Decimal  @default(5) @map("platform_commission_percent") @db.Decimal(5, 2)
+  updatedAt                 DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  updatedBy                 String?  @map("updated_by") @db.Uuid
+
+  @@map("platform_settings")
+}
+
+// Where one person's payouts go (see modules/ledger/payoutAccount.routes.ts).
+// Account and ID numbers are encrypted by the application (lib/crypto.ts,
+// PAYOUT_DATA_KEY) — only the last four digits are readable. The ID type
+// and number, email and phone are what WiPay needs to pay a bank account
+// automatically; manual payouts don't need them.
+model PayoutAccount {
+  id                     String           @id @default(uuid()) @db.Uuid
+  userId                 String           @unique @map("user_id") @db.Uuid
+  method                 PayoutMethod
+  // One of WiPay's supported Jamaican banks, by WiPay's name for it.
+  bankName               String?          @map("bank_name")
+  bankBranch             String?          @map("bank_branch")
+  bankAccountType        BankAccountType? @map("bank_account_type")
+  accountNumberEncrypted String?          @map("account_number_encrypted")
+  accountNumberLast4     String?          @map("account_number_last4")
+  nameInBank             String?          @map("name_in_bank")
+  lynkWalletId           String?          @map("lynk_wallet_id")
+  idType                 IdDocumentType?  @map("id_type")
+  idNumberEncrypted      String?          @map("id_number_encrypted")
+  email                  String?
+  phone                  String?
+  createdAt              DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt              DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("payout_accounts")
+}
+
+// One WiPay withdrawal notification, kept by WiPay's event id so a
+// redelivery is recognised and skipped.
+model PayoutWebhookEvent {
+  id              String   @id @default(uuid()) @db.Uuid
+  providerEventId String   @unique @map("provider_event_id")
+  event           String
+  payoutId        String?  @map("payout_id") @db.Uuid
+  outcome         String
+  payload         Json
+  receivedAt      DateTime @default(now()) @map("received_at") @db.Timestamptz
+
+  @@map("payout_webhook_events")
+}
+
+enum CheckoutPaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  // Replaced by a newer attempt for the same orders (the customer tried again).
+  SUPERSEDED
+  // WiPay says it was paid, but every order was already paid by another
+  // attempt — the customer may have been charged twice and needs a refund.
+  DUPLICATE
+  // A payment that had to be given back (e.g. a DUPLICATE), refunded in WiPay.
+  REFUNDED
+}
+
+// Which service took the payment. ISLEVENDOR_PAY: the Java IsleVendor Pay
+// service owns it and reports the outcome (POST /internal/pay/payments/:id/outcome);
+// this row is the marketplace's copy, for the customer's and admin's pages.
+enum PaymentProvider {
+  NODE
+  ISLEVENDOR_PAY
+}
+
+// One attempt to pay for a checkout through WiPay's hosted checkout. Covers
+// every order the customer placed together (orderIds); WiPay knows it by
+// `reference`. See src/modules/payments.
+model CheckoutPayment {
+  id                 String                @id @default(uuid()) @db.Uuid
+  customerId         String                @map("customer_id") @db.Uuid
+  reference          String                @unique
+  orderIds           String[]              @map("order_ids") @db.Uuid
+  // The total sent to WiPay — what its success hash is checked against.
+  amountJmd          Decimal               @map("amount_jmd") @db.Decimal(12, 2)
+  status             CheckoutPaymentStatus @default(PENDING)
+  wipayTransactionId String?               @unique @map("wipay_transaction_id")
+  checkoutUrl        String?               @map("checkout_url")
+  message            String?
+  createdAt          DateTime              @default(now()) @map("created_at") @db.Timestamptz
+  paidAt             DateTime?             @map("paid_at") @db.Timestamptz
+  refundReference    String?               @map("refund_reference")
+  refundedAt         DateTime?             @map("refunded_at") @db.Timestamptz
+  refundedBy         String?               @map("refunded_by") @db.Uuid
+  provider           PaymentProvider       @default(NODE)
+  // IsleVendor Pay's payment intent, when provider is ISLEVENDOR_PAY.
+  payIntentId        String?               @unique @map("pay_intent_id") @db.Uuid
+
+  customer User    @relation("CheckoutPayments", fields: [customerId], references: [id])
+  orders   Order[]
+
+  @@index([customerId, createdAt])
+  @@map("checkout_payments")
 }

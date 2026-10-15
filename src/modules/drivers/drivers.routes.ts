@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { UserRole } from '@prisma/client';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { prisma } from '../../lib/prisma.js';
+import { ITEMS_IN_ORDER, summarizeItems, toItemView } from '../../lib/orderItems.js';
 
 export const driversRouter = Router();
 
@@ -87,8 +88,9 @@ driversRouter.get('/me/deliveries', requireAuth, requireRole(UserRole.DRIVER, Us
   try {
     const include = {
       customer: { select: { fullName: true, phoneNumber: true } },
-      storeListing: { select: { masterProduct: { select: { title: true, imageUrl: true } }, store: { select: { storeName: true } } } },
-      shopProduct: { select: { title: true, imageUrl: true, shop: { select: { shopName: true } } } },
+      items: ITEMS_IN_ORDER,
+      resellerStore: { select: { storeName: true } },
+      shop: { select: { shopName: true } },
     } as const;
 
     const [inProgress, delivered] = await Promise.all([
@@ -107,9 +109,10 @@ driversRouter.get('/me/deliveries', requireAuth, requireRole(UserRole.DRIVER, Us
 
     const normalize = (o: (typeof inProgress)[number]) => ({
       id: o.id,
-      itemTitle: o.storeListing?.masterProduct.title ?? o.shopProduct?.title ?? 'Item no longer available',
-      itemImageUrl: o.storeListing?.masterProduct.imageUrl ?? o.shopProduct?.imageUrl ?? null,
-      sellerName: o.storeListing?.store.storeName ?? o.shopProduct?.shop.shopName ?? null,
+      itemTitle: summarizeItems(o.items),
+      itemImageUrl: o.items[0]?.imageUrl ?? null,
+      items: o.items.map(toItemView),
+      sellerName: o.resellerStore?.storeName ?? o.shop?.shopName ?? null,
       deliveryAddress: o.deliveryAddress,
       buyerName: o.customer.fullName,
       buyerPhone: o.customer.phoneNumber,

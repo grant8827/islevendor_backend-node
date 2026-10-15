@@ -4,6 +4,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { env } from '../src/env.js';
 import {
   api,
+  createCheckoutPayment,
+  wipayHash,
+  wipayReturn,
   createDriver,
   createLedgerAccount,
   createOrder,
@@ -86,12 +89,26 @@ describe('ledger integrity', () => {
   const affiliateOrder = () => createOrder({ customerId: customer.id, warehouseId, resellerStoreId });
   const shopOrder = () => createOrder({ customerId: customer.id, shopId });
 
-  function callback(orderId: string, opts: { transactionId?: string; status?: string; key?: string } = {}) {
-    const transaction_id = opts.transactionId ?? `txn-${randomUUID()}`;
-    const hash = createHash('md5').update(`${transaction_id}${orderId}${opts.key ?? API_KEY}`).digest('hex');
-    return { order_id: orderId, transaction_id, hash, status: opts.status ?? 'success' };
+  /** WiPay sending the customer back for `payment` — by default a genuine, verified success. */
+  function returnFor(
+    payment: { reference: string; wipayTransactionId: string | null; amountJmd: { toString(): string } },
+    opts: { transactionId?: string; status?: string; key?: string; amount?: number } = {},
+  ) {
+    const transactionId = opts.transactionId ?? payment.wipayTransactionId!;
+    return wipayReturn(server, {
+      status: opts.status ?? 'success',
+      order_id: payment.reference,
+      transaction_id: transactionId,
+      ...((opts.status ?? 'success') === 'success' ? { hash: wipayHash(transactionId, opts.amount ?? Number(payment.amountJmd.toString()), opts.key ?? API_KEY) } : {}),
+    });
   }
-  const postWebhook = (body: unknown) => api(server, '/ledger/webhooks/wipay', { method: 'POST', body });
+  /** A payment attempt for `orderId`, then a genuine success return. */
+  const pay = async (orderId: string) => {
+    const payment = await createCheckoutPayment([orderId]);
+    await returnFor(payment);
+    return payment;
+  };
+  const paymentStatus = async (id: string) => (await prisma.checkoutPayment.findUniqueOrThrow({ where: { id } })).status;
   const withdraw = (user: TestUser) => api(server, '/ledger/withdraw', { method: 'POST', token: user.token });
 
   async function balances(user: TestUser) {
@@ -111,7 +128,7 @@ describe('ledger integrity', () => {
 
   /** Pays for an order and walks it to PICKED_UP by `driver`, ready to deliver. */
   async function paidAndPickedUp(orderId: string) {
-    assert.equal((await postWebhook(callback(orderId))).status, 200);
+    await pay(orderId);
     await prisma.order.update({ where: { id: orderId }, data: { status: 'PICKED_UP', driverId: driver.id } });
   }
   const deliver = (orderId: string, user: TestUser = driver) =>
@@ -121,14 +138,17 @@ describe('ledger integrity', () => {
       body: { proofOfDeliveryImageUrl: 'private-kyc://proof.jpg' },
     });
 
-  describe('WiPay callbacks', () => {
+  describe('WiPay payments', () => {
     it('credits a paid order exactly once, with legs that add up to what was paid', async () => {
       const order = await affiliateOrder();
       const moved = await delta(warehouseOwner, async () => {
-        const res = await postWebhook(callback(order.id));
-        assert.equal(res.status, 200);
-        assert.equal(res.body.order.status, 'PACKING');
+        const payment = await createCheckoutPayment([order.id]);
+        const res = await returnFor(payment);
+        assert.equal(res.status, 303);
+        assert.equal(res.location, `http://localhost:5173/payment/${payment.id}`, 'the customer lands on their status page');
+        assert.equal(await paymentStatus(payment.id), 'PAID');
       });
+      assert.equal(await orderStatus(order.id), 'PACKING');
       assert.deepEqual(moved, { pending: WHOLESALE, available: 0 });
 
       const legs = await legsOf(order.id);
@@ -143,112 +163,108 @@ describe('ledger integrity', () => {
 
     it('splits a shop order between the shop and the platform', async () => {
       const order = await shopOrder();
-      const moved = await delta(shopOwner, () => postWebhook(callback(order.id)));
+      const moved = await delta(shopOwner, () => pay(order.id));
       assert.deepEqual(moved, { pending: MARGIN, available: 0 });
       assert.equal((await legsOf(order.id)).length, 2);
     });
 
-    it('rejects a callback with a bad signature, or when no key is configured', async () => {
+    it('pays several orders with one payment', async () => {
+      const [a, b] = await Promise.all([affiliateOrder(), shopOrder()]);
+      const payment = await createCheckoutPayment([a.id, b.id]);
+      assert.equal(Number(payment.amountJmd), TOTAL_PAID * 2);
+      await returnFor(payment);
+      assert.deepEqual([await orderStatus(a.id), await orderStatus(b.id)], ['PACKING', 'PACKING']);
+    });
+
+    it('rejects a return with a wrong hash, a different amount, or no key configured', async () => {
       const order = await affiliateOrder();
-      assert.equal((await postWebhook(callback(order.id, { key: 'wrong-key' }))).status, 400);
+      const payment = await createCheckoutPayment([order.id]);
+      await returnFor(payment, { key: 'wrong-key' });
+      await returnFor(payment, { amount: 1 });
 
       env.WIPAY_API_KEY = undefined;
       try {
-        assert.equal((await postWebhook(callback(order.id, { key: '' }))).status, 400);
+        await returnFor(payment);
       } finally {
         env.WIPAY_API_KEY = API_KEY;
       }
 
       assert.equal(await orderStatus(order.id), 'AWAITING_PAYMENT');
+      assert.equal(await paymentStatus(payment.id), 'PENDING');
       assert.equal((await legsOf(order.id)).length, 0);
     });
 
-    it('rejects a malformed payload', async () => {
-      for (const body of [{}, { order_id: 'nope', transaction_id: 't', hash: 'h', status: 'success' }, { order_id: { $ne: null } }]) {
-        assert.equal((await postWebhook(body)).status, 400);
-      }
+    it('ignores a return for a payment it doesn’t know, and sends the customer to their orders', async () => {
+      const res = await wipayReturn(server, { status: 'success', order_id: 'NOSUCHREF', transaction_id: 'x', hash: 'y' });
+      assert.equal(res.status, 303);
+      assert.equal(res.location, 'http://localhost:5173/account?tab=orders');
     });
 
-    it('refuses everything while the containment flag is off', async () => {
+    it('credits nothing while payments are switched off', async () => {
       const order = await affiliateOrder();
+      const payment = await createCheckoutPayment([order.id]);
       env.ENABLE_WIPAY_WEBHOOKS = false;
       try {
-        assert.equal((await postWebhook(callback(order.id))).status, 503);
+        await returnFor(payment);
       } finally {
         env.ENABLE_WIPAY_WEBHOOKS = true;
       }
       assert.equal(await orderStatus(order.id), 'AWAITING_PAYMENT');
     });
 
-    it('treats a redelivered callback as a no-op', async () => {
+    it('treats a repeated return as a no-op', async () => {
       const order = await affiliateOrder();
-      const body = callback(order.id);
-      await postWebhook(body);
-
-      const moved = await delta(warehouseOwner, async () => {
-        const res = await postWebhook(body);
-        assert.equal(res.status, 200);
-        assert.equal(res.body.skipped, true);
-      });
+      const payment = await createCheckoutPayment([order.id]);
+      await returnFor(payment);
+      const moved = await delta(warehouseOwner, () => returnFor(payment));
       assert.deepEqual(moved, { pending: 0, available: 0 });
       assert.equal((await legsOf(order.id)).length, 3);
     });
 
-    it('credits once when the same callback arrives many times at the same moment', async () => {
+    it('credits once when the same return arrives many times at the same moment', async () => {
       const order = await affiliateOrder();
-      const body = callback(order.id);
-
-      const moved = await delta(reseller, async () => {
-        const results = await Promise.all(Array.from({ length: 10 }, () => postWebhook(body)));
-        assert.ok(results.every((r) => r.status === 200));
-        assert.equal(results.filter((r) => r.body.order).length, 1);
-      });
+      const payment = await createCheckoutPayment([order.id]);
+      const moved = await delta(reseller, () => Promise.all(Array.from({ length: 10 }, () => returnFor(payment))));
       assert.deepEqual(moved, { pending: MARGIN, available: 0 });
       assert.equal(await prisma.paymentEvent.count({ where: { orderId: order.id } }), 1);
     });
 
-    it('credits once when different transactions for one order arrive at the same moment', async () => {
+    it('credits once when two attempts for one order both succeed at the same moment, and flags the second for a refund', async () => {
       const order = await affiliateOrder();
+      const first = await createCheckoutPayment([order.id]);
+      const second = await createCheckoutPayment([order.id]);
 
-      const moved = await delta(warehouseOwner, async () => {
-        const results = await Promise.all(Array.from({ length: 10 }, () => postWebhook(callback(order.id))));
-        assert.ok(results.every((r) => r.status === 200));
-        assert.equal(results.filter((r) => r.body.order).length, 1);
-      });
+      const moved = await delta(warehouseOwner, () => Promise.all([returnFor(first), returnFor(second)]));
       assert.deepEqual(moved, { pending: WHOLESALE, available: 0 });
       assert.equal((await legsOf(order.id)).length, 3);
-
-      // The nine losers are on record for reconciliation — each is a
-      // transaction the provider says succeeded against an already-paid order.
-      const events = await prisma.paymentEvent.findMany({ where: { orderId: order.id } });
-      assert.equal(events.filter((e) => e.outcome === 'APPLIED').length, 1);
-      assert.equal(events.filter((e) => e.outcome === 'IGNORED_ORDER_NOT_AWAITING_PAYMENT').length, 9);
+      assert.deepEqual([await paymentStatus(first.id), await paymentStatus(second.id)].sort(), ['DUPLICATE', 'PAID']);
     });
 
-    it('does not let a transaction id be replayed against a different order', async () => {
+    it('does not let one payment’s transaction be replayed against another payment', async () => {
       const [paid, unpaid] = await Promise.all([affiliateOrder(), affiliateOrder()]);
-      const transactionId = `txn-${randomUUID()}`;
-      await postWebhook(callback(paid.id, { transactionId }));
+      const paidPayment = await pay(paid.id);
+      const unpaidPayment = await createCheckoutPayment([unpaid.id]);
 
-      const res = await postWebhook(callback(unpaid.id, { transactionId }));
-      assert.equal(res.body.skipped, true);
+      // Same amount, so the hash itself would check out — the transaction id doesn't belong to this payment.
+      await returnFor(unpaidPayment, { transactionId: paidPayment.wipayTransactionId! });
       assert.equal(await orderStatus(unpaid.id), 'AWAITING_PAYMENT');
       assert.equal((await legsOf(unpaid.id)).length, 0);
     });
 
-    it('leaves a failed payment awaiting retry, and accepts the later success', async () => {
+    it('records a declined card, and accepts a later successful attempt', async () => {
       const order = await affiliateOrder();
-      const failed = await postWebhook(callback(order.id, { status: 'failed' }));
-      assert.equal(failed.body.skipped, true);
+      const declined = await createCheckoutPayment([order.id]);
+      await returnFor(declined, { status: 'failed' });
+      assert.equal(await paymentStatus(declined.id), 'FAILED');
       assert.equal(await orderStatus(order.id), 'AWAITING_PAYMENT');
 
-      await postWebhook(callback(order.id));
+      await pay(order.id);
       assert.equal(await orderStatus(order.id), 'PACKING');
     });
 
     it('does not credit an order that is no longer awaiting payment', async () => {
       const order = await createOrder({ customerId: customer.id, warehouseId, resellerStoreId, status: 'CANCELLED' });
-      const moved = await delta(warehouseOwner, () => postWebhook(callback(order.id)));
+      const moved = await delta(warehouseOwner, () => pay(order.id));
       assert.deepEqual(moved, { pending: 0, available: 0 });
       assert.equal(await orderStatus(order.id), 'CANCELLED');
     });
@@ -280,7 +296,7 @@ describe('ledger integrity', () => {
 
     it('refuses delivery of an order that is not out for delivery', async () => {
       const order = await affiliateOrder();
-      await postWebhook(callback(order.id));
+      await pay(order.id);
       // Assigned but refunded in the meantime — must not come back as DELIVERED.
       await prisma.order.update({ where: { id: order.id }, data: { status: 'REFUNDED', driverId: driver.id } });
 
@@ -313,7 +329,7 @@ describe('ledger integrity', () => {
 
     it('cannot withdraw money that is still in escrow', async () => {
       const shop = await freshShop();
-      await postWebhook(callback((await shop.order()).id));
+      await pay((await shop.order()).id);
       assert.deepEqual(await balances(shop.owner), { pending: MARGIN, available: 0 });
 
       const res = await withdraw(shop.owner);

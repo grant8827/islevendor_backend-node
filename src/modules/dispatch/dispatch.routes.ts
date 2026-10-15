@@ -10,7 +10,10 @@ import { offerJobToDrivers, claimJobForDriver } from './dispatch.gateway.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
 import { env } from '../../env.js';
 import { toOrderDto } from '../../lib/orderAccess.js';
-import { isEligibleDriver } from '../../lib/driverEligibility.js';
+import { isAcceptedByOrderSeller, isEligibleDriver } from '../../lib/driverEligibility.js';
+import { assertApprovedSeller } from '../../lib/eligibility.js';
+import { releaseEscrowForOrder } from '../ledger/ledger.service.js';
+import { ITEMS_IN_ORDER, toItemView } from '../../lib/orderItems.js';
 import { consumePickupToken, issuePickupToken, verifyPickupToken } from '../../lib/pickupToken.js';
 
 export const dispatchRouter = Router();
@@ -20,6 +23,12 @@ const DISPATCH_RADIUS_METERS = 10_000;
 // "every online driver in range" is fine at this scale, but an unbounded
 // LIMIT-less query is one to avoid regardless.
 const MAX_DRIVERS_OFFERED = 20;
+
+const READY_NOTES = {
+  ISLEDASH: 'Boxed and ready for pickup',
+  PICKUP: 'Ready for the customer to collect',
+  SELLER_DELIVERY: 'Ready to go out with the seller’s own delivery',
+} as const;
 
 /** Loads an order and confirms `user` is the shop/warehouse that packs it. */
 async function loadOrderForSeller(orderId: string, user: AuthTokenPayload) {
@@ -35,15 +44,19 @@ async function loadOrderForSeller(orderId: string, user: AuthTokenPayload) {
     }
   } else if (existing.warehouseId) {
     // Warehouse staff pack and dispatch orders too, not just the owner.
-    await assertWarehouseAccess(existing.warehouseId, user);
+    const { warehouse } = await assertWarehouseAccess(existing.warehouseId, user);
+    assertApprovedSeller(warehouse, 'warehouse');
   } else {
     throw new HttpError(403, 'You do not own this order');
   }
+  if (existing.shop) assertApprovedSeller(existing.shop, 'shop');
   return existing;
 }
 
 // Warehouse (or shop) finishes packing -> broadcast a JOB_OFFER to every
-// online, KYC-approved driver within 10km at once (up to MAX_DRIVERS_OFFERED);
+// online, KYC-approved driver within 10km *whom this business has accepted
+// as one of its couriers* (an APPROVED DeliveryApplication) at once (up to
+// MAX_DRIVERS_OFFERED);
 // first to accept gets it (see dispatch.gateway.ts's driver:acceptJob). The
 // query still orders nearest-first — harmless to keep, just no longer
 // meaningful now that every driver up to the cap gets the same offer at the
@@ -52,11 +65,25 @@ dispatchRouter.post('/orders/:id/ready', requireAuth, requireRole(UserRole.WAREH
   try {
     const existing = await loadOrderForSeller(String(req.params.id), req.user!);
 
-    const order = await prisma.order.update({
-      where: { id: existing.id },
-      data: { status: 'READY_FOR_PICKUP' },
+    // PACKING -> READY_FOR_PICKUP, once: a repeated press (or an order that
+    // isn't paid for yet, or was refunded) changes nothing.
+    const moved = await prisma.$transaction(async (tx) => {
+      const result = await tx.order.updateMany({ where: { id: existing.id, status: 'PACKING' }, data: { status: 'READY_FOR_PICKUP' } });
+      if (result.count === 0) return false;
+      await logTrackingEvent(tx, existing.id, 'READY_FOR_PICKUP', { note: READY_NOTES[existing.deliveryMethod] });
+      return true;
     });
-    await logTrackingEvent(prisma, order.id, 'READY_FOR_PICKUP', { note: 'Boxed and ready for pickup' });
+    if (!moved) {
+      throw new HttpError(409, `This order can't be marked ready (status: ${existing.status.replaceAll('_', ' ')})`);
+    }
+    const order = await prisma.order.findUniqueOrThrow({ where: { id: existing.id } });
+
+    // Only IsleDash orders go out to drivers. A pickup waits for the
+    // customer; the seller's own delivery is theirs to run — either way the
+    // seller finishes it with POST /orders/:id/complete below.
+    if (order.deliveryMethod !== 'ISLEDASH') {
+      return res.json({ order, dispatched: false, reason: READY_NOTES[order.deliveryMethod] });
+    }
 
     // Pickup point is the shop's location for a STORE order, the
     // warehouse's for an AFFILIATE order — never both.
@@ -65,6 +92,8 @@ dispatchRouter.post('/orders/:id/ready', requireAuth, requireRole(UserRole.WAREH
           SELECT dp.user_id
           FROM driver_profiles dp
           JOIN shops s ON s.id = ${order.shopId}::uuid
+          JOIN delivery_applications da
+            ON da.driver_id = dp.id AND da.shop_id = s.id AND da.status = 'APPROVED'
           WHERE dp.is_online = TRUE
             AND dp.is_kyc_approved = TRUE
             AND dp.current_location IS NOT NULL
@@ -76,6 +105,8 @@ dispatchRouter.post('/orders/:id/ready', requireAuth, requireRole(UserRole.WAREH
           SELECT dp.user_id
           FROM driver_profiles dp
           JOIN warehouses w ON w.id = ${order.warehouseId}::uuid
+          JOIN delivery_applications da
+            ON da.driver_id = dp.id AND da.warehouse_id = w.id AND da.status = 'APPROVED'
           WHERE dp.is_online = TRUE
             AND dp.is_kyc_approved = TRUE
             AND dp.current_location IS NOT NULL
@@ -85,7 +116,7 @@ dispatchRouter.post('/orders/:id/ready', requireAuth, requireRole(UserRole.WAREH
         `;
 
     if (nearbyDrivers.length === 0) {
-      return res.json({ order, dispatched: false, reason: 'No available drivers within 10km' });
+      return res.json({ order, dispatched: false, reason: 'None of your accepted drivers are online within 10km' });
     }
 
     const driverIds = nearbyDrivers.map((d) => d.user_id);
@@ -119,28 +150,7 @@ dispatchRouter.post('/orders/:id/delivered', requireAuth, requireRole(UserRole.D
       }
       await logTrackingEvent(tx, order.id, 'DELIVERED', { note: 'Delivered', postedBy: req.user!.sub });
 
-      // Escrow release: pending -> available for every leg of this order now
-      // that delivery is confirmed — only from here on can it be withdrawn
-      // (see ledger.service.ts's withdrawBalance). Moves the balance columns
-      // and the escrow_state label together; refundOrder decides which
-      // column to subtract from based on escrow_state, so they must agree.
-      if (env.ENABLE_ESCROW_RELEASE) {
-        const legs = await tx.ledgerTransaction.findMany({
-          where: { orderId: order.id, escrowState: 'HELD_IN_ESCROW', reversedAt: null, payoutId: null },
-          orderBy: { recipientAccountId: 'asc' },
-        });
-        for (const leg of legs) {
-          await tx.$executeRaw`
-            UPDATE ledger_accounts
-            SET pending_balance_jmd = pending_balance_jmd - ${leg.amountJmd}, available_balance_jmd = available_balance_jmd + ${leg.amountJmd}
-            WHERE id = ${leg.recipientAccountId}::uuid;
-          `;
-        }
-        await tx.ledgerTransaction.updateMany({
-          where: { id: { in: legs.map((leg) => leg.id) } },
-          data: { escrowState: 'AVAILABLE' },
-        });
-      }
+      await releaseEscrowForOrder(tx, order.id);
 
       return tx.order.findUniqueOrThrow({ where: { id: order.id } });
     });
@@ -199,6 +209,9 @@ dispatchRouter.post('/orders/:id/pickup-token', requireAuth, requireRole(UserRol
     if (order.status !== 'PACKING' && order.status !== 'READY_FOR_PICKUP') {
       throw new HttpError(409, `A pickup label can't be issued for this order (status: ${order.status.replaceAll('_', ' ')})`);
     }
+    if (order.deliveryMethod !== 'ISLEDASH') {
+      throw new HttpError(409, 'This order isn’t going out with IsleDash, so it has no driver pickup code');
+    }
     res.status(201).json(await issuePickupToken(order.id));
   } catch (err) {
     next(err);
@@ -237,6 +250,11 @@ dispatchRouter.post('/orders/:id/scan-pickup', requireAuth, requireRole(UserRole
     if (!alreadyMine) {
       const nonce = order ? await verifyPickupToken(orderId, token) : null;
       if (!order || !nonce) throw denied;
+      // Holding the label isn't enough: only a courier this business has
+      // accepted may take its packages.
+      if (!(await isAcceptedByOrderSeller(req.user!.sub, order))) {
+        throw new HttpError(403, "You aren't one of this business's accepted drivers — apply to deliver for them first");
+      }
 
       if (order.status !== 'READY_FOR_PICKUP') {
         throw new HttpError(409, `This package can't be picked up right now (status: ${order.status.replaceAll('_', ' ')})`);
@@ -254,10 +272,46 @@ dispatchRouter.post('/orders/:id/scan-pickup', requireAuth, requireRole(UserRole
         customer: { select: { fullName: true, phoneNumber: true } },
         storeListing: { select: { masterProduct: { select: { title: true } } } },
         shopProduct: { select: { title: true } },
+        items: ITEMS_IN_ORDER,
       },
     });
-    const { customer, storeListing, shopProduct, ...order_ } = full;
-    res.json({ ...toOrderDto(order_, 'DRIVER'), customer, storeListing, shopProduct });
+    const { customer, storeListing, shopProduct, items, ...order_ } = full;
+    res.json({ ...toOrderDto(order_, 'DRIVER'), customer, storeListing, shopProduct, items: items.map(toItemView) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const completeSchema = z.object({
+  note: z.string().trim().max(500).optional(),
+});
+
+// The seller finishes an order that didn't go out with IsleDash: the
+// customer collected it (PICKUP), or the seller's own delivery dropped it
+// off (SELLER_DELIVERY). READY_FOR_PICKUP -> DELIVERED, once, releasing
+// escrow exactly as a driver's delivery would (see /orders/:id/delivered).
+dispatchRouter.post('/orders/:id/complete', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.STORE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const { note } = completeSchema.parse(req.body ?? {});
+    const existing = await loadOrderForSeller(String(req.params.id), req.user!);
+    if (existing.deliveryMethod === 'ISLEDASH') {
+      throw new HttpError(409, 'IsleDash orders are completed by the driver who delivers them');
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const done = await tx.order.updateMany({
+        where: { id: existing.id, status: 'READY_FOR_PICKUP' },
+        data: { status: 'DELIVERED', deliveredAt: new Date() },
+      });
+      if (done.count === 0) {
+        throw new HttpError(409, `This order can't be completed (status: ${existing.status.replaceAll('_', ' ')}) — mark it ready first`);
+      }
+      const what = existing.deliveryMethod === 'PICKUP' ? 'Collected by the customer' : 'Delivered by the seller';
+      await logTrackingEvent(tx, existing.id, 'DELIVERED', { note: note ? `${what} — ${note}` : what, postedBy: req.user!.sub });
+      await releaseEscrowForOrder(tx, existing.id);
+      return tx.order.findUniqueOrThrow({ where: { id: existing.id } });
+    });
+    res.json(updated);
   } catch (err) {
     next(err);
   }

@@ -18,6 +18,7 @@ import { normalizeTrn } from '../../lib/trn.js';
 import { PARISH_COORDS, type Parish } from '../../lib/parishes.js';
 import { generateUniqueSlug } from '../../lib/slug.js';
 import { createWithGeneratedReferenceId } from '../../lib/referenceId.js';
+import { recordOnboardingPayout } from '../../lib/payoutAccounts.js';
 
 const SALT_ROUNDS = 12;
 
@@ -99,6 +100,9 @@ export async function registerWarehouseApplicant(input: WarehouseApplicantInput)
 
   return prisma.$transaction(async (tx) => {
     const user = await createApplicantUser(tx, input, 'WAREHOUSE');
+    // Bank details are stored encrypted on the user's payout account (see
+    // lib/payoutAccounts.ts); the business row keeps only the masked number.
+    const storedAccountNumber = await recordOnboardingPayout(tx, user.id, input, { email: input.email, phone: input.phoneNumber });
 
     const id = randomUUID();
     // Raw INSERT for the base row + spatial point (Prisma can't write a
@@ -129,7 +133,7 @@ export async function registerWarehouseApplicant(input: WarehouseApplicantInput)
           payoutMethod: input.payoutMethod,
           bankName: input.bankName,
           accountHolderName: input.accountHolderName,
-          accountNumber: input.accountNumber,
+          accountNumber: storedAccountNumber,
           branchCode: input.branchCode,
           lynkWalletId: input.lynkWalletId,
           cocjDocUrl: input.cocjDocUrl,
@@ -181,6 +185,9 @@ export async function registerResellerApplicant(input: ResellerApplicantInput) {
 
   return prisma.$transaction(async (tx) => {
     const user = await createApplicantUser(tx, input, 'RESELLER');
+    // Bank details are stored encrypted on the user's payout account (see
+    // lib/payoutAccounts.ts); the business row keeps only the masked number.
+    const storedAccountNumber = await recordOnboardingPayout(tx, user.id, input, { email: input.email, phone: input.phoneNumber });
 
     const store = await createWithGeneratedReferenceId('RS', (referenceId) =>
       tx.resellerStore.create({
@@ -201,7 +208,7 @@ export async function registerResellerApplicant(input: ResellerApplicantInput) {
           payoutMethod: input.payoutMethod,
           bankName: input.bankName,
           accountHolderName: input.accountHolderName,
-          accountNumber: input.accountNumber,
+          accountNumber: storedAccountNumber,
           branchCode: input.branchCode,
           lynkWalletId: input.lynkWalletId,
           idDocUrl: input.idDocUrl,
@@ -263,6 +270,9 @@ export async function registerVendorApplicant(input: VendorApplicantInput) {
 
   return prisma.$transaction(async (tx) => {
     const user = await createApplicantUser(tx, input, 'STORE');
+    // Bank details are stored encrypted on the user's payout account (see
+    // lib/payoutAccounts.ts); the business row keeps only the masked number.
+    const storedAccountNumber = await recordOnboardingPayout(tx, user.id, input, { email: input.email, phone: input.phoneNumber });
 
     const id = randomUUID();
     await tx.$executeRaw`
@@ -286,7 +296,7 @@ export async function registerVendorApplicant(input: VendorApplicantInput) {
           payoutMethod: input.payoutMethod,
           bankName: input.bankName,
           accountHolderName: input.accountHolderName,
-          accountNumber: input.accountNumber,
+          accountNumber: storedAccountNumber,
           branchCode: input.branchCode,
           lynkWalletId: input.lynkWalletId,
           govIdDocUrl: input.govIdDocUrl,
@@ -362,6 +372,9 @@ export async function registerDriverApplicant(input: DriverApplicantInput) {
 
   return prisma.$transaction(async (tx) => {
     const user = await createApplicantUser(tx, input, 'DRIVER');
+    // Bank details are stored encrypted on the user's payout account (see
+    // lib/payoutAccounts.ts); the business row keeps only the masked number.
+    const storedAccountNumber = await recordOnboardingPayout(tx, user.id, input, { email: input.email, phone: input.phoneNumber });
 
     const driverProfile = await createWithGeneratedReferenceId('DRV', (referenceId) =>
       tx.driverProfile.create({
@@ -383,7 +396,7 @@ export async function registerDriverApplicant(input: DriverApplicantInput) {
           payoutMethod: input.payoutMethod,
           bankName: input.bankName,
           accountHolderName: input.accountHolderName,
-          accountNumber: input.accountNumber,
+          accountNumber: storedAccountNumber,
           branchCode: input.branchCode,
           lynkWalletId: input.lynkWalletId,
           licenseHolderName: input.licenseHolderName,

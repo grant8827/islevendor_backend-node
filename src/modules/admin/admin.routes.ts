@@ -6,8 +6,14 @@ import { requireAuth } from '../../middleware/auth.js';
 import { requireCurrentAdmin } from '../../middleware/requireAdmin.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { loadDocumentReferences, type ApplicantType } from '../../lib/kycDocuments.js';
+import { recordAuditEvent } from '../../lib/audit.js';
+import { automatedPayoutsEnabled, getIsleDashRate, getPayoutTiming, setIsleDashRate, setPayoutTiming } from '../../lib/platformSettings.js';
+import { approvePayout, checkWiPayPayout, settlePayout, submitPayoutToWiPay, withdrawPlatformBalance } from '../ledger/ledger.service.js';
+import { missingForAutomaticPayout, revealForPayout } from '../../lib/payoutAccounts.js';
+import { registerPayRoutes, FINANCIAL_AUDIT_FILTER } from './pay.routes.js';
+import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 
-// The superadmin console's API (frontend: pages/admin). Read-side only so
+// The superadmin console's API (frontend: pages/admin). Mostly read-side so
 // far, plus the applicant review flow — the decision itself and the KYC
 // document links live with the rest of onboarding, in onboarding.routes.ts.
 export const adminRouter = Router();
@@ -25,7 +31,7 @@ adminRouter.get('/overview', async (_req, res, next) => {
     const pending = { applicantStatus: ApplicantStatus.PENDING_REVIEW };
     const [warehouses, resellers, vendors, drivers, usersByRole, ordersByStatus] = await Promise.all([
       prisma.warehouse.count({ where: pending }),
-      prisma.resellerStore.count({ where: pending }),
+      prisma.resellerStore.count({ where: { ...pending, houseWarehouseId: null } }),
       prisma.shop.count({ where: pending }),
       prisma.driverProfile.count({ where: pending }),
       prisma.user.groupBy({ by: ['role'], _count: true }),
@@ -76,7 +82,8 @@ adminRouter.get('/applicants', async (req, res, next) => {
 
     const [warehouses, resellers, vendors, drivers] = await Promise.all([
       wants('warehouse') ? prisma.warehouse.findMany({ where, include: { user: applicantUserSelect } }) : [],
-      wants('reseller') ? prisma.resellerStore.findMany({ where, include: { user: applicantUserSelect } }) : [],
+      // A warehouse's own house store isn't an application — only independent resellers' stores are.
+      wants('reseller') ? prisma.resellerStore.findMany({ where: { ...where, houseWarehouseId: null }, include: { user: applicantUserSelect } }) : [],
       wants('small-vendor') ? prisma.shop.findMany({ where, include: { user: applicantUserSelect } }) : [],
       wants('driver') ? prisma.driverProfile.findMany({ where, include: { user: applicantUserSelect } }) : [],
     ]);
@@ -97,7 +104,7 @@ adminRouter.get('/applicants', async (req, res, next) => {
 
     const applicants: ApplicantSummary[] = [
       ...warehouses.map((w) => summary('warehouse', w, { name: w.name, parish: w.parish, flags: [] })),
-      ...resellers.map((r) => summary('reseller', r, { name: r.storeName, parish: r.parish, flags: flagsOf({ 'Photo ID': r.idDocVerificationStatus }) })),
+      ...resellers.map((r) => summary('reseller', { ...r, user: r.user! }, { name: r.storeName, parish: r.parish, flags: flagsOf({ 'Photo ID': r.idDocVerificationStatus }) })),
       ...vendors.map((v) => summary('small-vendor', v, { name: v.shopName, parish: v.parish, flags: flagsOf({ 'Photo ID': v.govIdVerificationStatus }) })),
       ...drivers.map((d) =>
         summary('driver', d, {
@@ -217,6 +224,26 @@ adminRouter.get('/users', async (req, res, next) => {
   }
 });
 
+// Signs a user out of every device — the response to a suspected
+// compromised account, or to anything that should take effect before the
+// user's current token would expire. Audited in the same transaction.
+adminRouter.post('/users/:id/revoke-sessions', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const reason = z.string().trim().min(1, 'A reason is required').max(500).parse(req.body?.reason);
+    if (!(await prisma.user.findUnique({ where: { id }, select: { id: true } }))) throw new HttpError(404, 'User not found');
+
+    await prisma.$transaction(async (tx) => {
+      await revokeUserSessions(id, tx);
+      await recordAuditEvent(req, { action: 'user.sessions_revoked', targetType: 'user', targetId: id, metadata: { reason } }, tx);
+    });
+    disconnectUserSockets(id);
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── Orders ──────────────────────────────────────────────────────────────────
 
 // Platform-wide order list, newest first. ?q= is an order id (or the 8-char
@@ -265,13 +292,279 @@ adminRouter.get('/orders', async (req, res, next) => {
   }
 });
 
+// ── Money: IsleVendor's own balance, and payout requests ───────────────────
+
+// IsleVendor's PLATFORM ledger account: what's held in escrow and what's
+// available, recent entries behind those numbers, and its own withdrawals.
+adminRouter.get('/ledger/platform', async (_req, res, next) => {
+  try {
+    const account = await prisma.ledgerAccount.findFirst({ where: { accountType: 'PLATFORM' } });
+    if (!account) return res.json({ account: null, entries: [], payouts: [] });
+    const [entries, payouts] = await Promise.all([
+      prisma.ledgerTransaction.findMany({
+        where: { recipientAccountId: account.id },
+        orderBy: { createdAt: 'desc' },
+        take: PAGE_SIZE,
+        include: { order: { select: { id: true, status: true, deliveryMethod: true } } },
+      }),
+      prisma.payout.findMany({ where: { ledgerAccountId: account.id }, orderBy: { createdAt: 'desc' }, take: PAGE_SIZE }),
+    ]);
+    res.json({ account, entries, payouts });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// IsleVendor withdraws its available balance — a REQUESTED payout like any
+// seller's, settled the same way below. Audited.
+adminRouter.post('/ledger/platform/withdraw', async (req, res, next) => {
+  try {
+    const [payout] = await withdrawPlatformBalance();
+    await recordAuditEvent(req, {
+      action: 'ledger.platform_withdrawal_requested',
+      targetType: 'payout',
+      targetId: payout.id,
+      metadata: { amountJmd: payout.amountJmd.toFixed(2) },
+    });
+    res.status(201).json(payout);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const LEGACY_PAYOUT_DESTINATION = {
+  payoutMethod: true,
+  bankName: true,
+  accountHolderName: true,
+  accountNumber: true,
+  branchCode: true,
+  lynkWalletId: true,
+} as const;
+
+/**
+ * Where a payout should be sent: the owner's payout details (decrypted —
+ * an admin needs the whole account number to pay it), or, for someone who
+ * hasn't saved any yet, what they gave at sign-up.
+ */
+async function destinationFor(account: { userId: string | null; accountType: string }) {
+  if (!account.userId) return null;
+  const saved = await prisma.payoutAccount.findUnique({ where: { userId: account.userId } });
+  if (saved) {
+    const d = revealForPayout(saved);
+    return {
+      source: 'payout_account' as const,
+      payoutMethod: d.method,
+      bankName: d.bankName,
+      branchCode: d.bankBranch,
+      bankAccountType: d.bankAccountType,
+      accountHolderName: d.nameInBank,
+      accountNumber: d.accountNumber,
+      lynkWalletId: d.lynkWalletId,
+      readyForAutomaticPayout: missingForAutomaticPayout(saved).length === 0,
+    };
+  }
+  const where = { userId: account.userId, payoutMethod: { not: null } };
+  const legacy =
+    (await prisma.warehouse.findFirst({ where, select: LEGACY_PAYOUT_DESTINATION })) ??
+    (await prisma.resellerStore.findFirst({ where, select: LEGACY_PAYOUT_DESTINATION })) ??
+    (await prisma.shop.findFirst({ where, select: LEGACY_PAYOUT_DESTINATION })) ??
+    (await prisma.driverProfile.findFirst({ where, select: LEGACY_PAYOUT_DESTINATION }));
+  return legacy ? { source: 'sign_up' as const, ...legacy, readyForAutomaticPayout: false } : null;
+}
+
+// Every payout request, oldest first while they wait to be paid (?status=
+// REQUESTED, the default), newest first otherwise — with who it's for and
+// where to send it.
+adminRouter.get('/payouts', async (req, res, next) => {
+  try {
+    const status = z.enum(['REQUESTED', 'APPROVED', 'SUBMITTED', 'PROCESSING', 'PAID', 'FAILED']).default('REQUESTED').parse(req.query.status);
+    const page = pageSchema.parse(req.query.page);
+    const where = { status };
+    const [total, payouts] = await Promise.all([
+      prisma.payout.count({ where }),
+      prisma.payout.findMany({
+        where,
+        orderBy: { createdAt: status === 'REQUESTED' ? 'asc' : 'desc' },
+        skip: (page - 1) * PAGE_SIZE,
+        take: PAGE_SIZE,
+        include: { ledgerAccount: { include: { user: { select: { id: true, fullName: true, email: true, phoneNumber: true } } } } },
+      }),
+    ]);
+    const withDestinations = await Promise.all(
+      payouts.map(async (p) => ({ ...p, destination: await destinationFor(p.ledgerAccount) })),
+    );
+    res.json({ total, page, pageSize: PAGE_SIZE, payouts: withDestinations, automatedPayoutsEnabled: await automatedPayoutsEnabled() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const settleSchema = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('PAID'), reference: z.string().trim().min(1, 'Enter the transfer reference').max(200), note: z.string().trim().max(1000).optional() }),
+  z.object({ status: z.literal('FAILED'), note: z.string().trim().min(1, 'Say why it failed').max(1000), reference: z.string().trim().max(200).optional() }),
+]);
+
+// Record that a payout was sent (PAID, with the transfer reference) or
+// couldn't be (FAILED — the money returns to the owner's available
+// balance). Settling and its audit record are one transaction.
+adminRouter.patch('/payouts/:id', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const outcome = settleSchema.parse(req.body);
+    const payout = await prisma.$transaction(async (tx) => {
+      const settled = await settlePayout(tx, id, outcome, req.user!.sub);
+      await recordAuditEvent(
+        req,
+        {
+          action: outcome.status === 'PAID' ? 'payout.paid' : 'payout.failed',
+          targetType: 'payout',
+          targetId: id,
+          metadata: { amountJmd: settled.amountJmd.toFixed(2), ...(outcome.reference ? { reference: outcome.reference } : {}), ...(outcome.note ? { note: outcome.note } : {}) },
+        },
+        tx,
+      );
+      return settled;
+    });
+    res.json(payout);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Approve a payout request — checked and OK to pay, by hand or through WiPay.
+adminRouter.post('/payouts/:id/approve', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const payout = await prisma.$transaction(async (tx) => {
+      const approved = await approvePayout(tx, id, req.user!.sub);
+      await recordAuditEvent(req, { action: 'payout.approved', targetType: 'payout', targetId: id, metadata: { amountJmd: approved.amountJmd.toFixed(2) } }, tx);
+      return approved;
+    });
+    res.json(payout);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Send an approved payout to the owner's bank through WiPay. Only while
+// ENABLE_AUTOMATED_PAYOUTS is on; marked PAID only when WiPay's own status
+// says the transfer completed.
+adminRouter.post('/payouts/:id/send-wipay', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    await recordAuditEvent(req, { action: 'payout.wipay_submission_started', targetType: 'payout', targetId: id });
+    const payout = await submitPayoutToWiPay(id, req.user!.sub);
+    await recordAuditEvent(req, {
+      action: 'payout.sent_to_wipay',
+      targetType: 'payout',
+      targetId: id,
+      metadata: { amountJmd: payout.amountJmd.toFixed(2), ...(payout.providerTransactionId ? { transactionId: payout.providerTransactionId } : {}) },
+    });
+    res.json(payout);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Ask WiPay where a payout stands — after a timeout, or to refresh status.
+adminRouter.post('/payouts/:id/check-wipay', async (req, res, next) => {
+  try {
+    const id = z.string().uuid().parse(req.params.id);
+    const payout = await checkWiPayPayout(id);
+    await recordAuditEvent(req, {
+      action: 'payout.checked_with_wipay',
+      targetType: 'payout',
+      targetId: id,
+      metadata: { status: payout.status, ...(payout.providerStatus !== null ? { wipayStatus: payout.providerStatus } : {}) },
+    });
+    res.json(payout);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Platform settings ───────────────────────────────────────────────────────
+
+adminRouter.get('/settings/isledash', async (_req, res, next) => {
+  try {
+    const rate = await getIsleDashRate();
+    res.json({ baseFeeJmd: rate.baseFeeJmd.toFixed(2), extraItemPercent: rate.extraItemPercent });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const isleDashRateSchema = z.object({
+  baseFeeJmd: z.number().min(0).max(100_000),
+  extraItemPercent: z.number().int().min(0).max(100),
+});
+
+// IsleDash delivery pricing: the first item's fee and the % each further
+// item from the same seller costs. Applies to checkouts from now on; orders
+// already placed keep what they were charged. Audited with before and after.
+adminRouter.put('/settings/isledash', async (req, res, next) => {
+  try {
+    const input = isleDashRateSchema.parse(req.body);
+    await prisma.$transaction(async (tx) => {
+      const before = await getIsleDashRate(tx);
+      await setIsleDashRate(input, req.user!.sub, tx);
+      await recordAuditEvent(
+        req,
+        {
+          action: 'settings.isledash_rate_changed',
+          targetType: 'platform_settings',
+          targetId: 'default',
+          metadata: { before: { baseFeeJmd: before.baseFeeJmd.toFixed(2), extraItemPercent: before.extraItemPercent }, after: input },
+        },
+        tx,
+      );
+    });
+    res.json({ baseFeeJmd: input.baseFeeJmd.toFixed(2), extraItemPercent: input.extraItemPercent });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.get('/settings/payouts', async (_req, res, next) => {
+  try {
+    res.json(await getPayoutTiming());
+  } catch (err) {
+    next(err);
+  }
+});
+
+const payoutTimingSchema = z
+  .object({
+    minBusinessDays: z.number().int().min(0).max(30),
+    maxBusinessDays: z.number().int().min(1).max(30),
+  })
+  .refine((t) => t.minBusinessDays <= t.maxBusinessDays, { message: 'The shortest time can’t be longer than the longest', path: ['minBusinessDays'] });
+
+// How long withdrawals take to reach people's banks, as IsleVendor promises
+// it on every Payouts tab. Applies to withdrawals requested from now on.
+adminRouter.put('/settings/payouts', async (req, res, next) => {
+  try {
+    const input = payoutTimingSchema.parse(req.body);
+    await prisma.$transaction(async (tx) => {
+      const before = await getPayoutTiming(tx);
+      await setPayoutTiming(input, req.user!.sub, tx);
+      await recordAuditEvent(req, { action: 'settings.payout_timing_changed', targetType: 'platform_settings', targetId: 'default', metadata: { before: { ...before }, after: input } }, tx);
+    });
+    res.json(input);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── Audit log ───────────────────────────────────────────────────────────────
 
 adminRouter.get('/audit-events', async (req, res, next) => {
   try {
     const page = pageSchema.parse(req.query.page);
     const action = z.string().trim().max(100).optional().parse(req.query.action || undefined);
-    const where: Prisma.AuditEventWhereInput = action ? { action } : {};
+    // ?category=finance: every money-related action (IsleVendor Pay's Audit Logs).
+    const finance = req.query.category === 'finance';
+    const where: Prisma.AuditEventWhereInput = { ...(action ? { action } : {}), ...(finance ? FINANCIAL_AUDIT_FILTER : {}) };
 
     const [total, events] = await Promise.all([
       prisma.auditEvent.count({ where }),
@@ -288,3 +581,5 @@ adminRouter.get('/audit-events', async (req, res, next) => {
     next(err);
   }
 });
+
+registerPayRoutes(adminRouter);
