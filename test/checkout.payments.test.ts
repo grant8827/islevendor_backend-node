@@ -86,7 +86,8 @@ describe('paying at checkout', () => {
       [body.country_code, body.currency, body.environment, body.fee_structure, body.method, body.origin],
       ['JM', 'JMD', 'sandbox', 'merchant_absorb', 'credit_card_co', 'IsleVendor'],
     );
-    assert.equal(body.total, 2000 + 100 + 450, 'two J$1,000 items, the 5% service fee and shipping — the whole cart');
+    // Two decimals, as text: WiPay rejects a whole-number JSON total.
+    assert.equal(body.total, '2550.00', 'two J$1,000 items, the 5% service fee and shipping — the whole cart');
     assert.match(body.order_id, /^[A-Z0-9]{1,16}$/);
     assert.equal(body.response_url, 'http://localhost/api/webhooks/wipay');
     assert.equal(JSON.parse(body.data).paymentId, payment.id);

@@ -116,7 +116,8 @@ export async function startCheckoutPayment(customerId: string, orderIds: string[
         order_id: payment.reference,
         origin: env.WIPAY_ORIGIN,
         response_url: responseUrl(requestOrigin),
-        total: Number(payment.amountJmd.toFixed(2)),
+        // Text with exactly two decimals: WiPay rejects a JSON number like 1890 ("incorrect format").
+        total: payment.amountJmd.toFixed(2),
         email: customer.email.slice(0, 50),
         name: customer.fullName.slice(0, 60),
         ...(phone ? { phone } : {}),
