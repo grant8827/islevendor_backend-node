@@ -1165,18 +1165,27 @@ model AuditEvent {
 // "default" (see lib/platformSettings.ts, which falls back to the same
 // defaults if it's ever missing).
 model PlatformSetting {
-  id                       String   @id
+  id                        String   @id
   // IsleDash delivery: the fee for the first item, and what % of it each
   // further item from the same seller in one checkout costs.
-  isleDashBaseFeeJmd       Decimal  @default(300) @map("isledash_base_fee_jmd") @db.Decimal(12, 2)
-  isleDashExtraItemPercent Int      @default(50) @map("isledash_extra_item_percent")
+  isleDashBaseFeeJmd        Decimal  @default(300) @map("isledash_base_fee_jmd") @db.Decimal(12, 2)
+  isleDashExtraItemPercent  Int      @default(50) @map("isledash_extra_item_percent")
   // How long a withdrawal usually takes to reach the owner's bank once
   // requested, in business days. Payouts are sent by hand (see the admin
   // Payouts queue), so this is IsleVendor's own promise, not a provider's.
-  payoutMinBusinessDays    Int      @default(2) @map("payout_min_business_days")
-  payoutMaxBusinessDays    Int      @default(5) @map("payout_max_business_days")
-  updatedAt                DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
-  updatedBy                String?  @map("updated_by") @db.Uuid
+  payoutMinBusinessDays     Int      @default(2) @map("payout_min_business_days")
+  payoutMaxBusinessDays     Int      @default(5) @map("payout_max_business_days")
+  // IsleVendor Pay switches an admin can flip without a deploy. Each only
+  // narrows its environment switch (ENABLE_WIPAY_WEBHOOKS,
+  // ENABLE_AUTOMATED_PAYOUTS); neither can turn on what the deploy has off.
+  paymentsEnabled           Boolean  @default(true) @map("payments_enabled")
+  automatedPayoutsEnabled   Boolean  @default(false) @map("automated_payouts_enabled")
+  // Who pays WiPay's card fee; null = WIPAY_FEE_STRUCTURE from the environment.
+  wipayFeeStructure         String?  @map("wipay_fee_structure")
+  // IsleVendor's commission on every item sold, % of the seller's price.
+  platformCommissionPercent Decimal  @default(5) @map("platform_commission_percent") @db.Decimal(5, 2)
+  updatedAt                 DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  updatedBy                 String?  @map("updated_by") @db.Uuid
 
   @@map("platform_settings")
 }
@@ -1233,6 +1242,8 @@ enum CheckoutPaymentStatus {
   // WiPay says it was paid, but every order was already paid by another
   // attempt — the customer may have been charged twice and needs a refund.
   DUPLICATE
+  // A payment that had to be given back (e.g. a DUPLICATE), refunded in WiPay.
+  REFUNDED
 }
 
 // One attempt to pay for a checkout through WiPay's hosted checkout. Covers
@@ -1251,6 +1262,9 @@ model CheckoutPayment {
   message            String?
   createdAt          DateTime              @default(now()) @map("created_at") @db.Timestamptz
   paidAt             DateTime?             @map("paid_at") @db.Timestamptz
+  refundReference    String?               @map("refund_reference")
+  refundedAt         DateTime?             @map("refunded_at") @db.Timestamptz
+  refundedBy         String?               @map("refunded_by") @db.Uuid
 
   customer User    @relation("CheckoutPayments", fields: [customerId], references: [id])
   orders   Order[]

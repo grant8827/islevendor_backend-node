@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import type { OrderStatus, UserRole } from '@prisma/client';
 import { io as connectSocket, type Socket } from 'socket.io-client';
 import { createServer } from '../src/app.js';
+import { refreshPaySettings } from '../src/lib/platformSettings.js';
 import { prisma } from '../src/lib/prisma.js';
 import { redis } from '../src/lib/redis.js';
 import { signAuthToken } from '../src/middleware/auth.js';
@@ -17,6 +18,7 @@ export interface TestServer {
 /** Boots the real app on an ephemeral port. Call `close` in an `after` hook. */
 export async function startServer(): Promise<TestServer> {
   const { httpServer, io } = createServer();
+  await refreshPaySettings();
   await new Promise<void>((resolve) => httpServer.listen(0, resolve));
   const { port } = httpServer.address() as AddressInfo;
   return {

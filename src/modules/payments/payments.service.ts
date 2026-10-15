@@ -6,6 +6,13 @@ import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { toE164 } from '../../lib/payoutAccounts.js';
 import { creditOrderPayment, notifySellerOfPaidOrder } from '../ledger/ledger.service.js';
+import { cardPaymentsEnabled, effectiveFeeStructure, type FeeStructure } from '../../lib/platformSettings.js';
+
+export const CARD_FEE_PAID_BY: Record<FeeStructure, 'customer' | 'merchant' | 'split'> = {
+  customer_pay: 'customer',
+  merchant_absorb: 'merchant',
+  split: 'split',
+};
 
 // Customer payment through WiPay's hosted checkout
 // (https://docs.wipayfinancial.com/payments-api):
@@ -36,8 +43,13 @@ function wipayConfig() {
   return { accountNumber, apiKey, paymentUrl, environment: sandbox ? 'sandbox' : 'live' };
 }
 
-function assertPaymentsEnabled() {
-  if (!env.ENABLE_WIPAY_WEBHOOKS) throw new HttpError(503, 'Card payments are switched off right now — your order is saved and you can pay for it later');
+// Starting a payment needs both switches on; a payment already under way is
+// still confirmed if an admin pauses card payments meanwhile (the customer
+// may have paid) — see handleWiPayReturn.
+async function assertPaymentsEnabled() {
+  if (!(await cardPaymentsEnabled())) {
+    throw new HttpError(503, 'Card payments are switched off right now — your order is saved and you can pay for it later');
+  }
 }
 
 /** A short, unique reference WiPay accepts as order_id: letters and digits, 16 characters at most. */
@@ -58,8 +70,9 @@ function responseUrl(requestOrigin: string) {
  * the reason, and the customer can try again — the orders aren't lost.
  */
 export async function startCheckoutPayment(customerId: string, orderIds: string[], requestOrigin: string) {
-  assertPaymentsEnabled();
+  await assertPaymentsEnabled();
   const config = wipayConfig();
+  const feeStructure = await effectiveFeeStructure();
 
   const payment = await prisma.$transaction(async (tx) => {
     const orders = await tx.order.findMany({ where: { id: { in: orderIds }, customerId, status: 'AWAITING_PAYMENT' } });
@@ -89,7 +102,7 @@ export async function startCheckoutPayment(customerId: string, orderIds: string[
         country_code: env.WIPAY_COUNTRY_CODE,
         currency: env.WIPAY_CURRENCY,
         environment: config.environment,
-        fee_structure: env.WIPAY_FEE_STRUCTURE,
+        fee_structure: feeStructure,
         method: 'credit_card_co',
         order_id: payment.reference,
         origin: env.WIPAY_ORIGIN,
@@ -213,7 +226,7 @@ export async function paymentForCustomer(paymentId: string, customerId: string) 
     paidAt: payment.paidAt,
     checkoutUrl: payment.status === 'PENDING' ? payment.checkoutUrl : null,
     // With customer_pay or split, WiPay charged a card fee on top of amountJmd.
-    cardFeePaidBy: env.WIPAY_FEE_STRUCTURE === 'customer_pay' ? 'customer' : env.WIPAY_FEE_STRUCTURE === 'split' ? 'split' : 'merchant',
+    cardFeePaidBy: CARD_FEE_PAID_BY[await effectiveFeeStructure()],
     orders: orders.map((o) => ({ id: o.id, status: o.status, totalPaidJmd: o.totalPaidJmd, sellerName: o.resellerStore?.storeName ?? o.shop?.shopName ?? null })),
     // Trying again makes sense while some orders are still unpaid and this
     // is the attempt they're on.

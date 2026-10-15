@@ -1,9 +1,11 @@
 import { Decimal } from 'decimal.js';
 
-// Flat 5% of the warehouse's (post-discount) price on every item sold —
-// AFFILIATE and STORE alike. See computeAffiliatePricing below for how an
-// AFFILIATE order's other cut (the reseller's) is computed.
-export const PLATFORM_COMMISSION_RATE = new Decimal('0.05');
+import { platformCommissionRate } from './platformSettings.js';
+
+// IsleVendor's commission is a percentage of the seller's (post-discount)
+// price on every item sold — AFFILIATE and STORE alike — set by an admin in
+// IsleVendor Pay (5% unless changed; see lib/platformSettings.ts). Orders
+// keep the amount they were charged, so a change affects new orders only.
 
 /**
  * AFFILIATE pricing: the reseller's cut and the platform's cut are each a
@@ -18,7 +20,7 @@ export const PLATFORM_COMMISSION_RATE = new Decimal('0.05');
  *
  * `resellerCommissionPercent` is set by the warehouse itself (see
  * Warehouse.resellerCommissionPercent) — not the reseller, and not a global
- * platform constant like PLATFORM_COMMISSION_RATE.
+ * platform-wide rate like IsleVendor's own commission.
  */
 export function computeAffiliatePricing({
   wholesalePriceJmd,
@@ -35,7 +37,7 @@ export function computeAffiliatePricing({
   const unitWholesaleJmd = new Decimal(wholesalePriceJmd).times(discountMultiplier).toDecimalPlaces(2);
   const wholesaleTotalJmd = unitWholesaleJmd.times(quantity);
   const resellerMarginJmd = wholesaleTotalJmd.times(new Decimal(resellerCommissionPercent).dividedBy(100)).toDecimalPlaces(2);
-  const platformCommissionJmd = wholesaleTotalJmd.times(PLATFORM_COMMISSION_RATE).toDecimalPlaces(2);
+  const platformCommissionJmd = wholesaleTotalJmd.times(platformCommissionRate()).toDecimalPlaces(2);
   const retailTotalJmd = wholesaleTotalJmd.plus(resellerMarginJmd).plus(platformCommissionJmd);
 
   return { unitWholesaleJmd, wholesaleTotalJmd, resellerMarginJmd, platformCommissionJmd, retailTotalJmd };

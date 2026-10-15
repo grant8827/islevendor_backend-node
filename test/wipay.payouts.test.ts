@@ -8,6 +8,7 @@ import bcrypt from 'bcryptjs';
 import { api, createLedgerAccount, createShop, createUser, prisma, startServer, type TestServer, type TestUser } from './helpers.js';
 import { env } from '../src/env.js';
 import { decryptField, encryptField } from '../src/lib/crypto.js';
+import { updatePaySettings } from '../src/lib/platformSettings.js';
 
 // ── A fake WiPay withdrawal API ──────────────────────────────────────────────
 // Records every request and answers the way the test tells it to. No request
@@ -108,9 +109,12 @@ describe('automated WiPay payouts', () => {
       WIPAY_PAYOUT_API_KEY: 'test-wapi-key',
       WIPAY_PAYOUT_WEBHOOK_SECRET: SECRET,
     });
+    // Automated payouts need the admin's switch too, not just the deploy's.
+    await updatePaySettings({ automatedPayoutsEnabled: true }, admin.id);
   });
   beforeEach(() => fake.reset());
   after(async () => {
+    await updatePaySettings({ automatedPayoutsEnabled: false }, admin.id);
     Object.assign(env, { ENABLE_WITHDRAWALS: false, ENABLE_AUTOMATED_PAYOUTS: false, WIPAY_PAYOUT_API_URL: undefined, WIPAY_PAYOUT_API_KEY: undefined, WIPAY_PAYOUT_WEBHOOK_SECRET: undefined });
     wipay.close();
     await server.close();
@@ -258,9 +262,15 @@ describe('automated WiPay payouts', () => {
       await call('POST', `/admin/payouts/${payout.id}/approve`, admin);
       env.ENABLE_AUTOMATED_PAYOUTS = false;
       try {
-        assert.equal((await send(payout.id)).status, 503);
+        assert.equal((await send(payout.id)).status, 503, 'off in the deployment');
       } finally {
         env.ENABLE_AUTOMATED_PAYOUTS = true;
+      }
+      await updatePaySettings({ automatedPayoutsEnabled: false }, admin.id);
+      try {
+        assert.equal((await send(payout.id)).status, 503, 'paused by an admin');
+      } finally {
+        await updatePaySettings({ automatedPayoutsEnabled: true }, admin.id);
       }
       // Manual payment still works from APPROVED.
       const manual = await call('PATCH', `/admin/payouts/${payout.id}`, admin, { status: 'PAID', reference: 'NCB-1' });

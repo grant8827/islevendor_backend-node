@@ -6,7 +6,7 @@ import { Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
-import { computeAffiliatePricing, PLATFORM_COMMISSION_RATE } from '../../lib/pricing.js';
+import { computeAffiliatePricing } from '../../lib/pricing.js';
 import { logTrackingEvent } from '../../lib/tracking.js';
 import { assertOrderAccess, toOrderDto } from '../../lib/orderAccess.js';
 import { APPROVED_SELLER } from '../../lib/eligibility.js';
@@ -18,9 +18,8 @@ import {
   requireRate,
   type DeliverySettings,
 } from '../../lib/deliveryOptions.js';
-import { getIsleDashRate } from '../../lib/platformSettings.js';
-import { env } from '../../env.js';
-import { startCheckoutPayment } from '../payments/payments.service.js';
+import { effectiveFeeStructure, getIsleDashRate, platformCommissionRate } from '../../lib/platformSettings.js';
+import { CARD_FEE_PAID_BY, startCheckoutPayment } from '../payments/payments.service.js';
 import { requestOrigin } from '../payments/payments.routes.js';
 import { ITEMS_IN_ORDER, summarizeItems, toItemView } from '../../lib/orderItems.js';
 
@@ -104,7 +103,7 @@ async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
     const discountMultiplier = new Decimal(1).minus(new Decimal(product.discountPercent).dividedBy(100));
     const discountedUnitPrice = new Decimal(product.priceJmd.toString()).times(discountMultiplier).toDecimalPlaces(2);
     const itemTotal = discountedUnitPrice.times(line.quantity);
-    const platformCommissionJmd = itemTotal.times(PLATFORM_COMMISSION_RATE).toDecimalPlaces(2);
+    const platformCommissionJmd = itemTotal.times(platformCommissionRate()).toDecimalPlaces(2);
     return {
       line,
       sellerKey: `shop:${product.shop.id}`,
@@ -283,8 +282,6 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
   });
 }
 
-const CARD_FEE_PAID_BY = { customer_pay: 'customer', merchant_absorb: 'merchant', split: 'split' } as const;
-
 // IsleVendor's current IsleDash pricing — shown to sellers on their
 // Shipping tab so they know what customers pay when they pick IsleDash.
 ordersRouter.get('/isledash-rate', async (_req, res, next) => {
@@ -344,7 +341,7 @@ ordersRouter.post('/quote', async (req, res, next) => {
 
     // Who pays WiPay's card fee (WIPAY_FEE_STRUCTURE) — the cart says so
     // before the customer leaves for WiPay, where any fee is added.
-    res.json({ items: lines, sellers, cardFeePaidBy: CARD_FEE_PAID_BY[env.WIPAY_FEE_STRUCTURE] });
+    res.json({ items: lines, sellers, cardFeePaidBy: CARD_FEE_PAID_BY[await effectiveFeeStructure()] });
   } catch (err) {
     next(err);
   }

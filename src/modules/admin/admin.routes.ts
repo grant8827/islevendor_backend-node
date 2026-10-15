@@ -7,10 +7,10 @@ import { requireCurrentAdmin } from '../../middleware/requireAdmin.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { loadDocumentReferences, type ApplicantType } from '../../lib/kycDocuments.js';
 import { recordAuditEvent } from '../../lib/audit.js';
-import { getIsleDashRate, getPayoutTiming, setIsleDashRate, setPayoutTiming } from '../../lib/platformSettings.js';
+import { automatedPayoutsEnabled, getIsleDashRate, getPayoutTiming, setIsleDashRate, setPayoutTiming } from '../../lib/platformSettings.js';
 import { approvePayout, checkWiPayPayout, settlePayout, submitPayoutToWiPay, withdrawPlatformBalance } from '../ledger/ledger.service.js';
 import { missingForAutomaticPayout, revealForPayout } from '../../lib/payoutAccounts.js';
-import { env } from '../../env.js';
+import { registerPayRoutes, FINANCIAL_AUDIT_FILTER } from './pay.routes.js';
 import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 
 // The superadmin console's API (frontend: pages/admin). Mostly read-side so
@@ -393,7 +393,7 @@ adminRouter.get('/payouts', async (req, res, next) => {
     const withDestinations = await Promise.all(
       payouts.map(async (p) => ({ ...p, destination: await destinationFor(p.ledgerAccount) })),
     );
-    res.json({ total, page, pageSize: PAGE_SIZE, payouts: withDestinations, automatedPayoutsEnabled: env.ENABLE_AUTOMATED_PAYOUTS });
+    res.json({ total, page, pageSize: PAGE_SIZE, payouts: withDestinations, automatedPayoutsEnabled: await automatedPayoutsEnabled() });
   } catch (err) {
     next(err);
   }
@@ -562,7 +562,9 @@ adminRouter.get('/audit-events', async (req, res, next) => {
   try {
     const page = pageSchema.parse(req.query.page);
     const action = z.string().trim().max(100).optional().parse(req.query.action || undefined);
-    const where: Prisma.AuditEventWhereInput = action ? { action } : {};
+    // ?category=finance: every money-related action (IsleVendor Pay's Audit Logs).
+    const finance = req.query.category === 'finance';
+    const where: Prisma.AuditEventWhereInput = { ...(action ? { action } : {}), ...(finance ? FINANCIAL_AUDIT_FILTER : {}) };
 
     const [total, events] = await Promise.all([
       prisma.auditEvent.count({ where }),
@@ -579,3 +581,5 @@ adminRouter.get('/audit-events', async (req, res, next) => {
     next(err);
   }
 });
+
+registerPayRoutes(adminRouter);

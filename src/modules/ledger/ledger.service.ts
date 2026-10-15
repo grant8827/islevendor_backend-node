@@ -19,7 +19,7 @@ import {
   WiPayUncertainError,
   type WiPayWithdrawal,
 } from '../../lib/wipayPayouts.js';
-import { addBusinessDays, getPayoutTiming } from '../../lib/platformSettings.js';
+import { addBusinessDays, automatedPayoutsEnabled, getPayoutTiming } from '../../lib/platformSettings.js';
 
 const WIPAY_PROVIDER = 'WIPAY';
 
@@ -418,8 +418,8 @@ export async function approvePayout(tx: Prisma.TransactionClient, payoutId: stri
 // 5xx), it stays SUBMITTED until checkWiPayPayout has looked it up in WiPay's
 // records — a payout is never sent twice on a guess.
 
-function assertAutomatedPayoutsEnabled() {
-  if (!env.ENABLE_AUTOMATED_PAYOUTS) throw new HttpError(503, 'Automatic WiPay payouts are switched off — pay this one by hand');
+async function assertAutomatedPayoutsEnabled() {
+  if (!(await automatedPayoutsEnabled())) throw new HttpError(503, 'Automatic WiPay payouts are switched off — pay this one by hand');
 }
 
 // How long after a submission WiPay's records are trusted to show it, before
@@ -427,7 +427,7 @@ function assertAutomatedPayoutsEnabled() {
 const SUBMISSION_SETTLE_MS = 15 * 60 * 1000;
 
 export async function submitPayoutToWiPay(payoutId: string, adminId: string) {
-  assertAutomatedPayoutsEnabled();
+  await assertAutomatedPayoutsEnabled();
 
   // Claim it: APPROVED -> SUBMITTED with a fresh submission key, committed
   // before WiPay is called.

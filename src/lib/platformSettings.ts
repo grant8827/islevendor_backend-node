@@ -2,6 +2,7 @@ import { Decimal } from 'decimal.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { prisma } from './prisma.js';
 import type { ShippingRate } from './deliveryOptions.js';
+import { env } from '../env.js';
 
 const SETTINGS_ID = 'default';
 
@@ -37,6 +38,103 @@ export async function getPayoutTiming(db: PrismaClient | Prisma.TransactionClien
 export async function setPayoutTiming(timing: PayoutTiming, updatedBy: string, db: PrismaClient | Prisma.TransactionClient = prisma) {
   const data = { payoutMinBusinessDays: timing.minBusinessDays, payoutMaxBusinessDays: timing.maxBusinessDays, updatedBy };
   return db.platformSetting.upsert({ where: { id: SETTINGS_ID }, create: { id: SETTINGS_ID, ...data }, update: data });
+}
+
+// ── IsleVendor Pay settings ─────────────────────────────────────────────────
+
+export type FeeStructure = 'merchant_absorb' | 'customer_pay' | 'split';
+const FEE_STRUCTURES: FeeStructure[] = ['merchant_absorb', 'customer_pay', 'split'];
+
+export interface PaySettings {
+  paymentsEnabled: boolean;
+  automatedPayoutsEnabled: boolean;
+  /** null: use WIPAY_FEE_STRUCTURE from the environment. */
+  wipayFeeStructure: FeeStructure | null;
+  platformCommissionPercent: Decimal;
+}
+
+const DEFAULT_PAY_SETTINGS: PaySettings = {
+  paymentsEnabled: true,
+  automatedPayoutsEnabled: false,
+  wipayFeeStructure: null,
+  platformCommissionPercent: new Decimal(5),
+};
+
+// The pay settings are read on hot paths — every price shown in the
+// marketplace uses the commission — so they're cached in memory and
+// re-read every CACHE_MS (and at once after a change on this instance).
+// Another instance picks a change up within CACHE_MS.
+const CACHE_MS = 30_000;
+let cached: { value: PaySettings; at: number } | null = null;
+
+function toPaySettings(row: {
+  paymentsEnabled: boolean;
+  automatedPayoutsEnabled: boolean;
+  wipayFeeStructure: string | null;
+  platformCommissionPercent: Prisma.Decimal;
+} | null): PaySettings {
+  if (!row) return DEFAULT_PAY_SETTINGS;
+  return {
+    paymentsEnabled: row.paymentsEnabled,
+    automatedPayoutsEnabled: row.automatedPayoutsEnabled,
+    wipayFeeStructure: FEE_STRUCTURES.includes(row.wipayFeeStructure as FeeStructure) ? (row.wipayFeeStructure as FeeStructure) : null,
+    platformCommissionPercent: new Decimal(row.platformCommissionPercent.toString()),
+  };
+}
+
+/** Re-reads the pay settings into the cache. Called at start-up, after a change, and on a timer. */
+export async function refreshPaySettings(db: PrismaClient | Prisma.TransactionClient = prisma): Promise<PaySettings> {
+  const row = await db.platformSetting.findUnique({ where: { id: SETTINGS_ID } });
+  cached = { value: toPaySettings(row), at: Date.now() };
+  return cached.value;
+}
+
+/** The pay settings, from the cache when it's fresh. */
+export async function getPaySettings(): Promise<PaySettings> {
+  return cached && Date.now() - cached.at < CACHE_MS ? cached.value : refreshPaySettings();
+}
+
+/**
+ * IsleVendor's commission as a fraction (0.05 for 5%), for pricing code
+ * that can't wait on the database. Reads the cache — kept warm by
+ * refreshPaySettings at start-up and on a timer (see startPaySettingsRefresh).
+ */
+export function platformCommissionRate(): Decimal {
+  return (cached?.value ?? DEFAULT_PAY_SETTINGS).platformCommissionPercent.dividedBy(100);
+}
+
+/** Keeps the cache fresh in the background; returns a function that stops it. */
+export function startPaySettingsRefresh(): () => void {
+  const timer = setInterval(() => {
+    refreshPaySettings().catch((err) => console.error('[settings] refresh failed', err));
+  }, CACHE_MS);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+/** Who pays WiPay's card fee right now: the admin's choice, else the environment's. */
+export async function effectiveFeeStructure(): Promise<FeeStructure> {
+  return (await getPaySettings()).wipayFeeStructure ?? env.WIPAY_FEE_STRUCTURE;
+}
+
+/** Whether new card payments may start: the deployment allows them and no admin has paused them. */
+export async function cardPaymentsEnabled(): Promise<boolean> {
+  return env.ENABLE_WIPAY_WEBHOOKS && (await getPaySettings()).paymentsEnabled;
+}
+
+/** Whether payouts may be sent through WiPay: the deployment allows it and an admin has switched it on. */
+export async function automatedPayoutsEnabled(): Promise<boolean> {
+  return env.ENABLE_AUTOMATED_PAYOUTS && (await getPaySettings()).automatedPayoutsEnabled;
+}
+
+export async function updatePaySettings(
+  changes: Partial<Omit<PaySettings, 'platformCommissionPercent'> & { platformCommissionPercent: number }>,
+  updatedBy: string,
+  db: PrismaClient | Prisma.TransactionClient = prisma,
+) {
+  const data = { ...changes, updatedBy };
+  await db.platformSetting.upsert({ where: { id: SETTINGS_ID }, create: { id: SETTINGS_ID, ...data }, update: data });
+  return refreshPaySettings(db);
 }
 
 /**
