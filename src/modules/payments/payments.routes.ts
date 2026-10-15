@@ -1,6 +1,6 @@
 import { Router, type Request } from 'express';
 import { requireAuth } from '../../middleware/auth.js';
-import { env } from '../../env.js';
+import { corsOrigins, env } from '../../env.js';
 import { handlePaymentsWebhook, handleWiPayReturn, paymentForCustomer, retryPayment } from './payments.service.js';
 
 export const paymentsRouter = Router();
@@ -11,7 +11,7 @@ export const requestOrigin = (req: Request) => `${req.protocol}://${req.get('hos
 
 /** The marketplace's payment status page for a payment. */
 function statusPage(paymentId: string | null) {
-  const web = (env.PUBLIC_WEB_URL ?? env.CORS_ORIGIN.split(',')[0]).replace(/\/$/, '');
+  const web = (env.PUBLIC_WEB_URL ?? corsOrigins[0]).replace(/\/$/, '');
   return paymentId ? `${web}/payment/${paymentId}` : `${web}/account?tab=orders`;
 }
 

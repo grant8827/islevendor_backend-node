@@ -136,3 +136,12 @@ if (safetyErrors.length > 0) {
 }
 
 export const env = candidate;
+
+/**
+ * The websites allowed to call this API from a browser: CORS_ORIGIN as a
+ * comma-separated list (e.g. the Railway address and islevendor.com while
+ * both are in use). The first one is the default place to send customers.
+ */
+export const corsOrigins = candidate.CORS_ORIGIN.split(',')
+  .map((origin) => origin.trim().replace(/\/$/, ''))
+  .filter(Boolean);

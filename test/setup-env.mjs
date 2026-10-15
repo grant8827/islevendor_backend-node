@@ -29,7 +29,7 @@ Object.assign(process.env, {
   REDIS_URL: process.env.TEST_REDIS_URL ?? 'redis://localhost:6379/15',
   JWT_SECRET: 'test-only-secret',
   JWT_EXPIRES_IN: '1h',
-  CORS_ORIGIN: 'http://localhost:5173',
+  CORS_ORIGIN: 'http://localhost:5173, https://islevendor.test/',
   WIPAY_ENV: 'sandbox',
   WIPAY_ACCOUNT_NUMBER: '',
   WIPAY_API_KEY: '',

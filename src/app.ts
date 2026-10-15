@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import { Server } from 'socket.io';
-import { env } from './env.js';
+import { corsOrigins, env } from './env.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { setSocketServer } from './lib/socket.js';
 import { authRouter } from './modules/auth/auth.routes.js';
@@ -32,7 +32,7 @@ const app = express();
 app.set('trust proxy', true);
 
 app.use(helmet());
-app.use(cors({ origin: env.CORS_ORIGIN, credentials: true }));
+app.use(cors({ origin: corsOrigins, credentials: true }));
 // The raw bytes are kept alongside the parsed body: a webhook signature is
 // computed over exactly what was sent (see ledger.service.ts's
 // processWiPayPayoutWebhook), not over a re-serialised object.
@@ -87,7 +87,7 @@ app.use(errorHandler);
  */
 export function createServer() {
   const httpServer = http.createServer(app);
-  const io = new Server(httpServer, { cors: { origin: env.CORS_ORIGIN, credentials: true } });
+  const io = new Server(httpServer, { cors: { origin: corsOrigins, credentials: true } });
   setSocketServer(io);
   registerDispatchGateway(io);
   return { app, httpServer, io };
