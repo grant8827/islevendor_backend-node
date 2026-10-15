@@ -22,6 +22,7 @@ import { onboardingRouter } from './modules/onboarding/onboarding.routes.js';
 import { driversRouter } from './modules/drivers/drivers.routes.js';
 import { adminRouter } from './modules/admin/admin.routes.js';
 import { paymentsRouter, wipayWebhookRouter } from './modules/payments/payments.routes.js';
+import { internalPayRouter } from './modules/payments/internal.routes.js';
 
 const app = express();
 
@@ -71,6 +72,7 @@ app.use('/api/ratings', ratingsRouter);
 app.use('/api/drivers', driversRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/payments', paymentsRouter);
+app.use('/internal/pay', internalPayRouter);
 // WIPAY_RESPONSE_URL points here (see modules/payments).
 app.use('/api/webhooks/wipay', wipayWebhookRouter);
 // Versioned per ISLE-105's spec (the rest of the API is unversioned) — the

@@ -80,7 +80,13 @@ export async function startCheckoutPayment(customerId: string, orderIds: string[
 
     const amount = orders.reduce((sum, o) => sum.plus(o.totalPaidJmd.toString()), new Decimal(0));
     const created = await tx.checkoutPayment.create({
-      data: { customerId, reference: newReference(), orderIds, amountJmd: amount.toFixed(2) },
+      data: {
+        customerId,
+        reference: newReference(),
+        orderIds,
+        amountJmd: amount.toFixed(2),
+        provider: env.PAYMENTS_PROVIDER === 'islevendor-pay' ? 'ISLEVENDOR_PAY' : 'NODE',
+      },
     });
     // The orders' earlier attempts, if any, are replaced by this one.
     const previous = [...new Set(orders.map((o) => o.checkoutPaymentId).filter((id): id is string => !!id))];
@@ -93,6 +99,9 @@ export async function startCheckoutPayment(customerId: string, orderIds: string[
 
   const customer = await prisma.user.findUniqueOrThrow({ where: { id: customerId }, select: { email: true, fullName: true, phoneNumber: true } });
   const phone = toE164(customer.phoneNumber);
+  if (payment.provider === 'ISLEVENDOR_PAY') {
+    return startWithIsleVendorPay(payment, { email: customer.email.slice(0, 50), name: customer.fullName.slice(0, 60), phone: phone ?? null }, feeStructure);
+  }
   try {
     const res = await fetch(config.paymentUrl, {
       method: 'POST',
@@ -130,6 +139,92 @@ export async function startCheckoutPayment(customerId: string, orderIds: string[
       data: { status: 'FAILED', message: `Couldn’t start the card payment: ${err instanceof Error ? err.message : String(err)}` },
     });
   }
+}
+
+type CheckoutPaymentRow = Awaited<ReturnType<typeof prisma.checkoutPayment.create>>;
+
+/**
+ * Hands the payment to the IsleVendor Pay service, which asks WiPay for the
+ * checkout page and later reports the outcome to /internal/pay (see
+ * reportPayOutcome). This row stays the marketplace's copy. The payment's
+ * own id is the idempotency key, so a retried call can't open two checkouts.
+ */
+async function startWithIsleVendorPay(
+  payment: CheckoutPaymentRow,
+  customer: { email: string; name: string; phone: string | null },
+  feeStructure: FeeStructure,
+) {
+  try {
+    const res = await fetch(`${env.ISLEVENDOR_PAY_INTERNAL_URL}/internal/v1/payment-intents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-IsleVendor-Service-Token': env.ISLEVENDOR_PAY_SERVICE_TOKEN ?? '' },
+      body: JSON.stringify({
+        idempotencyKey: payment.id,
+        marketplacePaymentId: payment.id,
+        gateway: 'WIPAY',
+        customerUserId: payment.customerId,
+        orderIds: payment.orderIds,
+        amount: payment.amountJmd.toFixed(2),
+        currency: 'JMD',
+        feeStructure,
+        customer: { email: customer.email, name: customer.name, ...(customer.phone ? { phone: customer.phone } : {}) },
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const body = (await res.json().catch(() => ({}))) as { id?: string; status?: string; checkoutUrl?: string | null; message?: string | null; error?: string };
+    if (!res.ok || !body.id) throw new Error(body.error || `IsleVendor Pay returned ${res.status}`);
+    if (body.status !== 'PENDING' || !body.checkoutUrl) {
+      return prisma.checkoutPayment.update({
+        where: { id: payment.id },
+        data: { payIntentId: body.id, status: 'FAILED', message: body.message || 'Couldn’t start the card payment' },
+      });
+    }
+    return prisma.checkoutPayment.update({ where: { id: payment.id }, data: { payIntentId: body.id, checkoutUrl: body.checkoutUrl } });
+  } catch (err) {
+    console.error(`[islevendor-pay] couldn't start payment ${payment.id}:`, err instanceof Error ? err.message : err);
+    return prisma.checkoutPayment.update({
+      where: { id: payment.id },
+      data: { status: 'FAILED', message: 'Couldn’t start the card payment — please try again' },
+    });
+  }
+}
+
+/**
+ * IsleVendor Pay reporting a payment's verified outcome (it checked WiPay's
+ * hash or signature). Safe to repeat: a success credits each order once,
+ * through the same confirmPayment as Node's own WiPay payments. Answers
+ * what the marketplace now records, PAID, DUPLICATE (orders already paid by
+ * another attempt; refund needed) or FAILED, which IsleVendor Pay stores
+ * as acknowledged.
+ */
+export async function reportPayOutcome(
+  paymentId: string,
+  outcome: { paymentIntentId: string; status: 'PAID' | 'FAILED'; amount: string; transactionId: string | null; message: string | null },
+) {
+  const payment = await prisma.checkoutPayment.findUnique({ where: { id: paymentId } });
+  if (!payment || payment.provider !== 'ISLEVENDOR_PAY') throw new HttpError(404, 'Payment not found');
+  if (payment.payIntentId && payment.payIntentId !== outcome.paymentIntentId) throw new HttpError(409, 'A different payment intent owns this payment');
+  if (!payment.payIntentId) {
+    // We crashed between IsleVendor Pay answering and saving its id.
+    await prisma.checkoutPayment.update({ where: { id: payment.id }, data: { payIntentId: outcome.paymentIntentId } });
+  }
+
+  if (outcome.status === 'FAILED') {
+    await prisma.checkoutPayment.updateMany({
+      where: { id: payment.id, status: 'PENDING' },
+      data: { status: 'FAILED', message: (outcome.message || 'The card payment didn’t go through').slice(0, 500) },
+    });
+    return { status: 'FAILED' as const };
+  }
+
+  if (!outcome.transactionId) throw new HttpError(400, 'A paid outcome needs the WiPay transaction');
+  if (!new Decimal(outcome.amount).equals(payment.amountJmd.toString())) {
+    console.error(`[islevendor-pay] outcome for ${payment.id} has amount ${outcome.amount}, expected ${payment.amountJmd.toFixed(2)} — not applied`);
+    throw new HttpError(409, 'The amount doesn’t match this payment');
+  }
+  await confirmPayment(payment.id, outcome.transactionId, { source: 'islevendor-pay', ...outcome });
+  const after = await prisma.checkoutPayment.findUniqueOrThrow({ where: { id: payment.id }, select: { status: true } });
+  return { status: after.status === 'DUPLICATE' ? ('DUPLICATE' as const) : ('PAID' as const) };
 }
 
 function hashMatches(transactionId: string, amount: Prisma.Decimal, receivedHash: string) {

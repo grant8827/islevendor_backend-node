@@ -66,6 +66,16 @@ const envSchema = z.object({
   // WiPay's live API — only once WiPay has confirmed IsleVendor's account is
   // authorised for sub_banked withdrawals.
   WIPAY_PAYOUTS_LIVE_AUTHORIZED: booleanFromEnv,
+  // Who takes customer card payments for new checkouts: this backend
+  // (`node`, the default) or the IsleVendor Pay service (`islevendor-pay`,
+  // the Java service in islevendor-pay/). Payments already started finish
+  // with whichever started them.
+  PAYMENTS_PROVIDER: z.enum(['node', 'islevendor-pay']).default('node'),
+  // IsleVendor Pay on the private network, e.g. http://islevendor-pay.railway.internal:8081
+  ISLEVENDOR_PAY_INTERNAL_URL: optionalString(z.string().url()),
+  // Shared secret between this backend and IsleVendor Pay, both directions.
+  // While set, IsleVendor Pay can report payment outcomes here.
+  ISLEVENDOR_PAY_SERVICE_TOKEN: optionalString(z.string().min(32, 'ISLEVENDOR_PAY_SERVICE_TOKEN must be at least 32 characters')),
   AI_SERVICE_URL: z.string().default('http://localhost:8001'),
 });
 
@@ -114,6 +124,10 @@ if (candidate.WIPAY_PAYMENT_URL && new URL(candidate.WIPAY_PAYMENT_URL).hostname
   if (sandboxHost !== (candidate.WIPAY_ENV === 'sandbox')) {
     safetyErrors.push(`WIPAY_PAYMENT_URL is WiPay's ${sandboxHost ? 'sandbox' : 'live'} address but WIPAY_ENV is ${candidate.WIPAY_ENV}`);
   }
+}
+
+if (candidate.PAYMENTS_PROVIDER === 'islevendor-pay' && (!candidate.ISLEVENDOR_PAY_INTERNAL_URL || !candidate.ISLEVENDOR_PAY_SERVICE_TOKEN)) {
+  safetyErrors.push('PAYMENTS_PROVIDER=islevendor-pay requires ISLEVENDOR_PAY_INTERNAL_URL and ISLEVENDOR_PAY_SERVICE_TOKEN');
 }
 
 if (safetyErrors.length > 0) {

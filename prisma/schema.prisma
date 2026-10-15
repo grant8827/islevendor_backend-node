@@ -1246,6 +1246,14 @@ enum CheckoutPaymentStatus {
   REFUNDED
 }
 
+// Which service took the payment. ISLEVENDOR_PAY: the Java IsleVendor Pay
+// service owns it and reports the outcome (POST /internal/pay/payments/:id/outcome);
+// this row is the marketplace's copy, for the customer's and admin's pages.
+enum PaymentProvider {
+  NODE
+  ISLEVENDOR_PAY
+}
+
 // One attempt to pay for a checkout through WiPay's hosted checkout. Covers
 // every order the customer placed together (orderIds); WiPay knows it by
 // `reference`. See src/modules/payments.
@@ -1265,6 +1273,9 @@ model CheckoutPayment {
   refundReference    String?               @map("refund_reference")
   refundedAt         DateTime?             @map("refunded_at") @db.Timestamptz
   refundedBy         String?               @map("refunded_by") @db.Uuid
+  provider           PaymentProvider       @default(NODE)
+  // IsleVendor Pay's payment intent, when provider is ISLEVENDOR_PAY.
+  payIntentId        String?               @unique @map("pay_intent_id") @db.Uuid
 
   customer User    @relation("CheckoutPayments", fields: [customerId], references: [id])
   orders   Order[]
