@@ -6,6 +6,7 @@ import { loginUser, registerUser } from './auth.service.js';
 import { requireAuth, signAuthToken } from '../../middleware/auth.js';
 import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 import { prisma } from '../../lib/prisma.js';
+import { addressData, addressSchema, toAddressView } from '../../lib/customerAddress.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 
 export const authRouter = Router();
@@ -17,6 +18,8 @@ const registerSchema = z.object({
   phoneNumber: z.string().min(7),
   // Marketplace operators must use a role-specific onboarding flow.
   role: z.literal(UserRole.CUSTOMER),
+  // Where to deliver: saved to the account and filled in at checkout.
+  address: addressSchema,
 });
 
 authRouter.post('/register', async (req, res, next) => {
@@ -39,6 +42,31 @@ authRouter.post('/login', async (req, res, next) => {
     const { email, password } = loginSchema.parse(req.body);
     const result = await loginUser(email, password);
     res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// The signed-in customer's saved delivery address (null until one is saved).
+authRouter.get('/address', requireAuth, async (req, res, next) => {
+  try {
+    const address = await prisma.customerAddress.findUnique({ where: { userId: req.user!.sub } });
+    res.json({ address: address ? toAddressView(address) : null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Saves (or replaces) it, from My Account or "save for next time" at checkout.
+authRouter.put('/address', requireAuth, async (req, res, next) => {
+  try {
+    const data = addressData(addressSchema.parse(req.body));
+    const address = await prisma.customerAddress.upsert({
+      where: { userId: req.user!.sub },
+      create: { userId: req.user!.sub, ...data },
+      update: data,
+    });
+    res.json({ address: toAddressView(address) });
   } catch (err) {
     next(err);
   }

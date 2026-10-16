@@ -21,6 +21,7 @@ import {
 import { effectiveFeeStructure, getIsleDashRate, platformCommissionRate } from '../../lib/platformSettings.js';
 import { CARD_FEE_PAID_BY, startCheckoutPayment } from '../payments/payments.service.js';
 import { requestOrigin } from '../payments/payments.routes.js';
+import { formatAddress, mapPinSchema } from '../../lib/customerAddress.js';
 import { ITEMS_IN_ORDER, summarizeItems, toItemView } from '../../lib/orderItems.js';
 
 export const ordersRouter = Router();
@@ -187,7 +188,9 @@ const checkoutSchema = z
     // One choice per business shipping something in this cart, keyed by the
     // sellerKey POST /orders/quote returns.
     deliveryMethods: z.record(z.string(), deliveryMethodSchema),
+    // Leave both out to deliver to the customer's saved address.
     deliveryAddress: z.string().trim().min(1).max(500).optional(),
+    deliveryLocation: mapPinSchema.nullish(),
   });
 type CheckoutInput = z.infer<typeof checkoutSchema>;
 
@@ -207,6 +210,17 @@ type CheckoutInput = z.infer<typeof checkoutSchema>;
  * checkoutGroupId.
  */
 async function placeCheckout(customerId: string, input: CheckoutInput) {
+  // No address given: deliver to the saved one, with its map pin.
+  let deliveryAddress = input.deliveryAddress;
+  let pin = input.deliveryLocation ?? null;
+  if (!deliveryAddress) {
+    const saved = await prisma.customerAddress.findUnique({ where: { userId: customerId } });
+    if (saved) {
+      deliveryAddress = formatAddress(saved);
+      pin = saved.latitude !== null && saved.longitude !== null ? { latitude: Number(saved.latitude), longitude: Number(saved.longitude) } : null;
+    }
+  }
+
   return prisma.$transaction(async (tx) => {
     const isleDashRate = await getIsleDashRate(tx);
     const resolved: ResolvedLine[] = [];
@@ -226,7 +240,7 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
       const method = input.deliveryMethods[sellerKey];
       if (!method) throw new HttpError(400, `Choose how you want to get the items from ${sellerLines[0].sellerName}`);
       const rate = requireRate(sellerLines[0].seller, method, isleDashRate);
-      if (method !== 'PICKUP' && !input.deliveryAddress) throw new HttpError(400, 'Enter a delivery address');
+      if (method !== 'PICKUP' && !deliveryAddress) throw new HttpError(400, 'Enter a delivery address');
 
       // This seller's shipping, unit by unit in cart order, then summed per order.
       const unitFees = perItemFees(rate, unitsOf(sellerLines));
@@ -255,7 +269,10 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
             deliveryMethod: method,
             // A pickup records where to collect, so every seller view and
             // label shows it.
-            deliveryAddress: method === 'PICKUP' ? `Customer pickup: ${pickupLocationOf(lines[0].seller)}` : input.deliveryAddress!,
+            deliveryAddress: method === 'PICKUP' ? `Customer pickup: ${pickupLocationOf(lines[0].seller)}` : deliveryAddress!,
+            // Where the driver goes; not needed when the customer collects.
+            deliveryLatitude: method === 'PICKUP' || !pin ? null : pin.latitude.toFixed(6),
+            deliveryLongitude: method === 'PICKUP' || !pin ? null : pin.longitude.toFixed(6),
             checkoutGroupId,
             items: {
               create: lines.map((l) => ({
@@ -366,16 +383,14 @@ const singleCheckoutSchema = lineSchema
     // Defaults to IsleDash: every business offered it before delivery
     // options existed.
     deliveryMethod: deliveryMethodSchema.default('ISLEDASH'),
+    // Leave out to deliver to the customer's saved address.
     deliveryAddress: z.string().trim().min(1).max(500).optional(),
-  })
-  .refine((v) => v.deliveryMethod === 'PICKUP' || !!v.deliveryAddress, {
-    message: 'Enter a delivery address',
-    path: ['deliveryAddress'],
+    deliveryLocation: mapPinSchema.nullish(),
   });
 
 ordersRouter.post('/', requireAuth, requireRole(UserRole.CUSTOMER, UserRole.ADMIN), async (req, res, next) => {
   try {
-    const { deliveryMethod, deliveryAddress, ...line } = singleCheckoutSchema.parse(req.body);
+    const { deliveryMethod, deliveryAddress, deliveryLocation, ...line } = singleCheckoutSchema.parse(req.body);
     const resolved = await resolveLine(prisma, line);
     if (!resolved) throw new HttpError(404, line.kind === 'STORE' ? 'Product not found or inactive' : 'Listing not found or inactive');
 
@@ -383,6 +398,7 @@ ordersRouter.post('/', requireAuth, requireRole(UserRole.CUSTOMER, UserRole.ADMI
       items: [line],
       deliveryMethods: { [resolved.sellerKey]: deliveryMethod },
       deliveryAddress,
+      deliveryLocation,
     });
     const payment = await paymentFor(req, [order.id]);
     res.status(201).json({ ...order, checkoutUrl: payment?.checkoutUrl ?? null, paymentId: payment?.id ?? null });

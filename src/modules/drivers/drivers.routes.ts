@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { UserRole } from '@prisma/client';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { prisma } from '../../lib/prisma.js';
+import { pinOf } from '../../lib/orderAccess.js';
 import { ITEMS_IN_ORDER, summarizeItems, toItemView } from '../../lib/orderItems.js';
 
 export const driversRouter = Router();
@@ -114,6 +115,7 @@ driversRouter.get('/me/deliveries', requireAuth, requireRole(UserRole.DRIVER, Us
       items: o.items.map(toItemView),
       sellerName: o.resellerStore?.storeName ?? o.shop?.shopName ?? null,
       deliveryAddress: o.deliveryAddress,
+      deliveryLocation: pinOf(o),
       buyerName: o.customer.fullName,
       buyerPhone: o.customer.phoneNumber,
       driverFeeJmd: o.driverFeeJmd,

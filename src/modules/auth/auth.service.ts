@@ -3,6 +3,7 @@ import { UserRole } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { signAuthToken } from '../../middleware/auth.js';
+import { addressData, type AddressInput } from '../../lib/customerAddress.js';
 
 const SALT_ROUNDS = 12;
 
@@ -12,6 +13,8 @@ export interface RegisterInput {
   fullName: string;
   phoneNumber: string;
   role: UserRole;
+  // Customers' delivery address (businesses register through onboarding).
+  address?: AddressInput;
 }
 
 export async function registerUser(input: RegisterInput) {
@@ -30,6 +33,7 @@ export async function registerUser(input: RegisterInput) {
         fullName: input.fullName,
         phoneNumber: input.phoneNumber,
         role: input.role,
+        ...(input.address ? { address: { create: addressData(input.address) } } : {}),
       },
     });
 

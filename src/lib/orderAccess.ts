@@ -49,6 +49,13 @@ export async function assertOrderAccess(orderId: string, user: AuthTokenPayload)
  * fee, a warehouse its wholesale total, a reseller/shop its own take — and
  * only an ADMIN sees the full split.
  */
+/** The order's delivery map pin, for "Open in Maps". Null if none was given. */
+export function pinOf(order: Pick<Order, 'deliveryLatitude' | 'deliveryLongitude'>) {
+  return order.deliveryLatitude !== null && order.deliveryLongitude !== null
+    ? { latitude: Number(order.deliveryLatitude), longitude: Number(order.deliveryLongitude) }
+    : null;
+}
+
 export function toOrderDto(order: Order, access: OrderAccess) {
   const base = {
     id: order.id,
@@ -57,6 +64,7 @@ export function toOrderDto(order: Order, access: OrderAccess) {
     storeListingId: order.storeListingId,
     shopProductId: order.shopProductId,
     deliveryAddress: order.deliveryAddress,
+    deliveryLocation: pinOf(order),
     deliveredAt: order.deliveredAt,
     createdAt: order.createdAt,
   };

@@ -85,6 +85,7 @@ model User {
   applicationMessages  ApplicationMessage[] @relation("ApplicationMessageSender")
   payoutAccount        PayoutAccount?
   checkoutPayments     CheckoutPayment[]    @relation("CheckoutPayments")
+  address              CustomerAddress?
 
   @@map("users")
 }
@@ -801,6 +802,10 @@ model Order {
   // charge — first item full, extras at the multi-item rate — split across
   // them; this ties them together. Null for orders placed one at a time.
   checkoutGroupId         String?        @map("checkout_group_id") @db.Uuid
+  // The customer's map pin for this delivery (from their saved address or
+  // phone at checkout), so the driver can navigate. Null: address text only.
+  deliveryLatitude        Decimal?       @map("delivery_latitude") @db.Decimal(9, 6)
+  deliveryLongitude       Decimal?       @map("delivery_longitude") @db.Decimal(9, 6)
   status                  OrderStatus    @default(AWAITING_PAYMENT)
   deliveryAddress         String         @map("delivery_address")
   proofOfDeliveryImageUrl String?        @map("proof_of_delivery_image_url")
@@ -1244,6 +1249,28 @@ enum CheckoutPaymentStatus {
   DUPLICATE
   // A payment that had to be given back (e.g. a DUPLICATE), refunded in WiPay.
   REFUNDED
+}
+
+// A customer's delivery address, saved at sign-up and editable on My
+// Account; checkout fills it in. One per customer for now. latitude /
+// longitude are an optional map pin from the customer's phone, copied onto
+// each order so the driver can navigate there.
+model CustomerAddress {
+  id                   String   @id @default(uuid()) @db.Uuid
+  userId               String   @unique @map("user_id") @db.Uuid
+  addressLine1         String   @map("address_line1")
+  addressLine2         String?  @map("address_line2")
+  town                 String
+  parish               String
+  landmark             String?
+  deliveryInstructions String?  @map("delivery_instructions")
+  latitude             Decimal? @db.Decimal(9, 6)
+  longitude            Decimal? @db.Decimal(9, 6)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("customer_addresses")
 }
 
 // Which service took the payment. ISLEVENDOR_PAY: the Java IsleVendor Pay
