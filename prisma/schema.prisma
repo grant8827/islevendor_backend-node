@@ -123,6 +123,10 @@ enum PayoutMethod {
 enum DocumentVerificationStatus {
   VERIFIED
   NAME_MISMATCH
+  // Something other than the name didn't match what the applicant entered:
+  // the TRN on a TRN card, the plate on a vehicle document, the address on
+  // a proof of address. Flagged for an admin, not blocked.
+  DETAILS_MISMATCH
   EXPIRED
   NEEDS_REVIEW
 }
@@ -213,34 +217,44 @@ model Warehouse {
   location    Unsupported("geometry(Point, 4326)")
 
   // ── ISLE-101: warehouse hub onboarding fields ──
-  legalBusinessName String?         @map("legal_business_name")
-  trn               String?         @map("trn")
-  gctNumber         String?         @map("gct_number")
-  contactName       String?         @map("contact_name")
-  contactPhone      String?         @map("contact_phone")
-  contactEmail      String?         @map("contact_email")
-  town              String?         @map("town")
-  coverageParishes  String[]        @default([]) @map("coverage_parishes")
-  storageSqFt       Int?            @map("storage_sq_ft")
-  loadingBayCount   Int?            @map("loading_bay_count")
-  operatingHours    String?         @map("operating_hours")
-  storageTypes      String[]        @default([]) @map("storage_types")
-  securityControls  String[]        @default([]) @map("security_controls")
-  payoutMethod      PayoutMethod?   @map("payout_method")
-  bankName          String?         @map("bank_name")
-  accountHolderName String?         @map("account_holder_name")
-  accountNumber     String?         @map("account_number")
-  branchCode        String?         @map("branch_code")
-  lynkWalletId      String?         @map("lynk_wallet_id")
-  cocjDocUrl        String?         @map("cocj_doc_url")
-  trnCardUrl        String?         @map("trn_card_url")
-  proofOfAddressUrl String?         @map("proof_of_address_url")
-  slaAcceptedAt     DateTime?       @map("sla_accepted_at") @db.Timestamptz
+  legalBusinessName                String?                     @map("legal_business_name")
+  trn                              String?                     @map("trn")
+  gctNumber                        String?                     @map("gct_number")
+  contactName                      String?                     @map("contact_name")
+  contactPhone                     String?                     @map("contact_phone")
+  contactEmail                     String?                     @map("contact_email")
+  town                             String?                     @map("town")
+  coverageParishes                 String[]                    @default([]) @map("coverage_parishes")
+  storageSqFt                      Int?                        @map("storage_sq_ft")
+  loadingBayCount                  Int?                        @map("loading_bay_count")
+  operatingHours                   String?                     @map("operating_hours")
+  storageTypes                     String[]                    @default([]) @map("storage_types")
+  securityControls                 String[]                    @default([]) @map("security_controls")
+  payoutMethod                     PayoutMethod?               @map("payout_method")
+  bankName                         String?                     @map("bank_name")
+  accountHolderName                String?                     @map("account_holder_name")
+  accountNumber                    String?                     @map("account_number")
+  branchCode                       String?                     @map("branch_code")
+  lynkWalletId                     String?                     @map("lynk_wallet_id")
+  cocjDocUrl                       String?                     @map("cocj_doc_url")
+  trnCardUrl                       String?                     @map("trn_card_url")
+  proofOfAddressUrl                String?                     @map("proof_of_address_url")
+  // backend-fastapi's reading of each document at sign-up (null for
+  // warehouses created before these checks, or from the dashboard form).
+  // An expired document or a proof of address older than 90 days is
+  // rejected outright; everything else is recorded here for the admin.
+  cocjVerificationStatus           DocumentVerificationStatus? @map("cocj_verification_status")
+  trnCardVerificationStatus        DocumentVerificationStatus? @map("trn_card_verification_status")
+  proofOfAddressVerificationStatus DocumentVerificationStatus? @map("proof_of_address_verification_status")
+  proofOfAddressIssuedOn           DateTime?                   @map("proof_of_address_issued_on") @db.Date
+  // What didn't check out, in plain words, across all three documents.
+  documentProblems                 String[]                    @default([]) @map("document_problems")
+  slaAcceptedAt                    DateTime?                   @map("sla_accepted_at") @db.Timestamptz
   // Existing WarehouseSetupForm (dashboard quick-setup) rows keep the
   // APPROVED default — see the ApplicantStatus doc comment above. The new
   // ISLE-105 onboarding endpoint explicitly overrides this to PENDING_REVIEW.
-  applicantStatus   ApplicantStatus @default(PENDING_REVIEW) @map("applicant_status")
-  referenceId       String?         @unique @map("reference_id")
+  applicantStatus                  ApplicantStatus             @default(PENDING_REVIEW) @map("applicant_status")
+  referenceId                      String?                     @unique @map("reference_id")
 
   // The warehouse's own call, not a platform-wide constant: what percentage
   // of their (post-discount) wholesale price a reseller earns for selling
@@ -741,6 +755,18 @@ model ApplicationMessage {
   @@map("application_messages")
 }
 
+enum ProofOfDeliveryType {
+  PACKAGE_WITH_ID
+  PACKAGE_WITH_RECIPIENT
+}
+
+enum ProofOfDeliveryCheck {
+  PASSED
+  FLAGGED
+  // The AI service couldn't be reached, or the photo isn't stored locally.
+  NOT_CHECKED
+}
+
 enum OrderStatus {
   // Not in the original spec's enum: an order exists (stock is reserved) the
   // moment checkout starts, but it must not enter the warehouse's PACKING
@@ -793,32 +819,38 @@ model Order {
   // How it reaches the customer, chosen at checkout. Only ISLEDASH orders
   // go to drivers; the other two are completed by the seller (see
   // dispatch.routes.ts's POST /orders/:id/complete).
-  deliveryMethod          DeliveryMethod @default(ISLEDASH) @map("delivery_method")
+  deliveryMethod          DeliveryMethod        @default(ISLEDASH) @map("delivery_method")
   // The seller's own delivery charge on a SELLER_DELIVERY order — paid to the
   // seller, unlike driverFeeJmd, which is held for an IsleDash driver. Zero
   // for every other method.
-  sellerDeliveryFeeJmd    Decimal        @default(0) @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
+  sellerDeliveryFeeJmd    Decimal               @default(0) @map("seller_delivery_fee_jmd") @db.Decimal(12, 2)
   // Orders for one seller placed in the same checkout share one shipping
   // charge — first item full, extras at the multi-item rate — split across
   // them; this ties them together. Null for orders placed one at a time.
-  checkoutGroupId         String?        @map("checkout_group_id") @db.Uuid
+  checkoutGroupId         String?               @map("checkout_group_id") @db.Uuid
   // The customer's map pin for this delivery (from their saved address or
   // phone at checkout), so the driver can navigate. Null: address text only.
-  deliveryLatitude        Decimal?       @map("delivery_latitude") @db.Decimal(9, 6)
-  deliveryLongitude       Decimal?       @map("delivery_longitude") @db.Decimal(9, 6)
-  status                  OrderStatus    @default(AWAITING_PAYMENT)
-  deliveryAddress         String         @map("delivery_address")
-  proofOfDeliveryImageUrl String?        @map("proof_of_delivery_image_url")
+  deliveryLatitude        Decimal?              @map("delivery_latitude") @db.Decimal(9, 6)
+  deliveryLongitude       Decimal?              @map("delivery_longitude") @db.Decimal(9, 6)
+  status                  OrderStatus           @default(AWAITING_PAYMENT)
+  deliveryAddress         String                @map("delivery_address")
+  proofOfDeliveryImageUrl String?               @map("proof_of_delivery_image_url")
+  // What the driver says the proof photo shows, and backend-fastapi's look
+  // at it: FLAGGED when it couldn't see the person or ID it should show
+  // (the delivery still goes through; the seller and admin are told).
+  proofOfDeliveryType     ProofOfDeliveryType?  @map("proof_of_delivery_type")
+  proofOfDeliveryCheck    ProofOfDeliveryCheck? @map("proof_of_delivery_check")
+  proofOfDeliveryNote     String?               @map("proof_of_delivery_note")
   // When the driver actually marked it DELIVERED — distinct from createdAt
   // (order placement time). Powers the driver's Delivered tab and lets the
   // seller-side Orders view show when it landed, not just that it did.
-  deliveredAt             DateTime?      @map("delivered_at") @db.Timestamptz
+  deliveredAt             DateTime?             @map("delivered_at") @db.Timestamptz
   // WiPay's transaction for the payment that paid this order — shared by
   // every order paid in the same checkout.
-  wipayTransactionId      String?        @map("wipay_transaction_id")
+  wipayTransactionId      String?               @map("wipay_transaction_id")
   // The current payment attempt for this order (see CheckoutPayment).
-  checkoutPaymentId       String?        @map("checkout_payment_id") @db.Uuid
-  createdAt               DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  checkoutPaymentId       String?               @map("checkout_payment_id") @db.Uuid
+  createdAt               DateTime              @default(now()) @map("created_at") @db.Timestamptz
 
   customer       User                 @relation("OrderCustomer", fields: [customerId], references: [id])
   driver         User?                @relation("OrderDriver", fields: [driverId], references: [id])

@@ -69,7 +69,7 @@ describe('payouts', () => {
   }
 
   const deliver = (orderId: string, driver: TestUser) =>
-    call('POST', `/dispatch/orders/${orderId}/delivered`, driver, { proofOfDeliveryImageUrl: 'private-kyc://proof.jpg' });
+    call('POST', `/dispatch/orders/${orderId}/delivered`, driver, { proofOfDeliveryImageUrl: 'private-kyc://proof.jpg', proofType: 'PACKAGE_WITH_ID', confirmed: true });
 
   describe('driver earnings', () => {
     it("moves the IsleDash fee to the driver's own account on delivery", async () => {

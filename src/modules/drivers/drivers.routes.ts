@@ -79,8 +79,10 @@ driversRouter.get('/me/document-alerts', requireAuth, requireRole(UserRole.DRIVE
 
 // The driver's own Delivery/Delivered tabs (DeliveryPanel.jsx): orders
 // assigned to them (Order.driverId — set by dispatch.gateway.ts's
-// driver:acceptJob), split by status. `inProgress` is PICKED_UP — accepted
-// but not yet handed over; `delivered` is DELIVERED, most recent first,
+// driver:acceptJob or a label scan), split by status. `inProgress` is
+// everything not yet handed over: accepted but still at the seller
+// (READY_FOR_PICKUP — scan the label to pick it up) and on the way
+// (PICKED_UP — mark it delivered); `delivered` is DELIVERED, most recent first,
 // capped since a long-tenured driver's full history isn't what this tab is
 // for (that's a future "delivery history" concern, not asked for here).
 const DELIVERED_HISTORY_LIMIT = 50;
@@ -91,12 +93,13 @@ driversRouter.get('/me/deliveries', requireAuth, requireRole(UserRole.DRIVER, Us
       customer: { select: { fullName: true, phoneNumber: true } },
       items: ITEMS_IN_ORDER,
       resellerStore: { select: { storeName: true } },
-      shop: { select: { shopName: true } },
+      shop: { select: { shopName: true, addressLine: true, pickupAddress: true, parish: true } },
+      warehouse: { select: { name: true, addressLine: true, parish: true } },
     } as const;
 
     const [inProgress, delivered] = await Promise.all([
       prisma.order.findMany({
-        where: { driverId: req.user!.sub, status: 'PICKED_UP' },
+        where: { driverId: req.user!.sub, status: { in: ['READY_FOR_PICKUP', 'PICKED_UP'] } },
         include,
         orderBy: { createdAt: 'asc' }, // oldest-accepted first — first in line to deliver
       }),
@@ -110,6 +113,8 @@ driversRouter.get('/me/deliveries', requireAuth, requireRole(UserRole.DRIVER, Us
 
     const normalize = (o: (typeof inProgress)[number]) => ({
       id: o.id,
+      // READY_FOR_PICKUP: go to the seller and scan the label; PICKED_UP: on the way.
+      status: o.status,
       itemTitle: summarizeItems(o.items),
       itemImageUrl: o.items[0]?.imageUrl ?? null,
       items: o.items.map(toItemView),
@@ -122,6 +127,11 @@ driversRouter.get('/me/deliveries', requireAuth, requireRole(UserRole.DRIVER, Us
       createdAt: o.createdAt,
       deliveredAt: o.deliveredAt,
       proofOfDeliveryImageUrl: o.proofOfDeliveryImageUrl,
+      proofOfDeliveryType: o.proofOfDeliveryType,
+      proofOfDeliveryCheck: o.proofOfDeliveryCheck,
+      // Where to collect it.
+      pickupFrom: o.shop ? o.shop.shopName : (o.warehouse?.name ?? null),
+      pickupAddress: o.shop ? `${o.shop.pickupAddress || o.shop.addressLine}, ${o.shop.parish}` : o.warehouse ? `${o.warehouse.addressLine}, ${o.warehouse.parish}` : null,
     });
 
     res.json({ inProgress: inProgress.map(normalize), delivered: delivered.map(normalize) });

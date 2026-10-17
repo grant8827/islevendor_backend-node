@@ -117,7 +117,9 @@ export function registerDispatchGateway(io: Server) {
           return;
         }
 
-        const claimed = await claimJobForDriver(io, orderId, user.sub, 'Picked up by driver');
+        // Accepting assigns the job; the package is only picked up once the
+        // driver scans its label at the seller (POST /orders/:id/scan-pickup).
+        const claimed = await claimJobForDriver(io, orderId, user.sub, 'Accepted by the driver — on the way to collect it', { pickedUp: false });
         socket.emit(claimed ? 'JOB_ASSIGNED' : 'JOB_OFFER_EXPIRED', { orderId });
       } catch (err) {
         console.error('[dispatch] driver:acceptJob failed', err);
@@ -128,31 +130,38 @@ export function registerDispatchGateway(io: Server) {
 }
 
 /**
- * Atomically assigns `orderId` to `driverId` and flips it PICKED_UP — the
- * `driverId: null` guard in this update is the actual race-decider (Postgres
- * only lets one concurrent request succeed), not a pre-check, since a
- * pre-check-then-write would itself race between two drivers claiming the
- * same job in the same instant. Shared by two claim paths: the in-app
- * `driver:acceptJob` socket event above, and dispatch.routes.ts's POST
- * /orders/:id/scan-pickup (the QR code printed on the shipping label —
- * see printLabel.js — for a driver who never got/used the in-app offer).
+ * Atomically assigns `orderId` to `driverId` — the `driverId: null` guard in
+ * this update is the actual race-decider (Postgres only lets one concurrent
+ * request succeed), not a pre-check, since a pre-check-then-write would
+ * itself race between two drivers claiming the same job in the same instant.
+ * Shared by two claim paths: the in-app `driver:acceptJob` socket event
+ * above, which only assigns the job (`pickedUp: false` — the order stays
+ * READY_FOR_PICKUP until the driver scans the label), and dispatch.routes.ts's
+ * POST /orders/:id/scan-pickup, where a driver holding a package nobody had
+ * accepted claims and picks it up in one step (`pickedUp: true`).
  * Returns false if the job was already claimed by someone else.
  *
  * Callers are responsible for authorizing `driverId` first — the socket path
  * by offer membership, the QR path by a signed pickup token.
  */
-export async function claimJobForDriver(io: Server, orderId: string, driverId: string, note: string): Promise<boolean> {
+export async function claimJobForDriver(
+  io: Server,
+  orderId: string,
+  driverId: string,
+  note: string,
+  { pickedUp }: { pickedUp: boolean },
+): Promise<boolean> {
   // One transaction, so an order can never end up assigned without its
-  // PICKED_UP tracking event (or vice versa).
+  // tracking event (or vice versa).
   const claimed = await prisma.$transaction(async (tx) => {
     const result = await tx.order.updateMany({
       // Only IsleDash orders are a driver's to take — a pickup or the
       // seller's own delivery never is, whatever a client sends.
       where: { id: orderId, status: 'READY_FOR_PICKUP', driverId: null, deliveryMethod: 'ISLEDASH' },
-      data: { driverId, status: 'PICKED_UP' },
+      data: pickedUp ? { driverId, status: 'PICKED_UP' } : { driverId },
     });
     if (result.count === 0) return false;
-    await logTrackingEvent(tx, orderId, 'PICKED_UP', { note, postedBy: driverId });
+    await logTrackingEvent(tx, orderId, pickedUp ? 'PICKED_UP' : 'READY_FOR_PICKUP', { note, postedBy: driverId });
     return true;
   });
   if (!claimed) return false;

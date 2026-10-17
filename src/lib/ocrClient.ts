@@ -2,20 +2,34 @@ import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { env } from '../env.js';
 
-// 'license' | 'insurance' | 'registration' are driver-onboarding documents;
-// 'photo_id' covers the reseller/small-vendor onboarding flows' own personal
-// photo ID upload (driver's license / passport / voter ID / government ID) —
-// same shape of check (name-on-file match + expiry), different upload field.
-export type KycDocumentType = 'license' | 'insurance' | 'registration' | 'photo_id';
+// 'license' | 'insurance' | 'registration' are a driver's documents;
+// 'photo_id' is a reseller's or small vendor's own photo ID; 'trn_card' |
+// 'business_registration' | 'proof_of_address' are a warehouse's.
+export type KycDocumentType = 'license' | 'insurance' | 'registration' | 'photo_id' | 'trn_card' | 'business_registration' | 'proof_of_address';
 
 export interface DocumentCheckResult {
-  status: 'verified' | 'name_mismatch' | 'expired' | 'needs_review';
+  // expired and stale (a proof of address over 90 days old) are objective
+  // date checks the onboarding routes block on; name_mismatch and
+  // details_mismatch are findings for an admin; needs_review means the
+  // document couldn't be read confidently.
+  status: 'verified' | 'name_mismatch' | 'details_mismatch' | 'expired' | 'stale' | 'needs_review';
   documentType: KycDocumentType;
   extractedName: string | null;
   nameMatch: boolean | null;
   nameMatchScore: number | null;
   expiryDate: string | null; // ISO date (YYYY-MM-DD)
   isExpired: boolean | null;
+  documentDate: string | null; // proof of address: when it was issued
+  problems: string[];
+}
+
+/** What else to check the document against, beyond the applicant's name. */
+export interface DocumentExpectations {
+  // Another name it may be in — a business document in the owner's name.
+  alternateName?: string;
+  trn?: string;
+  plate?: string;
+  address?: string;
 }
 
 // Used when the FastAPI OCR service can't be reached, times out, or returns
@@ -32,6 +46,8 @@ function serviceUnavailableResult(documentType: KycDocumentType): DocumentCheckR
     nameMatchScore: null,
     expiryDate: null,
     isExpired: null,
+    documentDate: null,
+    problems: ['The document check service was unavailable'],
   };
 }
 
@@ -42,22 +58,23 @@ interface VerifyDocumentApiResponse {
   name_match_score: number | null;
   expiry_date: string | null;
   is_expired: boolean | null;
+  document_date?: string | null;
+  problems?: string[];
 }
 
 /**
- * Calls the FastAPI OCR service (backend-fastapi/app/routers/ocr.py) to
- * extract the holder name and expiry date off an onboarding KYC document
- * image/PDF, and check the name against `expectedName` (the applicant's
- * registered legal name). Used by the onboarding routes (driver, reseller,
- * small-vendor) to decide whether to accept an uploaded document — see
- * onboarding.routes.ts's verifyRequiredDocument for what happens with each
- * status.
+ * Calls the FastAPI OCR service (backend-fastapi/app/routers/ocr.py) to read
+ * an onboarding document image/PDF and check it against what the applicant
+ * entered: their name, and per document the TRN, licence plate or address.
+ * See onboarding.routes.ts's verifyRequiredDocument for what happens with
+ * each status.
  */
 export async function verifyKycDocument(
   filePath: string,
   mimeType: string,
   documentType: KycDocumentType,
   expectedName: string,
+  expect: DocumentExpectations = {},
 ): Promise<DocumentCheckResult> {
   let fileBuffer: Buffer;
   try {
@@ -70,6 +87,10 @@ export async function verifyKycDocument(
   const form = new FormData();
   form.append('document_type', documentType);
   form.append('expected_name', expectedName);
+  if (expect.alternateName) form.append('alternate_name', expect.alternateName);
+  if (expect.trn) form.append('expected_trn', expect.trn);
+  if (expect.plate) form.append('expected_plate', expect.plate);
+  if (expect.address) form.append('expected_address', expect.address);
   form.append('image', new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), path.basename(filePath));
 
   try {
@@ -87,9 +108,43 @@ export async function verifyKycDocument(
       nameMatchScore: data.name_match_score,
       expiryDate: data.expiry_date,
       isExpired: data.is_expired,
+      documentDate: data.document_date ?? null,
+      problems: data.problems ?? [],
     };
   } catch (err) {
     console.error(`[ocrClient] OCR service call failed for ${documentType} document:`, err);
     return serviceUnavailableResult(documentType);
+  }
+}
+
+export type ProofType = 'PACKAGE_WITH_ID' | 'PACKAGE_WITH_RECIPIENT';
+
+export interface DeliveryPhotoCheck {
+  check: 'PASSED' | 'FLAGGED' | 'NOT_CHECKED';
+  note: string | null;
+}
+
+/**
+ * Asks the AI service whether a proof-of-delivery photo shows what the
+ * driver says it does (the recipient, or their ID). Never throws and never
+ * blocks: an unreachable service is NOT_CHECKED, and the delivery goes
+ * through either way — a flagged photo is for a person to look at.
+ */
+export async function checkDeliveryPhoto(filePath: string, mimeType: string, proofType: ProofType): Promise<DeliveryPhotoCheck> {
+  try {
+    const fileBuffer = await readFile(filePath);
+    const form = new FormData();
+    form.append('proof_type', proofType);
+    form.append('image', new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), path.basename(filePath));
+    const res = await fetch(`${env.AI_SERVICE_URL}/ocr/delivery-photo`, { method: 'POST', body: form, signal: AbortSignal.timeout(20_000) });
+    if (!res.ok) {
+      console.error(`[ocrClient] delivery photo check returned ${res.status}`);
+      return { check: 'NOT_CHECKED', note: 'The photo check service was unavailable' };
+    }
+    const data = (await res.json()) as { status: 'passed' | 'flagged'; reason: string | null };
+    return data.status === 'passed' ? { check: 'PASSED', note: null } : { check: 'FLAGGED', note: data.reason ?? 'The photo needs a look' };
+  } catch (err) {
+    console.error('[ocrClient] delivery photo check failed:', err);
+    return { check: 'NOT_CHECKED', note: 'The photo check service was unavailable' };
   }
 }

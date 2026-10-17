@@ -93,6 +93,11 @@ export interface WarehouseApplicantInput extends ApplicantAccountInput {
   cocjDocUrl: string;
   trnCardUrl: string;
   proofOfAddressUrl: string;
+  cocjVerificationStatus?: DocumentVerificationStatus;
+  trnCardVerificationStatus?: DocumentVerificationStatus;
+  proofOfAddressVerificationStatus?: DocumentVerificationStatus;
+  proofOfAddressIssuedOn?: Date;
+  documentProblems?: string[];
 }
 
 export async function registerWarehouseApplicant(input: WarehouseApplicantInput) {
@@ -139,6 +144,11 @@ export async function registerWarehouseApplicant(input: WarehouseApplicantInput)
           cocjDocUrl: input.cocjDocUrl,
           trnCardUrl: input.trnCardUrl,
           proofOfAddressUrl: input.proofOfAddressUrl,
+          cocjVerificationStatus: input.cocjVerificationStatus,
+          trnCardVerificationStatus: input.trnCardVerificationStatus,
+          proofOfAddressVerificationStatus: input.proofOfAddressVerificationStatus,
+          proofOfAddressIssuedOn: input.proofOfAddressIssuedOn,
+          documentProblems: input.documentProblems ?? [],
           slaAcceptedAt: new Date(),
           applicantStatus: 'PENDING_REVIEW',
           referenceId,
