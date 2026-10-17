@@ -181,6 +181,36 @@ describe('QR pickup claims', () => {
       assert.equal(await assignedDriver(order.id), driver.id);
     });
 
+    it('picks up a job the driver accepted in the app when they scan its label', async () => {
+      const driver = await courier();
+      const order = await readyOrder();
+      await prisma.order.update({ where: { id: order.id }, data: { driverId: driver.id } }); // accepted in the app
+      const { token } = (await issue(order.id)).body;
+
+      // Accepting isn't picking up: no token, no pickup.
+      assert.equal((await scan(order.id, driver)).status, 403);
+      assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).status, 'READY_FOR_PICKUP');
+
+      const res = await scan(order.id, driver, token);
+      assert.equal(res.status, 200);
+      const updated = await prisma.order.findUniqueOrThrow({ where: { id: order.id }, include: { trackingEvents: true } });
+      assert.equal(updated.status, 'PICKED_UP');
+      assert.equal(updated.driverId, driver.id);
+      assert.equal(updated.trackingEvents.filter((e) => e.status === 'PICKED_UP').length, 1);
+    });
+
+    it("refuses a scan of a job another driver accepted, even with the label", async () => {
+      const [driver, other] = await Promise.all([courier(), courier()]);
+      const order = await readyOrder();
+      await prisma.order.update({ where: { id: order.id }, data: { driverId: driver.id } });
+      const { token } = (await issue(order.id)).body;
+
+      assert.equal((await scan(order.id, other, token)).status, 403);
+      const updated = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+      assert.equal(updated.driverId, driver.id);
+      assert.equal(updated.status, 'READY_FOR_PICKUP');
+    });
+
     it('assigns exactly one driver when several scan the same label at once', async () => {
       const drivers = await Promise.all(Array.from({ length: 6 }, () => courier()));
       const order = await readyOrder();

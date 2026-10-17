@@ -37,6 +37,28 @@ const privateKycStorage = multer.diskStorage({
   },
 });
 
+const IMAGE_TYPES_BY_EXTENSION: Record<string, string> = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif' };
+
+/**
+ * The file on this server behind a URL that /uploads/image returned, or
+ * null if the URL isn't one of ours (another host, a path outside the
+ * uploads folder). Only the last path segment is used, so a crafted URL
+ * can't reach anything outside UPLOADS_DIR.
+ */
+export function localUpload(url: string): { path: string; mimeType: string } | null {
+  let pathname: string;
+  try {
+    pathname = new URL(url, 'http://local').pathname;
+  } catch {
+    return null;
+  }
+  if (!pathname.startsWith('/uploads/')) return null;
+  const name = path.basename(pathname);
+  const mimeType = IMAGE_TYPES_BY_EXTENSION[path.extname(name).toLowerCase()];
+  if (!mimeType || !/^[\w-]+\.\w+$/.test(name)) return null;
+  return { path: path.join(UPLOADS_DIR, name), mimeType };
+}
+
 const upload = multer({
   storage: publicStorage,
   limits: { fileSize: MAX_FILE_SIZE_BYTES },

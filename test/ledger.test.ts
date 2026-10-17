@@ -135,7 +135,7 @@ describe('ledger integrity', () => {
     api(server, `/dispatch/orders/${orderId}/delivered`, {
       method: 'POST',
       token: user.token,
-      body: { proofOfDeliveryImageUrl: 'private-kyc://proof.jpg' },
+      body: { proofOfDeliveryImageUrl: 'private-kyc://proof.jpg', proofType: 'PACKAGE_WITH_RECIPIENT', confirmed: true },
     });
 
   describe('WiPay payments', () => {

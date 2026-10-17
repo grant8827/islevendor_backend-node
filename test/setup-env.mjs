@@ -51,6 +51,10 @@ Object.assign(process.env, {
   WIPAY_PAYOUT_API_KEY: '',
   WIPAY_PAYOUT_WEBHOOK_SECRET: '',
   WIPAY_PAYOUTS_LIVE_AUTHORIZED: 'false',
+  // The AI service (backend-fastapi). Nothing listens here unless a test
+  // starts its own fake on this port (see delivery.proof.test.ts), so no
+  // test ever reaches a real OCR service running on the developer's machine.
+  AI_SERVICE_URL: 'http://127.0.0.1:18001',
   PAYMENTS_PROVIDER: 'node',
   ISLEVENDOR_PAY_INTERNAL_URL: '',
   ISLEVENDOR_PAY_SERVICE_TOKEN: '',

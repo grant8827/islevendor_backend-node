@@ -8,7 +8,7 @@ import { HttpError } from '../../middleware/errorHandler.js';
 import { kycUpload } from '../uploads/uploads.routes.js';
 import { trnSchema } from '../../lib/trn.js';
 import { PARISHES, type Parish } from '../../lib/parishes.js';
-import { verifyKycDocument, type KycDocumentType, type DocumentCheckResult } from '../../lib/ocrClient.js';
+import { verifyKycDocument, type DocumentExpectations, type KycDocumentType, type DocumentCheckResult } from '../../lib/ocrClient.js';
 import { recordAuditEvent } from '../../lib/audit.js';
 import {
   deleteDocument,
@@ -60,42 +60,55 @@ function requireFileUrl(files: UploadedFiles, field: string, label: string): str
 }
 
 // Runs the FastAPI OCR check (src/lib/ocrClient.ts) on one required
-// onboarding KYC document — driver's license/insurance/registration, or a
-// reseller/small-vendor's own photo ID. Only an *expired* document is
-// rejected outright, before any account/profile is created — that's an
-// objective date comparison once a date is found. A name mismatch is NOT
-// rejected here: name-on-document extraction is far more error-prone (fonts,
-// middle names, maiden names, business-owned vehicles), so a false mismatch
-// would wrongly lock out a legitimate applicant with no recourse. Instead
-// it's stored as a flag (see toDocumentVerificationStatus) for the admin
-// reviewing the application in the /pending queue to check against the
-// actual document themselves. A document the OCR service couldn't
-// confidently read at all (`needs_review`) is likewise not rejected — see
-// ocrClient.ts's serviceUnavailableResult doc comment.
+// onboarding document — a driver's license/insurance/registration, a
+// reseller/small-vendor's own photo ID, or a warehouse's TRN card, COCJ
+// business registration and proof of address. Only objective date failures
+// are rejected outright, before any account/profile is created: an
+// *expired* document, or a proof of address issued more than 90 days ago.
+// A name or details mismatch (TRN, licence plate, address) is NOT rejected:
+// OCR on phone photos misreads fonts, middle names, maiden names, business-
+// owned vehicles and digits, so a false mismatch would wrongly lock out a
+// legitimate applicant with no recourse. Instead it's stored as a flag (see
+// toDocumentVerificationStatus) for the admin reviewing the application in
+// the /pending queue to check against the actual document. A document the
+// OCR service couldn't confidently read at all (`needs_review`) is likewise
+// not rejected — see ocrClient.ts's serviceUnavailableResult doc comment.
 async function verifyRequiredDocument(
   files: UploadedFiles,
   field: string,
   documentType: KycDocumentType,
   label: string,
   expectedName: string,
+  expect: DocumentExpectations = {},
 ): Promise<DocumentCheckResult> {
   const file = files[field]?.[0];
   if (!file) throw new HttpError(400, `${label} is required`);
 
-  const result = await verifyKycDocument(file.path, file.mimetype, documentType, expectedName);
+  const result = await verifyKycDocument(file.path, file.mimetype, documentType, expectedName, expect);
 
   if (result.status === 'expired') {
     throw new HttpError(400, `${label} has expired — upload a current one.`);
   }
+  if (result.status === 'stale') {
+    throw new HttpError(400, `${label} is more than 3 months old — upload one issued in the last 3 months.`);
+  }
   return result;
 }
 
-function toDocumentVerificationStatus(status: DocumentCheckResult['status']): 'VERIFIED' | 'NAME_MISMATCH' | 'NEEDS_REVIEW' {
-  // Only reachable with 'verified', 'name_mismatch', or 'needs_review' —
-  // verifyRequiredDocument above throws before returning 'expired'.
+function toDocumentVerificationStatus(
+  status: DocumentCheckResult['status'],
+): 'VERIFIED' | 'NAME_MISMATCH' | 'DETAILS_MISMATCH' | 'NEEDS_REVIEW' {
+  // 'expired' and 'stale' never get here — verifyRequiredDocument above
+  // throws on them.
   if (status === 'verified') return 'VERIFIED';
   if (status === 'name_mismatch') return 'NAME_MISMATCH';
+  if (status === 'details_mismatch') return 'DETAILS_MISMATCH';
   return 'NEEDS_REVIEW';
+}
+
+/** "TRN card: The TRN doesn't match…" for each problem a check found. */
+function labelledProblems(label: string, result: DocumentCheckResult): string[] {
+  return result.problems.map((p) => `${label}: ${p}`);
 }
 
 const accountSchema = z.object({
@@ -170,15 +183,37 @@ onboardingRouter.post(
       const storageTypes = toArray(req.body.storageTypes);
       const securityControls = toArray(req.body.securityControls);
 
+      // Read all three documents before creating anything. The business's
+      // documents may be in its legal name or the contact person's.
+      const names = { alternateName: input.contactName };
+      const labels = { cocj: 'COCJ business registration document', trn: 'TRN card photo', address: 'Proof of address' };
+      const [cocjCheck, trnCheck, addressCheck] = await Promise.all([
+        verifyRequiredDocument(files, 'cocjDoc', 'business_registration', labels.cocj, input.legalBusinessName, names),
+        verifyRequiredDocument(files, 'trnCard', 'trn_card', labels.trn, input.legalBusinessName, { ...names, trn: input.trn }),
+        verifyRequiredDocument(files, 'proofOfAddress', 'proof_of_address', labels.address, input.legalBusinessName, {
+          ...names,
+          address: `${input.addressLine} ${input.town}`,
+        }),
+      ]);
+
       const result = await registerWarehouseApplicant({
         ...input,
         contactEmail: input.contactEmail || undefined,
         coverageParishes,
         storageTypes,
         securityControls,
-        cocjDocUrl: requireFileUrl(files, 'cocjDoc', 'COCJ business registration document'),
-        trnCardUrl: requireFileUrl(files, 'trnCard', 'TRN card photo'),
-        proofOfAddressUrl: requireFileUrl(files, 'proofOfAddress', 'Proof of address'),
+        cocjDocUrl: requireFileUrl(files, 'cocjDoc', labels.cocj),
+        trnCardUrl: requireFileUrl(files, 'trnCard', labels.trn),
+        proofOfAddressUrl: requireFileUrl(files, 'proofOfAddress', labels.address),
+        cocjVerificationStatus: toDocumentVerificationStatus(cocjCheck.status),
+        trnCardVerificationStatus: toDocumentVerificationStatus(trnCheck.status),
+        proofOfAddressVerificationStatus: toDocumentVerificationStatus(addressCheck.status),
+        proofOfAddressIssuedOn: addressCheck.documentDate ? new Date(addressCheck.documentDate) : undefined,
+        documentProblems: [
+          ...labelledProblems('COCJ registration', cocjCheck),
+          ...labelledProblems('TRN card', trnCheck),
+          ...labelledProblems('Proof of address', addressCheck),
+        ],
       });
 
       res.status(201).json({ ...result, status: 'PENDING_REVIEW' });
@@ -307,12 +342,14 @@ onboardingRouter.post(
       if (zoneParishes.length < 1) throw new HttpError(400, 'Select at least one operating zone parish');
 
       // Name-match + expiry check against the applicant's own registered
-      // name (input.fullName) — run before creating any account/profile so
-      // a rejected document never gets partially onboarded.
+      // name (input.fullName), and the plate on the vehicle's papers — run
+      // before creating any account/profile so a rejected document never
+      // gets partially onboarded.
       const [licenseCheck, insuranceCheck, registrationCheck] = await Promise.all([
         verifyRequiredDocument(files, 'licensePhoto', 'license', "Driver's license photo", input.fullName),
-        verifyRequiredDocument(files, 'insuranceCert', 'insurance', 'Certificate of insurance', input.fullName),
-        verifyRequiredDocument(files, 'registrationCert', 'registration', 'Certificate of registration', input.fullName),
+        // The vehicle's papers should show the plate the driver entered.
+        verifyRequiredDocument(files, 'insuranceCert', 'insurance', 'Certificate of insurance', input.fullName, { plate: input.licensePlate }),
+        verifyRequiredDocument(files, 'registrationCert', 'registration', 'Certificate of registration', input.fullName, { plate: input.licensePlate }),
       ]);
 
       const result = await registerDriverApplicant({
@@ -353,7 +390,20 @@ onboardingRouter.get('/pending', requireAuth, requireCurrentAdmin, async (_req, 
     const [warehouses, resellers, vendors, drivers] = await Promise.all([
       prisma.warehouse.findMany({
         where: { applicantStatus: 'PENDING_REVIEW' },
-        select: { id: true, name: true, referenceId: true, town: true, parish: true, user: { select: { email: true, fullName: true } } },
+        select: {
+          id: true,
+          name: true,
+          referenceId: true,
+          town: true,
+          parish: true,
+          user: { select: { email: true, fullName: true } },
+          // See driverProfile's select below for why these are surfaced.
+          cocjVerificationStatus: true,
+          trnCardVerificationStatus: true,
+          proofOfAddressVerificationStatus: true,
+          proofOfAddressIssuedOn: true,
+          documentProblems: true,
+        },
       }),
       prisma.resellerStore.findMany({
         where: { applicantStatus: 'PENDING_REVIEW' },

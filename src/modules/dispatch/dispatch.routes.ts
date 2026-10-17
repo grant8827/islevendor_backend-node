@@ -15,6 +15,8 @@ import { assertApprovedSeller } from '../../lib/eligibility.js';
 import { releaseEscrowForOrder } from '../ledger/ledger.service.js';
 import { ITEMS_IN_ORDER, toItemView } from '../../lib/orderItems.js';
 import { consumePickupToken, issuePickupToken, verifyPickupToken } from '../../lib/pickupToken.js';
+import { checkDeliveryPhoto } from '../../lib/ocrClient.js';
+import { localUpload } from '../uploads/uploads.routes.js';
 
 export const dispatchRouter = Router();
 
@@ -127,14 +129,34 @@ dispatchRouter.post('/orders/:id/ready', requireAuth, requireRole(UserRole.WAREH
   }
 });
 
+const deliveredSchema = z.object({
+  proofOfDeliveryImageUrl: z.string().min(1, 'proofOfDeliveryImageUrl is required').max(500),
+  // What the photo shows: the package with the recipient's ID, or with the
+  // recipient. The driver picks one and confirms the photo shows it.
+  proofType: z.enum(['PACKAGE_WITH_ID', 'PACKAGE_WITH_RECIPIENT'], {
+    message: 'Say what the photo shows: the package with the recipient, or with their ID',
+  }),
+  confirmed: z.literal(true, { message: 'Confirm the photo clearly shows the package and the recipient or their ID' }),
+});
+
+const PROOF_LABELS = { PACKAGE_WITH_ID: "the package with the recipient's ID", PACKAGE_WITH_RECIPIENT: 'the package with the recipient' } as const;
+
 dispatchRouter.post('/orders/:id/delivered', requireAuth, requireRole(UserRole.DRIVER, UserRole.ADMIN), async (req, res, next) => {
   try {
-    const { proofOfDeliveryImageUrl } = req.body as { proofOfDeliveryImageUrl?: string };
-    if (!proofOfDeliveryImageUrl) throw new HttpError(400, 'proofOfDeliveryImageUrl is required');
+    const { proofOfDeliveryImageUrl, proofType } = deliveredSchema.parse(req.body ?? {});
 
     const order = await prisma.order.findUnique({ where: { id: String(req.params.id) } });
     if (!order) throw new HttpError(404, 'Order not found');
     if (order.driverId !== req.user!.sub) throw new HttpError(403, 'You are not assigned to this order');
+    if (order.status !== 'PICKED_UP') {
+      throw new HttpError(409, `This order can't be marked delivered (status: ${order.status.replaceAll('_', ' ')}) — scan the label when you collect it first`);
+    }
+
+    // backend-fastapi looks for the person or ID the photo should show. It
+    // never blocks the delivery — a FLAGGED photo is for the seller and an
+    // admin to look at (a dark doorstep shouldn't leave a driver stuck).
+    const file = localUpload(proofOfDeliveryImageUrl);
+    const photo = file ? await checkDeliveryPhoto(file.path, file.mimeType, proofType) : { check: 'NOT_CHECKED' as const, note: 'The photo isn’t stored on this server' };
 
     const updated = await prisma.$transaction(async (tx) => {
       // PICKED_UP -> DELIVERED, once. The status condition is the
@@ -143,12 +165,20 @@ dispatchRouter.post('/orders/:id/delivered', requireAuth, requireRole(UserRole.D
       // never for one that was refunded or isn't out for delivery.
       const delivered = await tx.order.updateMany({
         where: { id: order.id, driverId: req.user!.sub, status: 'PICKED_UP' },
-        data: { status: 'DELIVERED', proofOfDeliveryImageUrl, deliveredAt: new Date() },
+        data: {
+          status: 'DELIVERED',
+          proofOfDeliveryImageUrl,
+          proofOfDeliveryType: proofType,
+          proofOfDeliveryCheck: photo.check,
+          proofOfDeliveryNote: photo.note,
+          deliveredAt: new Date(),
+        },
       });
       if (delivered.count === 0) {
         throw new HttpError(409, `This order can't be marked delivered (status: ${order.status.replaceAll('_', ' ')})`);
       }
-      await logTrackingEvent(tx, order.id, 'DELIVERED', { note: 'Delivered', postedBy: req.user!.sub });
+      const flagged = photo.check === 'FLAGGED' ? ` — photo flagged for a look: ${photo.note}` : '';
+      await logTrackingEvent(tx, order.id, 'DELIVERED', { note: `Delivered — photo of ${PROOF_LABELS[proofType]}${flagged}`, postedBy: req.user!.sub });
 
       await releaseEscrowForOrder(tx, order.id);
 
@@ -164,6 +194,7 @@ dispatchRouter.post('/orders/:id/delivered', requireAuth, requireRole(UserRole.D
     getSocketServer().to(room).emit('ORDER_DELIVERED', {
       orderId: updated.id,
       proofOfDeliveryImageUrl: updated.proofOfDeliveryImageUrl,
+      proofOfDeliveryCheck: updated.proofOfDeliveryCheck,
       deliveredAt: updated.deliveredAt,
     });
 
@@ -223,21 +254,25 @@ const scanPickupSchema = z.object({
 });
 
 // Confirms physical pickup by scanning the QR code printed on the shipping
-// label (see printLabel.js) — a second path into PICKED_UP alongside the
-// in-app driver:acceptJob accept, for a driver who's physically holding the
-// box but never got (or acted on) the in-app JOB_OFFER. Whoever scans first
-// claims it, same as accepting in-app (see claimJobForDriver); re-scanning
-// by the same already-assigned driver is a harmless no-op that just returns
-// the order again, so this page can be safely reloaded/rescanned.
+// label (see printLabel.js) — the only way an IsleDash order becomes
+// PICKED_UP. Two cases:
+//  - The driver accepted the job in the app (it's assigned to them, still
+//    READY_FOR_PICKUP): scanning at the seller marks it picked up.
+//  - Nobody has the job yet, and a driver holding the box scans it: they
+//    claim it and pick it up in one step. Whoever scans first wins, same as
+//    accepting in-app (see claimJobForDriver).
+// Re-scanning a package already picked up by the same driver is a harmless
+// no-op that just returns the order again, so the scan can be retried.
 //
-// Claiming needs the label's signed token, not just the order id in the URL
-// — the token is the proof of holding the physical label — and it's burned
-// on the first successful claim. Every failure a non-assigned caller can hit
+// Picking up needs the label's signed token, not just the order id in the
+// URL — the token is the proof of holding the physical label — and it's
+// burned on success. Every failure a caller without the package can hit
 // returns the same 403, so this endpoint can't be used to probe order ids.
 dispatchRouter.post('/orders/:id/scan-pickup', requireAuth, requireRole(UserRole.DRIVER), async (req, res, next) => {
   try {
     const orderId = String(req.params.id);
     const { token } = scanPickupSchema.parse(req.body ?? {});
+    const driverId = req.user!.sub;
     const denied = new HttpError(403, 'This pickup code is invalid or has expired — ask the seller to reprint the label');
 
     if (!(await isEligibleDriver(req.user!))) {
@@ -245,22 +280,38 @@ dispatchRouter.post('/orders/:id/scan-pickup', requireAuth, requireRole(UserRole
     }
 
     const order = /^[0-9a-f-]{36}$/i.test(orderId) ? await prisma.order.findUnique({ where: { id: orderId } }) : null;
-    const alreadyMine = order?.status === 'PICKED_UP' && order.driverId === req.user!.sub;
+    const alreadyPickedUp = order?.status === 'PICKED_UP' && order.driverId === driverId;
 
-    if (!alreadyMine) {
+    if (!alreadyPickedUp) {
       const nonce = order ? await verifyPickupToken(orderId, token) : null;
       if (!order || !nonce) throw denied;
+      // Someone else accepted this job.
+      if (order.driverId && order.driverId !== driverId) throw denied;
       // Holding the label isn't enough: only a courier this business has
       // accepted may take its packages.
-      if (!(await isAcceptedByOrderSeller(req.user!.sub, order))) {
+      if (!(await isAcceptedByOrderSeller(driverId, order))) {
         throw new HttpError(403, "You aren't one of this business's accepted drivers — apply to deliver for them first");
       }
-
       if (order.status !== 'READY_FOR_PICKUP') {
         throw new HttpError(409, `This package can't be picked up right now (status: ${order.status.replaceAll('_', ' ')})`);
       }
-      const claimed = await claimJobForDriver(getSocketServer(), orderId, req.user!.sub, 'Picked up (QR scan)');
-      if (!claimed) throw new HttpError(409, 'This package was just claimed by another driver');
+
+      if (order.driverId === driverId) {
+        // Accepted in the app earlier; now actually collected.
+        const pickedUp = await prisma.$transaction(async (tx) => {
+          const result = await tx.order.updateMany({
+            where: { id: orderId, driverId, status: 'READY_FOR_PICKUP' },
+            data: { status: 'PICKED_UP' },
+          });
+          if (result.count === 0) return false;
+          await logTrackingEvent(tx, orderId, 'PICKED_UP', { note: 'Picked up — label scanned', postedBy: driverId });
+          return true;
+        });
+        if (!pickedUp) throw new HttpError(409, 'This package was just picked up');
+      } else {
+        const claimed = await claimJobForDriver(getSocketServer(), orderId, driverId, 'Picked up — label scanned', { pickedUp: true });
+        if (!claimed) throw new HttpError(409, 'This package was just claimed by another driver');
+      }
       await consumePickupToken(orderId, nonce);
     }
 

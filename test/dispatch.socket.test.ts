@@ -109,7 +109,7 @@ describe('Socket.IO authorization', () => {
     }
     const assignedDriver = async (orderId: string) => (await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).driverId;
 
-    it('lets an approved driver who was offered the job accept it, once', async () => {
+    it('lets an approved driver who was offered the job accept it, once — assigned, not yet picked up', async () => {
       const driver = await createDriver();
       const order = await readyOrder();
       await offer(order.id, [driver]);
@@ -117,8 +117,9 @@ describe('Socket.IO authorization', () => {
       assert.equal(await accept(driver, order.id), 'JOB_ASSIGNED');
       const updated = await prisma.order.findUniqueOrThrow({ where: { id: order.id }, include: { trackingEvents: true } });
       assert.equal(updated.driverId, driver.id);
-      assert.equal(updated.status, 'PICKED_UP');
-      assert.equal(updated.trackingEvents.filter((e) => e.status === 'PICKED_UP').length, 1);
+      // Picked up only when the driver scans the label at the seller.
+      assert.equal(updated.status, 'READY_FOR_PICKUP');
+      assert.equal(updated.trackingEvents.filter((e) => e.status === 'PICKED_UP').length, 0);
 
       assert.equal(await accept(driver, order.id), 'JOB_OFFER_EXPIRED');
     });
@@ -171,7 +172,7 @@ describe('Socket.IO authorization', () => {
 
       const updated = await prisma.order.findUniqueOrThrow({ where: { id: order.id }, include: { trackingEvents: true } });
       assert.equal(updated.driverId, drivers[outcomes.indexOf('JOB_ASSIGNED')].id);
-      assert.equal(updated.trackingEvents.filter((e) => e.status === 'PICKED_UP').length, 1);
+      assert.equal(updated.status, 'READY_FOR_PICKUP');
     });
   });
 });

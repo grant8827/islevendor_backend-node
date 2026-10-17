@@ -103,7 +103,17 @@ adminRouter.get('/applicants', async (req, res, next) => {
     });
 
     const applicants: ApplicantSummary[] = [
-      ...warehouses.map((w) => summary('warehouse', w, { name: w.name, parish: w.parish, flags: [] })),
+      ...warehouses.map((w) =>
+        summary('warehouse', w, {
+          name: w.name,
+          parish: w.parish,
+          flags: flagsOf({
+            'COCJ registration': w.cocjVerificationStatus,
+            'TRN card': w.trnCardVerificationStatus,
+            'Proof of address': w.proofOfAddressVerificationStatus,
+          }),
+        }),
+      ),
       ...resellers.map((r) => summary('reseller', { ...r, user: r.user! }, { name: r.storeName, parish: r.parish, flags: flagsOf({ 'Photo ID': r.idDocVerificationStatus }) })),
       ...vendors.map((v) => summary('small-vendor', v, { name: v.shopName, parish: v.parish, flags: flagsOf({ 'Photo ID': v.govIdVerificationStatus }) })),
       ...drivers.map((d) =>
