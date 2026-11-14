@@ -11,6 +11,7 @@ import { automatedPayoutsEnabled, getIsleDashRate, getPayoutTiming, setIsleDashR
 import { approvePayout, checkWiPayPayout, settlePayout, submitPayoutToWiPay, withdrawPlatformBalance } from '../ledger/ledger.service.js';
 import { missingForAutomaticPayout, revealForPayout } from '../../lib/payoutAccounts.js';
 import { registerPayRoutes, FINANCIAL_AUDIT_FILTER } from './pay.routes.js';
+import { registerHeroSlideRoutes } from '../heroSlides/heroSlides.routes.js';
 import { disconnectUserSockets, revokeUserSessions } from '../../lib/sessions.js';
 
 // The superadmin console's API (frontend: pages/admin). Mostly read-side so
@@ -593,3 +594,4 @@ adminRouter.get('/audit-events', async (req, res, next) => {
 });
 
 registerPayRoutes(adminRouter);
+registerHeroSlideRoutes(adminRouter);
