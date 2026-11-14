@@ -26,9 +26,9 @@ const updateSchema = z.object({
 
 const ordered = [{ sortOrder: 'asc' as const }, { createdAt: 'asc' as const }];
 
-/** The bit of a listing a hero card shows. */
-function cardItem(listing: { id: string; masterProduct: { title: string; imageUrl: string | null } }) {
-  return { id: listing.id, title: listing.masterProduct.title, imageUrl: listing.masterProduct.imageUrl };
+/** The bit of a listing a hero card shows — plus its sale, for the sale tag. */
+function cardItem(listing: { id: string; discountPercent: number; masterProduct: { title: string; imageUrl: string | null } }) {
+  return { id: listing.id, title: listing.masterProduct.title, imageUrl: listing.masterProduct.imageUrl, discountPercent: listing.discountPercent };
 }
 
 /** Each slide with its item, or `item: null` when that item isn't for sale any more. */
