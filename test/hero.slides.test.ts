@@ -44,16 +44,16 @@ describe('hero slides', () => {
 
   it('shows the item’s image and name, in order, and drops items no longer for sale', async () => {
     const tv = await listItem('TV');
-    const radio = await listItem('Radio');
+    const radio = await prisma.shopProduct.update({ where: { id: (await listItem('Radio')).id }, data: { discountPercent: 25 } });
     const a = (await call('POST', '/admin/hero-slides', admin, { listingId: tv.id, background: 'secondary' })).body;
     const b = (await call('POST', '/admin/hero-slides', admin, { listingId: radio.id, background: 'primary' })).body;
-    assert.deepEqual(a.item, { id: tv.id, title: 'TV', imageUrl: 'https://example.com/TV.jpg' });
+    assert.deepEqual(a.item, { id: tv.id, title: 'TV', imageUrl: 'https://example.com/TV.jpg', discountPercent: 0 });
 
     let pub = await call('GET', '/hero-slides', null);
     assert.equal(pub.status, 200);
     assert.deepEqual(pub.body, [
-      { id: a.id, background: 'secondary', item: { id: tv.id, title: 'TV', imageUrl: 'https://example.com/TV.jpg' } },
-      { id: b.id, background: 'primary', item: { id: radio.id, title: 'Radio', imageUrl: 'https://example.com/Radio.jpg' } },
+      { id: a.id, background: 'secondary', item: { id: tv.id, title: 'TV', imageUrl: 'https://example.com/TV.jpg', discountPercent: 0 } },
+      { id: b.id, background: 'primary', item: { id: radio.id, title: 'Radio', imageUrl: 'https://example.com/Radio.jpg', discountPercent: 25 } },
     ]);
 
     assert.equal((await call('PUT', '/admin/hero-slides/order', admin, { ids: [a.id] })).status, 400);
