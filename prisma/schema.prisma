@@ -1227,6 +1227,27 @@ model PlatformSetting {
   @@map("platform_settings")
 }
 
+// One card in the home page's hero row, picked by an admin (Admin Console →
+// Home Hero) from the items listed on the site. The card shows that item's
+// own image and name and opens its product page. `listingId` is a
+// StoreListing or ShopProduct id (the same ids /product/:id takes — they
+// can't collide), so there's no foreign key; a card whose item stops being
+// for sale is simply left off the home page. `background` is a site-colour
+// key (see modules/heroSlides). Lowest `sortOrder` shows first.
+model HeroSlide {
+  id         String   @id @default(uuid()) @db.Uuid
+  listingId  String   @map("listing_id") @db.Uuid
+  background String   @default("navy")
+  sortOrder  Int      @default(0) @map("sort_order")
+  isActive   Boolean  @default(true) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@unique([listingId])
+  @@index([isActive, sortOrder])
+  @@map("hero_slides")
+}
+
 // Where one person's payouts go (see modules/ledger/payoutAccount.routes.ts).
 // Account and ID numbers are encrypted by the application (lib/crypto.ts,
 // PAYOUT_DATA_KEY) — only the last four digits are readable. The ID type

@@ -46,16 +46,17 @@ commerceRouter.post('/stores', requireAuth, requireRole(UserRole.RESELLER, UserR
 // affiliate listing already has — every frontend read site (ProductCard,
 // cart, checkout, this file's own /listings/:id) can then treat both kinds
 // identically and only branch on `kind` where it actually matters.
-function normalizeShopProduct(p: {
-  id: string;
-  shopId: string;
-  priceJmd: unknown;
-  isActive: boolean;
-  discountPercent: number;
-  isFeatured: boolean;
-  shop: { shopName: string; slug: string; parish: string };
-  [key: string]: unknown;
-}) {
+function normalizeShopProduct<
+  T extends {
+    id: string;
+    shopId: string;
+    priceJmd: unknown;
+    isActive: boolean;
+    discountPercent: number;
+    isFeatured: boolean;
+    shop: { shopName: string; slug: string; parish: string };
+  },
+>(p: T) {
   const originalPrice = Number(p.priceJmd);
   const salePrice = originalPrice * (1 - p.discountPercent / 100);
   return {
@@ -115,46 +116,56 @@ function normalizeAffiliateListing<
 // shop product, optionally filtered by category/search text. Powers the
 // public home page — deliberately has no auth requirement, same as a
 // storefront page.
+/**
+ * Everything a shopper can buy right now (both kinds of listing), newest
+ * first, in the shape the storefront renders. `ids` narrows to those listings
+ * (the home hero's picked items); anything no longer for sale is left out.
+ */
+export async function findPublicListings({ category, q, ids }: { category?: string; q?: string; ids?: string[] } = {}) {
+  const idFilter = ids ? { id: { in: ids } } : {};
+  const [affiliateListings, shopProducts] = await Promise.all([
+    prisma.storeListing.findMany({
+      where: {
+        ...idFilter,
+        isActive: true,
+        // Both businesses behind an affiliate listing must be approved by
+        // IsleVendor: the reseller selling it and the warehouse stocking it.
+        store: APPROVED_SELLER,
+        // A suspended master product shouldn't be buyable even if an
+        // affiliate still has it listed — the warehouse isn't selling it.
+        masterProduct: {
+          isActive: true,
+          warehouse: APPROVED_SELLER,
+          ...(category && category !== 'All' ? { category } : {}),
+          ...(q ? { title: { contains: q, mode: 'insensitive' } } : {}),
+        },
+      },
+      include: {
+        masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
+        store: { select: { storeName: true, slug: true } },
+      },
+      orderBy: { masterProduct: { createdAt: 'desc' } },
+    }),
+    prisma.shopProduct.findMany({
+      where: {
+        ...idFilter,
+        isActive: true,
+        shop: APPROVED_SELLER,
+        ...(category && category !== 'All' ? { category } : {}),
+        ...(q ? { title: { contains: q, mode: 'insensitive' } } : {}),
+      },
+      include: { shop: { select: { shopName: true, slug: true, parish: true } } },
+      orderBy: { createdAt: 'desc' },
+    }),
+  ]);
+  return [...affiliateListings.map(normalizeAffiliateListing), ...shopProducts.map(normalizeShopProduct)];
+}
+
 commerceRouter.get('/listings', async (req, res, next) => {
   try {
     const category = typeof req.query.category === 'string' ? req.query.category : undefined;
     const q = typeof req.query.q === 'string' ? req.query.q : undefined;
-
-    const [affiliateListings, shopProducts] = await Promise.all([
-      prisma.storeListing.findMany({
-        where: {
-          isActive: true,
-          // Both businesses behind an affiliate listing must be approved by
-          // IsleVendor: the reseller selling it and the warehouse stocking it.
-          store: APPROVED_SELLER,
-          // A suspended master product shouldn't be buyable even if an
-          // affiliate still has it listed — the warehouse isn't selling it.
-          masterProduct: {
-            isActive: true,
-            warehouse: APPROVED_SELLER,
-            ...(category && category !== 'All' ? { category } : {}),
-            ...(q ? { title: { contains: q, mode: 'insensitive' } } : {}),
-          },
-        },
-        include: {
-          masterProduct: { include: { warehouse: { select: { parish: true, resellerCommissionPercent: true } } } },
-          store: { select: { storeName: true, slug: true } },
-        },
-        orderBy: { masterProduct: { createdAt: 'desc' } },
-      }),
-      prisma.shopProduct.findMany({
-        where: {
-          isActive: true,
-          shop: APPROVED_SELLER,
-          ...(category && category !== 'All' ? { category } : {}),
-          ...(q ? { title: { contains: q, mode: 'insensitive' } } : {}),
-        },
-        include: { shop: { select: { shopName: true, slug: true, parish: true } } },
-        orderBy: { createdAt: 'desc' },
-      }),
-    ]);
-
-    res.json([...affiliateListings.map(normalizeAffiliateListing), ...shopProducts.map(normalizeShopProduct)]);
+    res.json(await findPublicListings({ category, q }));
   } catch (err) {
     next(err);
   }

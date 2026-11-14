@@ -21,6 +21,7 @@ import { ratingsRouter } from './modules/ratings/ratings.routes.js';
 import { onboardingRouter } from './modules/onboarding/onboarding.routes.js';
 import { driversRouter } from './modules/drivers/drivers.routes.js';
 import { adminRouter } from './modules/admin/admin.routes.js';
+import { heroSlidesRouter } from './modules/heroSlides/heroSlides.routes.js';
 import { paymentsRouter, wipayWebhookRouter } from './modules/payments/payments.routes.js';
 import { internalPayRouter } from './modules/payments/internal.routes.js';
 
@@ -71,6 +72,7 @@ app.use('/api/shop', shopRouter);
 app.use('/api/ratings', ratingsRouter);
 app.use('/api/drivers', driversRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/hero-slides', heroSlidesRouter);
 app.use('/api/payments', paymentsRouter);
 app.use('/internal/pay', internalPayRouter);
 // WIPAY_RESPONSE_URL points here (see modules/payments).
