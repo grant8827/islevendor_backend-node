@@ -11,6 +11,8 @@ import { computeAffiliatePricing } from '../../lib/pricing.js';
 import { refundOrder } from '../ledger/ledger.service.js';
 import { assertWarehouseAccess, type WarehouseAccess } from '../../lib/warehouseAccess.js';
 import { DELIVERY_SETTINGS_SELECT, deliverySettingsSchema } from '../../lib/deliveryOptions.js';
+import { mapPinSchema } from '../../lib/customerAddress.js';
+import { setSellerPin } from '../../lib/sellerLocation.js';
 import { APPROVED_SELLER, assertApprovedSeller, assertHasPayoutDetails } from '../../lib/eligibility.js';
 import { registerStaffRoutes } from './warehouse.staff.js';
 import { registerHouseStoreRoutes } from './warehouse.houseStore.js';
@@ -263,6 +265,8 @@ const NON_OWNER_WAREHOUSE_FIELDS = {
   sellerDeliveryNote: true,
   offersPickup: true,
   pickupInstructions: true,
+  pinLatitude: true,
+  pinLongitude: true,
 } as const;
 
 warehouseRouter.get('/mine', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
@@ -314,6 +318,18 @@ warehouseRouter.put('/:warehouseId/delivery-options', requireAuth, requireRole(U
     const { warehouse } = await assertWarehouseAccess(String(req.params.warehouseId), req.user!, { adminOnly: true });
     const updated = await prisma.warehouse.update({ where: { id: warehouse.id }, data: input, select: { id: true, ...DELIVERY_SETTINGS_SELECT } });
     res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Where this warehouse is on the map — what IsleDash measures delivery
+// distance from, and where drivers are sent to collect (lib/sellerLocation.ts).
+warehouseRouter.put('/:warehouseId/location', requireAuth, requireRole(UserRole.WAREHOUSE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const { warehouse } = await assertWarehouseAccess(String(req.params.warehouseId), req.user!, { adminOnly: true });
+    const pin = await setSellerPin('warehouse', warehouse.id, mapPinSchema.parse(req.body));
+    res.json(pin);
   } catch (err) {
     next(err);
   }

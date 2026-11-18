@@ -7,7 +7,8 @@ import { requireCurrentAdmin } from '../../middleware/requireAdmin.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { loadDocumentReferences, type ApplicantType } from '../../lib/kycDocuments.js';
 import { recordAuditEvent } from '../../lib/audit.js';
-import { automatedPayoutsEnabled, getIsleDashRate, getPayoutTiming, setIsleDashRate, setPayoutTiming } from '../../lib/platformSettings.js';
+import { automatedPayoutsEnabled, getIsleDashPricing, getPayoutTiming, setIsleDashPricing, setPayoutTiming } from '../../lib/platformSettings.js';
+import { pricingToJson } from '../../lib/isleDashPricing.js';
 import { approvePayout, checkWiPayPayout, settlePayout, submitPayoutToWiPay, withdrawPlatformBalance } from '../ledger/ledger.service.js';
 import { missingForAutomaticPayout, revealForPayout } from '../../lib/payoutAccounts.js';
 import { registerPayRoutes, FINANCIAL_AUDIT_FILTER } from './pay.routes.js';
@@ -498,39 +499,67 @@ adminRouter.post('/payouts/:id/check-wipay', async (req, res, next) => {
 
 adminRouter.get('/settings/isledash', async (_req, res, next) => {
   try {
-    const rate = await getIsleDashRate();
-    res.json({ baseFeeJmd: rate.baseFeeJmd.toFixed(2), extraItemPercent: rate.extraItemPercent });
+    res.json(pricingToJson(await getIsleDashPricing()));
   } catch (err) {
     next(err);
   }
 });
 
-const isleDashRateSchema = z.object({
-  baseFeeJmd: z.number().min(0).max(100_000),
-  extraItemPercent: z.number().int().min(0).max(100),
-});
+const money = z.number().min(0).max(100_000);
+const isleDashPricingSchema = z
+  .object({
+    baseFeeJmd: money,
+    includedMiles: z.number().min(0).max(500),
+    perMileJmd: money,
+    minFeeJmd: money,
+    maxFeeJmd: money.nullable(),
+    maxMiles: z.number().positive().max(500).nullable(),
+    extraItemPercent: z.number().int().min(0).max(100),
+    fallbackFeeJmd: money,
+    roadAdjustPercent: z.number().int().min(0).max(200),
+  })
+  .partial()
+  .strict();
+const fullPricingSchema = isleDashPricingSchema
+  .required()
+  .refine((v) => v.maxFeeJmd === null || v.maxFeeJmd >= v.minFeeJmd, {
+    message: "The maximum fee can't be less than the minimum fee",
+    path: ['maxFeeJmd'],
+  });
 
-// IsleDash delivery pricing: the first item's fee and the % each further
-// item from the same seller costs. Applies to checkouts from now on; orders
-// already placed keep what they were charged. Audited with before and after.
+// IsleDash delivery pricing for every seller (Admin → Settings → Shipping):
+// see lib/isleDashPricing.ts. Applies to checkouts from now on; orders
+// already placed keep what they were charged. Fields left out keep their
+// current value. Audited with before and after.
 adminRouter.put('/settings/isledash', async (req, res, next) => {
   try {
-    const input = isleDashRateSchema.parse(req.body);
-    await prisma.$transaction(async (tx) => {
-      const before = await getIsleDashRate(tx);
-      await setIsleDashRate(input, req.user!.sub, tx);
+    const changes = isleDashPricingSchema.parse(req.body);
+    const saved = await prisma.$transaction(async (tx) => {
+      const before = pricingToJson(await getIsleDashPricing(tx));
+      const input = fullPricingSchema.parse({
+        ...before,
+        baseFeeJmd: Number(before.baseFeeJmd),
+        perMileJmd: Number(before.perMileJmd),
+        minFeeJmd: Number(before.minFeeJmd),
+        maxFeeJmd: before.maxFeeJmd === null ? null : Number(before.maxFeeJmd),
+        fallbackFeeJmd: Number(before.fallbackFeeJmd),
+        ...changes,
+      });
+      await setIsleDashPricing(input, req.user!.sub, tx);
+      const after = pricingToJson(await getIsleDashPricing(tx));
       await recordAuditEvent(
         req,
         {
           action: 'settings.isledash_rate_changed',
           targetType: 'platform_settings',
           targetId: 'default',
-          metadata: { before: { baseFeeJmd: before.baseFeeJmd.toFixed(2), extraItemPercent: before.extraItemPercent }, after: input },
+          metadata: { before, after },
         },
         tx,
       );
+      return after;
     });
-    res.json({ baseFeeJmd: input.baseFeeJmd.toFixed(2), extraItemPercent: input.extraItemPercent });
+    res.json(saved);
   } catch (err) {
     next(err);
   }

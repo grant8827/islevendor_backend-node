@@ -2,13 +2,15 @@ import { Decimal } from 'decimal.js';
 import { z } from 'zod';
 import type { DeliveryMethod, Prisma } from '@prisma/client';
 import { HttpError } from '../middleware/errorHandler.js';
+import { isleDashQuote, sellerPin, type IsleDashPricing, type IsleDashQuote, type MapPin } from './isleDashPricing.js';
 
 // How an order can reach the customer, and what each way costs. The
 // business that packs the order (a shop, or the warehouse behind a reseller
 // listing) decides which of these it offers; the customer picks one at
 // checkout.
-//  - ISLEDASH:        an IsleDash driver, at the platform's driver fee. The fee
-//                     is held for the driver (see ledger.service.ts).
+//  - ISLEDASH:        an IsleDash driver, at the platform's distance-based fee
+//                     (lib/isleDashPricing.ts). The fee is held for the driver
+//                     (see ledger.service.ts).
 //  - SELLER_DELIVERY: the business's own delivery, at the fee it sets. The fee
 //                     is the business's.
 //  - PICKUP:          the customer collects it. Always free.
@@ -17,7 +19,7 @@ import { HttpError } from '../middleware/errorHandler.js';
  * What one way of delivering costs: the full fee for the first item, and
  * `extraItemPercent` of it for each further item bought from the same seller
  * in one checkout. Every unit counts — 3 of one product is three items.
- * IsleDash's rate is IsleVendor's (lib/platformSettings.ts); the seller's own
+ * IsleDash's rate is IsleVendor's, by distance (lib/isleDashPricing.ts); the seller's own
  * delivery rate is the seller's.
  */
 export interface ShippingRate {
@@ -51,6 +53,8 @@ export const DELIVERY_SETTINGS_SELECT = {
   sellerDeliveryExtraItemPercent: true,
   offersPickup: true,
   pickupInstructions: true,
+  pinLatitude: true,
+  pinLongitude: true,
 } as const;
 
 export interface DeliverySettings {
@@ -65,6 +69,9 @@ export interface DeliverySettings {
   sellerDeliveryExtraItemPercent: number;
   offersPickup: boolean;
   pickupInstructions: string | null;
+  /** The seller's map pin; null until placed (IsleDash then charges the fallback fee). */
+  pinLatitude: Prisma.Decimal | null;
+  pinLongitude: Prisma.Decimal | null;
 }
 
 export interface DeliveryOption {
@@ -78,17 +85,24 @@ export interface DeliveryOption {
   detail: string | null;
   /** Whether the customer has to give a delivery address. */
   needsAddress: boolean;
+  /** IsleDash only: the road miles it was priced for; null when charged the fallback fee. */
+  distanceMiles: string | null;
 }
 
 export function pickupLocationOf(seller: DeliverySettings): string {
   return `${seller.pickupAddress || seller.addressLine}, ${seller.parish}`;
 }
 
-/** The rate for `method` from this seller, or null if it doesn't offer it. */
-export function rateFor(seller: DeliverySettings, method: DeliveryMethod, isleDashRate: ShippingRate): ShippingRate | null {
+/** What IsleDash costs from this seller to a buyer at `buyerPin`. */
+export function isleDashQuoteFor(seller: DeliverySettings, pricing: IsleDashPricing, buyerPin: MapPin | null): IsleDashQuote {
+  return isleDashQuote(pricing, sellerPin(seller), buyerPin);
+}
+
+/** The rate for `method` from this seller, or null if it doesn't offer it (or IsleDash can't reach the buyer). */
+export function rateFor(seller: DeliverySettings, method: DeliveryMethod, isleDash: IsleDashQuote): ShippingRate | null {
   switch (method) {
     case 'ISLEDASH':
-      return seller.offersIsleDash ? isleDashRate : null;
+      return seller.offersIsleDash ? isleDash.rate : null;
     case 'SELLER_DELIVERY':
       return seller.offersSellerDelivery && seller.sellerDeliveryFeeJmd !== null
         ? { baseFeeJmd: new Decimal(seller.sellerDeliveryFeeJmd.toString()), extraItemPercent: seller.sellerDeliveryExtraItemPercent }
@@ -98,17 +112,26 @@ export function rateFor(seller: DeliverySettings, method: DeliveryMethod, isleDa
   }
 }
 
-/** Throws 400 unless the seller offers `method`. */
-export function requireRate(seller: DeliverySettings, method: DeliveryMethod, isleDashRate: ShippingRate): ShippingRate {
-  const rate = rateFor(seller, method, isleDashRate);
+/** Throws 400 unless the seller offers `method` (and, for IsleDash, the buyer is in range). */
+export function requireRate(seller: DeliverySettings, method: DeliveryMethod, isleDash: IsleDashQuote): ShippingRate {
+  if (method === 'ISLEDASH' && seller.offersIsleDash && !isleDash.available) throw new HttpError(400, `${isleDash.reason} — choose another delivery option`);
+  const rate = rateFor(seller, method, isleDash);
   if (!rate) throw new HttpError(400, "This seller doesn't offer that delivery option — choose another");
   return rate;
 }
 
+/** What the customer is told under the IsleDash option. */
+function isleDashDetail(quote: IsleDashQuote): string | null {
+  if (!quote.available) return null;
+  if (quote.distanceMiles) return `${quote.distanceMiles.toFixed(1)} mi from the seller`;
+  if (quote.missingPin === 'buyer') return 'Standard fee — add a map pin to your address to price it by distance';
+  return 'Standard fee';
+}
+
 /** Every option this business currently offers for `units` items, in the order a customer should see them. */
-export function deliveryOptionsFor(seller: DeliverySettings, isleDashRate: ShippingRate, units = 1): DeliveryOption[] {
+export function deliveryOptionsFor(seller: DeliverySettings, isleDash: IsleDashQuote, units = 1): DeliveryOption[] {
   const describe = (method: DeliveryMethod, label: string, detail: string | null): DeliveryOption | null => {
-    const rate = rateFor(seller, method, isleDashRate);
+    const rate = rateFor(seller, method, isleDash);
     if (!rate) return null;
     return {
       method,
@@ -118,14 +141,20 @@ export function deliveryOptionsFor(seller: DeliverySettings, isleDashRate: Shipp
       extraItemFeeJmd: extraItemFee(rate).toFixed(2),
       detail,
       needsAddress: method !== 'PICKUP',
+      distanceMiles: method === 'ISLEDASH' && isleDash.distanceMiles ? isleDash.distanceMiles.toFixed(1) : null,
     };
   };
   const where = pickupLocationOf(seller);
   return [
-    describe('ISLEDASH', 'IsleDash delivery', null),
+    describe('ISLEDASH', 'IsleDash delivery', isleDashDetail(isleDash)),
     describe('SELLER_DELIVERY', 'Delivered by the seller', seller.sellerDeliveryNote),
     describe('PICKUP', 'Pick up', seller.pickupInstructions ? `${where} — ${seller.pickupInstructions}` : where),
   ].filter((o): o is DeliveryOption => o !== null);
+}
+
+/** Why IsleDash isn't among this seller's options for this buyer, if it's only distance that rules it out. */
+export function isleDashUnavailableReason(seller: DeliverySettings, isleDash: IsleDashQuote): string | null {
+  return seller.offersIsleDash && !isleDash.available ? isleDash.reason : null;
 }
 
 /** What a business submits to change its delivery options. */

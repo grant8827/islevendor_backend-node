@@ -131,15 +131,21 @@ describe('multi-item shipping', () => {
       assert.equal((await call('PUT', '/admin/settings/isledash', admin, { baseFeeJmd: 500, extraItemPercent: 150 })).status, 400);
 
       try {
-        assert.equal((await call('PUT', '/admin/settings/isledash', admin, { baseFeeJmd: 500, extraItemPercent: 20 })).status, 200);
-        assert.deepEqual((await call('GET', '/orders/isledash-rate')).body, { baseFeeJmd: '500.00', extraItemPercent: 20 });
+        // Neither side has a map pin, so the fallback fee applies.
+        const res = await call('PUT', '/admin/settings/isledash', admin, { fallbackFeeJmd: 500, extraItemPercent: 20 });
+        assert.equal(res.status, 200);
+        const rate = (await call('GET', '/orders/isledash-rate')).body;
+        assert.equal(rate.fallbackFeeJmd, '500.00');
+        assert.equal(rate.extraItemPercent, 20);
+        assert.equal(rate.baseFeeJmd, '300.00', 'fields left out keep their value');
         assert.equal(optionFee((await quote([s.line(s.a, 3)])).body, s.key, 'ISLEDASH'), '700.00', '500 + 100 + 100');
 
         const event = await prisma.auditEvent.findFirstOrThrow({ where: { action: 'settings.isledash_rate_changed' }, orderBy: { createdAt: 'desc' } });
         assert.equal(event.actorId, admin.id);
-        assert.deepEqual((event.metadata as any).after, { baseFeeJmd: 500, extraItemPercent: 20 });
+        assert.equal((event.metadata as any).after.fallbackFeeJmd, '500.00');
+        assert.equal((event.metadata as any).before.fallbackFeeJmd, '300.00');
       } finally {
-        await call('PUT', '/admin/settings/isledash', admin, { baseFeeJmd: 300, extraItemPercent: 50 });
+        await call('PUT', '/admin/settings/isledash', admin, { baseFeeJmd: 300, fallbackFeeJmd: 300, extraItemPercent: 50 });
       }
     });
   });

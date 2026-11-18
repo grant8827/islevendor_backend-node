@@ -6,6 +6,8 @@ import { prisma } from '../../lib/prisma.js';
 import { requireAuth, requireRole } from '../../middleware/auth.js';
 import { HttpError } from '../../middleware/errorHandler.js';
 import { DELIVERY_SETTINGS_SELECT, deliverySettingsSchema } from '../../lib/deliveryOptions.js';
+import { mapPinSchema } from '../../lib/customerAddress.js';
+import { setSellerPin } from '../../lib/sellerLocation.js';
 import { APPROVED_SELLER, assertApprovedSeller, assertHasPayoutDetails } from '../../lib/eligibility.js';
 import { imageUrlSchema } from '../../lib/validation.js';
 import { createWithGeneratedSku } from '../../lib/sku.js';
@@ -105,6 +107,18 @@ shopRouter.put('/:shopId/delivery-options', requireAuth, requireRole(UserRole.ST
     const shop = await assertOwnsShop(String(req.params.shopId), req.user!.sub, req.user!.role === UserRole.ADMIN);
     const updated = await prisma.shop.update({ where: { id: shop.id }, data: input, select: { id: true, pickupAddress: true, ...DELIVERY_SETTINGS_SELECT } });
     res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Where this shop is on the map — what IsleDash measures delivery
+// distance from, and where drivers are sent to collect (lib/sellerLocation.ts).
+shopRouter.put('/:shopId/location', requireAuth, requireRole(UserRole.STORE, UserRole.ADMIN), async (req, res, next) => {
+  try {
+    const shop = await assertOwnsShop(String(req.params.shopId), req.user!.sub, req.user!.role === UserRole.ADMIN);
+    const pin = await setSellerPin('shop', shop.id, mapPinSchema.parse(req.body));
+    res.json(pin);
   } catch (err) {
     next(err);
   }
