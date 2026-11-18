@@ -1,24 +1,69 @@
 import { Decimal } from 'decimal.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { prisma } from './prisma.js';
-import type { ShippingRate } from './deliveryOptions.js';
+import type { IsleDashPricing } from './isleDashPricing.js';
 import { env } from '../env.js';
 
 const SETTINGS_ID = 'default';
 
-// What the migration seeds; used if the row is ever missing so checkout
-// never fails for want of a settings row.
-const DEFAULT_ISLEDASH_RATE: ShippingRate = { baseFeeJmd: new Decimal(300), extraItemPercent: 50 };
+// What the migrations seed; used if the row is ever missing so checkout
+// never fails for want of a settings row. Price per mile 0: a flat fee.
+const DEFAULT_ISLEDASH_PRICING: IsleDashPricing = {
+  baseFeeJmd: new Decimal(300),
+  includedMiles: new Decimal(0),
+  perMileJmd: new Decimal(0),
+  minFeeJmd: new Decimal(0),
+  maxFeeJmd: null,
+  maxMiles: null,
+  extraItemPercent: 50,
+  fallbackFeeJmd: new Decimal(300),
+  roadAdjustPercent: 30,
+};
 
-/** IsleVendor's IsleDash delivery rate, as set in the admin console. */
-export async function getIsleDashRate(db: PrismaClient | Prisma.TransactionClient = prisma): Promise<ShippingRate> {
+const dec = (v: Prisma.Decimal) => new Decimal(v.toString());
+
+/** IsleVendor's IsleDash delivery pricing, as set in Admin → Settings → Shipping. */
+export async function getIsleDashPricing(db: PrismaClient | Prisma.TransactionClient = prisma): Promise<IsleDashPricing> {
   const row = await db.platformSetting.findUnique({ where: { id: SETTINGS_ID } });
-  if (!row) return DEFAULT_ISLEDASH_RATE;
-  return { baseFeeJmd: new Decimal(row.isleDashBaseFeeJmd.toString()), extraItemPercent: row.isleDashExtraItemPercent };
+  if (!row) return DEFAULT_ISLEDASH_PRICING;
+  return {
+    baseFeeJmd: dec(row.isleDashBaseFeeJmd),
+    includedMiles: dec(row.isleDashIncludedMiles),
+    perMileJmd: dec(row.isleDashPerMileJmd),
+    minFeeJmd: dec(row.isleDashMinFeeJmd),
+    maxFeeJmd: row.isleDashMaxFeeJmd === null ? null : dec(row.isleDashMaxFeeJmd),
+    maxMiles: row.isleDashMaxMiles === null ? null : dec(row.isleDashMaxMiles),
+    extraItemPercent: row.isleDashExtraItemPercent,
+    fallbackFeeJmd: dec(row.isleDashFallbackFeeJmd),
+    roadAdjustPercent: row.isleDashRoadAdjustPercent,
+  };
 }
 
-export async function setIsleDashRate(rate: { baseFeeJmd: number; extraItemPercent: number }, updatedBy: string, db: PrismaClient | Prisma.TransactionClient = prisma) {
-  const data = { isleDashBaseFeeJmd: rate.baseFeeJmd, isleDashExtraItemPercent: rate.extraItemPercent, updatedBy };
+export interface IsleDashPricingInput {
+  baseFeeJmd: number;
+  includedMiles: number;
+  perMileJmd: number;
+  minFeeJmd: number;
+  maxFeeJmd: number | null;
+  maxMiles: number | null;
+  extraItemPercent: number;
+  fallbackFeeJmd: number;
+  roadAdjustPercent: number;
+}
+
+export async function setIsleDashPricing(p: IsleDashPricingInput, updatedBy: string, db: PrismaClient | Prisma.TransactionClient = prisma) {
+  const data = {
+    isleDashBaseFeeJmd: p.baseFeeJmd,
+    isleDashIncludedMiles: p.includedMiles,
+    isleDashPerMileJmd: p.perMileJmd,
+    isleDashMinFeeJmd: p.minFeeJmd,
+    isleDashMaxFeeJmd: p.maxFeeJmd,
+    isleDashMaxMiles: p.maxMiles,
+    isleDashExtraItemPercent: p.extraItemPercent,
+    isleDashFallbackFeeJmd: p.fallbackFeeJmd,
+    isleDashRoadAdjustPercent: p.roadAdjustPercent,
+    updatedBy,
+  };
   return db.platformSetting.upsert({ where: { id: SETTINGS_ID }, create: { id: SETTINGS_ID, ...data }, update: data });
 }
 

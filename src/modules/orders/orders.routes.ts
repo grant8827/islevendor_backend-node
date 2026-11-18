@@ -13,12 +13,15 @@ import { APPROVED_SELLER } from '../../lib/eligibility.js';
 import {
   DELIVERY_SETTINGS_SELECT,
   deliveryOptionsFor,
+  isleDashQuoteFor,
+  isleDashUnavailableReason,
   perItemFees,
   pickupLocationOf,
   requireRate,
   type DeliverySettings,
 } from '../../lib/deliveryOptions.js';
-import { effectiveFeeStructure, getIsleDashRate, platformCommissionRate } from '../../lib/platformSettings.js';
+import { effectiveFeeStructure, getIsleDashPricing, platformCommissionRate } from '../../lib/platformSettings.js';
+import { pricingToJson } from '../../lib/isleDashPricing.js';
 import { CARD_FEE_PAID_BY, startCheckoutPayment } from '../payments/payments.service.js';
 import { requestOrigin } from '../payments/payments.routes.js';
 import { formatAddress, mapPinSchema } from '../../lib/customerAddress.js';
@@ -206,8 +209,9 @@ type CheckoutInput = z.infer<typeof checkoutSchema>;
  *
  * Shipping is charged per business that ships, across all its items: the
  * first item at the full fee, every further unit at that rate's extra-item
- * fee (lib/deliveryOptions.ts). Orders sharing one charge carry the same
- * checkoutGroupId.
+ * fee (lib/deliveryOptions.ts). IsleDash's fee depends on the distance from
+ * the seller's map pin to the delivery pin (lib/isleDashPricing.ts). Orders
+ * sharing one charge carry the same checkoutGroupId.
  */
 async function placeCheckout(customerId: string, input: CheckoutInput) {
   // No address given: deliver to the saved one, with its map pin.
@@ -222,7 +226,7 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
   }
 
   return prisma.$transaction(async (tx) => {
-    const isleDashRate = await getIsleDashRate(tx);
+    const isleDashPricing = await getIsleDashPricing(tx);
     const resolved: ResolvedLine[] = [];
     for (const line of input.items) {
       const r = await resolveLine(tx, line);
@@ -239,7 +243,8 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
     for (const [sellerKey, sellerLines] of groupBySeller(resolved)) {
       const method = input.deliveryMethods[sellerKey];
       if (!method) throw new HttpError(400, `Choose how you want to get the items from ${sellerLines[0].sellerName}`);
-      const rate = requireRate(sellerLines[0].seller, method, isleDashRate);
+      const isleDash = isleDashQuoteFor(sellerLines[0].seller, isleDashPricing, pin);
+      const rate = requireRate(sellerLines[0].seller, method, isleDash);
       if (method !== 'PICKUP' && !deliveryAddress) throw new HttpError(400, 'Enter a delivery address');
 
       // This seller's shipping, unit by unit in cart order, then summed per order.
@@ -273,6 +278,7 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
             // Where the driver goes; not needed when the customer collects.
             deliveryLatitude: method === 'PICKUP' || !pin ? null : pin.latitude.toFixed(6),
             deliveryLongitude: method === 'PICKUP' || !pin ? null : pin.longitude.toFixed(6),
+            deliveryDistanceMiles: method === 'ISLEDASH' && isleDash.distanceMiles ? isleDash.distanceMiles.toFixed(2) : null,
             checkoutGroupId,
             items: {
               create: lines.map((l) => ({
@@ -301,10 +307,10 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
 
 // IsleVendor's current IsleDash pricing — shown to sellers on their
 // Shipping tab so they know what customers pay when they pick IsleDash.
+// baseFeeJmd and extraItemPercent come first for older app versions.
 ordersRouter.get('/isledash-rate', async (_req, res, next) => {
   try {
-    const rate = await getIsleDashRate();
-    res.json({ baseFeeJmd: rate.baseFeeJmd.toFixed(2), extraItemPercent: rate.extraItemPercent });
+    res.json(pricingToJson(await getIsleDashPricing()));
   } catch (err) {
     next(err);
   }
@@ -324,7 +330,12 @@ async function paymentFor(req: Request, orderIds: string[]) {
   }
 }
 
-const quoteSchema = z.object({ items: z.array(lineSchema).min(1).max(50) });
+const quoteSchema = z.object({
+  items: z.array(lineSchema).min(1).max(50),
+  // Where it's going, to price IsleDash by distance — the same pin checkout
+  // will send. Left out: IsleDash is quoted at the fallback fee.
+  deliveryLocation: mapPinSchema.nullish(),
+});
 
 // The cart's view of itself, priced by the server: what each line costs
 // today, whether it's still in stock, and — per business shipping something
@@ -333,8 +344,8 @@ const quoteSchema = z.object({ items: z.array(lineSchema).min(1).max(50) });
 // Public, like the marketplace — a guest can build a cart.
 ordersRouter.post('/quote', async (req, res, next) => {
   try {
-    const { items } = quoteSchema.parse(req.body);
-    const isleDashRate = await getIsleDashRate();
+    const { items, deliveryLocation } = quoteSchema.parse(req.body);
+    const isleDashPricing = await getIsleDashPricing();
     const resolved = await Promise.all(items.map((line) => resolveLine(prisma, line)));
 
     const lines = items.map((line, i) => {
@@ -353,7 +364,14 @@ ordersRouter.post('/quote', async (req, res, next) => {
     const available = resolved.filter((r, i): r is ResolvedLine => r !== null && lines[i].available);
     const sellers = [...groupBySeller(resolved.filter((r): r is ResolvedLine => r !== null))].map(([key, group]) => {
       const units = unitsOf(available.filter((r) => r.sellerKey === key));
-      return { key, name: group[0].sellerName, units, options: deliveryOptionsFor(group[0].seller, isleDashRate, Math.max(units, 1)) };
+      const isleDash = isleDashQuoteFor(group[0].seller, isleDashPricing, deliveryLocation ?? null);
+      return {
+        key,
+        name: group[0].sellerName,
+        units,
+        options: deliveryOptionsFor(group[0].seller, isleDash, Math.max(units, 1)),
+        isleDashUnavailable: isleDashUnavailableReason(group[0].seller, isleDash),
+      };
     });
 
     // Who pays WiPay's card fee (WIPAY_FEE_STRUCTURE) — the cart says so

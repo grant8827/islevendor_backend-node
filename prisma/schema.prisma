@@ -279,6 +279,11 @@ model Warehouse {
   // Customer collects it themselves — always free.
   offersPickup                   Boolean  @default(false) @map("offers_pickup")
   pickupInstructions             String?  @map("pickup_instructions")
+  // The seller's exact map pin, placed from its dashboard (see
+  // lib/isleDashPricing.ts). Until then `location` is only a parish centre and
+  // IsleDash charges the fallback fee; placing a pin updates both.
+  pinLatitude                    Decimal? @map("pin_latitude") @db.Decimal(9, 6)
+  pinLongitude                   Decimal? @map("pin_longitude") @db.Decimal(9, 6)
 
   user                 User                    @relation(fields: [userId], references: [id])
   products             MasterProduct[]
@@ -607,6 +612,11 @@ model Shop {
   // Customer collects it themselves — always free.
   offersPickup                   Boolean  @default(false) @map("offers_pickup")
   pickupInstructions             String?  @map("pickup_instructions")
+  // The seller's exact map pin, placed from its dashboard (see
+  // lib/isleDashPricing.ts). Until then `location` is only a parish centre and
+  // IsleDash charges the fallback fee; placing a pin updates both.
+  pinLatitude                    Decimal? @map("pin_latitude") @db.Decimal(9, 6)
+  pinLongitude                   Decimal? @map("pin_longitude") @db.Decimal(9, 6)
 
   user                 User                  @relation(fields: [userId], references: [id])
   products             ShopProduct[]
@@ -832,6 +842,9 @@ model Order {
   // phone at checkout), so the driver can navigate. Null: address text only.
   deliveryLatitude        Decimal?              @map("delivery_latitude") @db.Decimal(9, 6)
   deliveryLongitude       Decimal?              @map("delivery_longitude") @db.Decimal(9, 6)
+  // Road miles an IsleDash order was priced for (lib/isleDashPricing.ts).
+  // Null: charged the fallback fee, or not an IsleDash order.
+  deliveryDistanceMiles   Decimal?              @map("delivery_distance_miles") @db.Decimal(7, 2)
   status                  OrderStatus           @default(AWAITING_PAYMENT)
   deliveryAddress         String                @map("delivery_address")
   proofOfDeliveryImageUrl String?               @map("proof_of_delivery_image_url")
@@ -1203,10 +1216,23 @@ model AuditEvent {
 // defaults if it's ever missing).
 model PlatformSetting {
   id                        String   @id
-  // IsleDash delivery: the fee for the first item, and what % of it each
-  // further item from the same seller in one checkout costs.
+  // IsleDash delivery, priced by distance (see lib/isleDashPricing.ts): the
+  // base fee covers the first includedMiles, then perMile for each mile
+  // after, kept between the min and max fee. Each further item from the same
+  // seller in one checkout costs extraItemPercent of that. Without both map
+  // pins the fee is fallbackFee. Miles are straight-line plus
+  // roadAdjustPercent, for roads that don't run straight.
   isleDashBaseFeeJmd        Decimal  @default(300) @map("isledash_base_fee_jmd") @db.Decimal(12, 2)
   isleDashExtraItemPercent  Int      @default(50) @map("isledash_extra_item_percent")
+  isleDashIncludedMiles     Decimal  @default(0) @map("isledash_included_miles") @db.Decimal(6, 2)
+  isleDashPerMileJmd        Decimal  @default(0) @map("isledash_per_mile_jmd") @db.Decimal(12, 2)
+  isleDashMinFeeJmd         Decimal  @default(0) @map("isledash_min_fee_jmd") @db.Decimal(12, 2)
+  // Null: no cap.
+  isleDashMaxFeeJmd         Decimal? @map("isledash_max_fee_jmd") @db.Decimal(12, 2)
+  // Null: no limit. Further than this, IsleDash isn't offered.
+  isleDashMaxMiles          Decimal? @map("isledash_max_miles") @db.Decimal(6, 2)
+  isleDashFallbackFeeJmd    Decimal  @default(300) @map("isledash_fallback_fee_jmd") @db.Decimal(12, 2)
+  isleDashRoadAdjustPercent Int      @default(30) @map("isledash_road_adjust_percent")
   // How long a withdrawal usually takes to reach the owner's bank once
   // requested, in business days. Payouts are sent by hand (see the admin
   // Payouts queue), so this is IsleVendor's own promise, not a provider's.
