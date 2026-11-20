@@ -18,6 +18,9 @@ const DEFAULT_ISLEDASH_PRICING: IsleDashPricing = {
   extraItemPercent: 50,
   fallbackFeeJmd: new Decimal(300),
   roadAdjustPercent: 30,
+  includedWeightLb: new Decimal(0),
+  perPoundJmd: new Decimal(0),
+  maxWeightLb: null,
 };
 
 const dec = (v: Prisma.Decimal) => new Decimal(v.toString());
@@ -36,6 +39,9 @@ export async function getIsleDashPricing(db: PrismaClient | Prisma.TransactionCl
     extraItemPercent: row.isleDashExtraItemPercent,
     fallbackFeeJmd: dec(row.isleDashFallbackFeeJmd),
     roadAdjustPercent: row.isleDashRoadAdjustPercent,
+    includedWeightLb: dec(row.isleDashIncludedWeightLb),
+    perPoundJmd: dec(row.isleDashPerPoundJmd),
+    maxWeightLb: row.isleDashMaxWeightLb === null ? null : dec(row.isleDashMaxWeightLb),
   };
 }
 
@@ -49,6 +55,9 @@ export interface IsleDashPricingInput {
   extraItemPercent: number;
   fallbackFeeJmd: number;
   roadAdjustPercent: number;
+  includedWeightLb: number;
+  perPoundJmd: number;
+  maxWeightLb: number | null;
 }
 
 export async function setIsleDashPricing(p: IsleDashPricingInput, updatedBy: string, db: PrismaClient | Prisma.TransactionClient = prisma) {
@@ -62,6 +71,9 @@ export async function setIsleDashPricing(p: IsleDashPricingInput, updatedBy: str
     isleDashExtraItemPercent: p.extraItemPercent,
     isleDashFallbackFeeJmd: p.fallbackFeeJmd,
     isleDashRoadAdjustPercent: p.roadAdjustPercent,
+    isleDashIncludedWeightLb: p.includedWeightLb,
+    isleDashPerPoundJmd: p.perPoundJmd,
+    isleDashMaxWeightLb: p.maxWeightLb,
     updatedBy,
   };
   return db.platformSetting.upsert({ where: { id: SETTINGS_ID }, create: { id: SETTINGS_ID, ...data }, update: data });

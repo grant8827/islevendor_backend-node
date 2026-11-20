@@ -517,6 +517,9 @@ const isleDashPricingSchema = z
     extraItemPercent: z.number().int().min(0).max(100),
     fallbackFeeJmd: money,
     roadAdjustPercent: z.number().int().min(0).max(200),
+    includedWeightLb: z.number().min(0).max(10_000),
+    perPoundJmd: money,
+    maxWeightLb: z.number().positive().max(10_000).nullable(),
   })
   .partial()
   .strict();
@@ -543,6 +546,7 @@ adminRouter.put('/settings/isledash', async (req, res, next) => {
         minFeeJmd: Number(before.minFeeJmd),
         maxFeeJmd: before.maxFeeJmd === null ? null : Number(before.maxFeeJmd),
         fallbackFeeJmd: Number(before.fallbackFeeJmd),
+        perPoundJmd: Number(before.perPoundJmd),
         ...changes,
       });
       await setIsleDashPricing(input, req.user!.sub, tx);

@@ -14,6 +14,12 @@ import type { ShippingRate } from './deliveryOptions.js';
 // one checkout costs extraItemPercent of it (lib/deliveryOptions.ts). If
 // either side has no map pin, the fee is fallbackFee. Further than maxMiles,
 // IsleDash isn't offered at all.
+//
+// Weight: everything one seller sends in the delivery is weighed together
+// (products with no weight count as 0). Each pound over includedWeight adds
+// perPound to the fee, after the min/max. When perPound is set it replaces
+// the extra-item charge, so a heavy order isn't charged twice. Heavier than
+// maxWeight, IsleDash isn't offered.
 
 export interface IsleDashPricing {
   baseFeeJmd: Decimal;
@@ -27,6 +33,10 @@ export interface IsleDashPricing {
   extraItemPercent: number;
   fallbackFeeJmd: Decimal;
   roadAdjustPercent: number;
+  includedWeightLb: Decimal;
+  perPoundJmd: Decimal;
+  /** null: no limit. */
+  maxWeightLb: Decimal | null;
 }
 
 export interface MapPin {
@@ -36,8 +46,16 @@ export interface MapPin {
 
 export type IsleDashQuote =
   /** distanceMiles null: no pin on one side, so charged the fallback fee. */
-  | { available: true; rate: ShippingRate; distanceMiles: Decimal | null; missingPin: 'seller' | 'buyer' | null }
-  | { available: false; rate: null; distanceMiles: Decimal; reason: string };
+  | {
+      available: true;
+      rate: ShippingRate;
+      distanceMiles: Decimal | null;
+      missingPin: 'seller' | 'buyer' | null;
+      weightLb: Decimal;
+      /** What the weight added to the fee. */
+      weightFeeJmd: Decimal;
+    }
+  | { available: false; rate: null; distanceMiles: Decimal | null; weightLb: Decimal; reason: string };
 
 const EARTH_RADIUS_MILES = 3958.8;
 
@@ -64,30 +82,50 @@ export function distanceFee(pricing: IsleDashPricing, miles: Decimal): Decimal {
   return fee.toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
 }
 
-/** What IsleDash costs from a seller pinned at `from` to a buyer at `to`, or why it isn't offered. */
-export function isleDashQuote(pricing: IsleDashPricing, from: MapPin | null, to: MapPin | null): IsleDashQuote {
-  if (!from || !to) {
-    return {
-      available: true,
-      rate: { baseFeeJmd: pricing.fallbackFeeJmd, extraItemPercent: pricing.extraItemPercent },
-      distanceMiles: null,
-      missingPin: !from ? 'seller' : 'buyer',
-    };
-  }
-  const miles = deliveryMiles(pricing, from, to);
-  if (pricing.maxMiles !== null && miles.greaterThan(pricing.maxMiles)) {
+/** What `weightLb` pounds add to the fee. */
+export function weightFee(pricing: IsleDashPricing, weightLb: Decimal): Decimal {
+  const over = Decimal.max(weightLb.minus(pricing.includedWeightLb), 0);
+  return over.times(pricing.perPoundJmd).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
+}
+
+/** Whether weight pricing is on — it then replaces the extra-item charge. */
+export const chargesByWeight = (pricing: IsleDashPricing) => pricing.perPoundJmd.greaterThan(0);
+
+const lb = (d: Decimal) => d.toDecimalPlaces(1).toString();
+
+/**
+ * What IsleDash costs from a seller pinned at `from` to a buyer at `to`, for
+ * a delivery weighing `weightLb` in all, or why it isn't offered.
+ */
+export function isleDashQuote(pricing: IsleDashPricing, from: MapPin | null, to: MapPin | null, weightLb: Decimal = new Decimal(0)): IsleDashQuote {
+  const miles = from && to ? deliveryMiles(pricing, from, to) : null;
+  if (miles && pricing.maxMiles !== null && miles.greaterThan(pricing.maxMiles)) {
     return {
       available: false,
       rate: null,
       distanceMiles: miles,
-      reason: `IsleDash doesn't deliver this far (${miles.toFixed(1)} mi — the limit is ${pricing.maxMiles.toDecimalPlaces(1).toString()} mi)`,
+      weightLb,
+      reason: `IsleDash doesn't deliver this far (${miles.toFixed(1)} mi — the limit is ${lb(pricing.maxMiles)} mi)`,
     };
   }
+  if (pricing.maxWeightLb !== null && weightLb.greaterThan(pricing.maxWeightLb)) {
+    return {
+      available: false,
+      rate: null,
+      distanceMiles: miles,
+      weightLb,
+      reason: `Too heavy for IsleDash (${lb(weightLb)} lb — the limit is ${lb(pricing.maxWeightLb)} lb)`,
+    };
+  }
+  const base = miles ? distanceFee(pricing, miles) : pricing.fallbackFeeJmd;
+  const extra = weightFee(pricing, weightLb);
   return {
     available: true,
-    rate: { baseFeeJmd: distanceFee(pricing, miles), extraItemPercent: pricing.extraItemPercent },
+    rate: { baseFeeJmd: base.plus(extra), extraItemPercent: chargesByWeight(pricing) ? 0 : pricing.extraItemPercent },
     distanceMiles: miles,
-    missingPin: null,
+    missingPin: miles ? null : !from ? 'seller' : 'buyer',
+    weightLb,
+    weightFeeJmd: extra,
   };
 }
 
@@ -110,5 +148,8 @@ export function pricingToJson(p: IsleDashPricing) {
     extraItemPercent: p.extraItemPercent,
     fallbackFeeJmd: money(p.fallbackFeeJmd),
     roadAdjustPercent: p.roadAdjustPercent,
+    includedWeightLb: Number(p.includedWeightLb),
+    perPoundJmd: money(p.perPoundJmd),
+    maxWeightLb: p.maxWeightLb === null ? null : Number(p.maxWeightLb),
   };
 }

@@ -133,6 +133,8 @@ const createProductSchema = z.object({
   discountPercent: z.number().int().min(0).max(90).default(0),
   isFeatured: z.boolean().default(false),
   stockQuantity: z.number().int().min(0).default(0),
+  // Pounds per unit, for IsleDash weight pricing; left out counts as 0.
+  weightLb: z.number().min(0).max(10_000).nullable().optional(),
   // images[0] is the main photo; the rest are gallery-only. SKU is no
   // longer taken from the seller — it's generated server-side below.
   images: z.array(imageUrlSchema).min(1),
@@ -156,6 +158,7 @@ shopRouter.post('/products', requireAuth, requireRole(UserRole.STORE, UserRole.A
           discountPercent: input.discountPercent,
           isFeatured: input.isFeatured,
           stockQuantity: input.stockQuantity,
+          weightLb: input.weightLb ?? null,
           imageUrl: input.images[0],
           images: input.images,
         },
@@ -195,6 +198,7 @@ const updateProductSchema = z.object({
   discountPercent: z.number().int().min(0).max(90).optional(),
   isFeatured: z.boolean().optional(),
   stockQuantity: z.number().int().min(0).optional(),
+  weightLb: z.number().min(0).max(10_000).nullable().optional(),
   images: z.array(imageUrlSchema).min(1).optional(),
   isActive: z.boolean().optional(),
 });

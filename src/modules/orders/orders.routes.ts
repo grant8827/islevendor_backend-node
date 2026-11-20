@@ -88,6 +88,8 @@ interface ResolvedLine {
   sellerName: string;
   seller: DeliverySettings;
   stockQuantity: number;
+  /** The whole line's weight (unit weight × quantity); products with none count as 0. */
+  weightLb: Decimal;
   stock: { table: 'master_products' | 'shop_products'; id: string };
   goodsTotalJmd: Decimal;
   wholesaleTotalJmd: Decimal;
@@ -96,6 +98,8 @@ interface ResolvedLine {
   orderFields: { resellerStoreId: string; warehouseId: string } | { shopId: string };
   itemFields: { storeListingId: string } | { shopProductId: string };
 }
+
+const lineWeight = (unitLb: Prisma.Decimal | null, quantity: number) => (unitLb === null ? new Decimal(0) : new Decimal(unitLb.toString()).times(quantity));
 
 async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
   if (line.kind === 'STORE') {
@@ -117,6 +121,7 @@ async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
       sellerName: product.shop.shopName,
       seller: product.shop,
       stockQuantity: product.stockQuantity,
+      weightLb: lineWeight(product.weightLb, line.quantity),
       stock: { table: 'shop_products', id: product.id },
       goodsTotalJmd: itemTotal.plus(platformCommissionJmd),
       wholesaleTotalJmd: new Decimal(0),
@@ -153,6 +158,7 @@ async function resolveLine(db: Db, line: Line): Promise<ResolvedLine | null> {
     sellerName: `${listing.store.storeName} (ships from ${warehouse.parish})`,
     seller: warehouse,
     stockQuantity: listing.masterProduct.stockQuantity,
+    weightLb: lineWeight(listing.masterProduct.weightLb, line.quantity),
     stock: { table: 'master_products', id: listing.masterProductId },
     goodsTotalJmd: price.retailTotalJmd,
     wholesaleTotalJmd: price.wholesaleTotalJmd,
@@ -174,6 +180,8 @@ const groupBySeller = (lines: ResolvedLine[]) => groupBy(lines, (l) => l.sellerK
 const sum = (values: Decimal[]) => values.reduce((total, v) => total.plus(v), new Decimal(0));
 
 const unitsOf = (lines: ResolvedLine[]) => lines.reduce((sum, l) => sum + l.line.quantity, 0);
+
+const weightOf = (lines: ResolvedLine[]) => sum(lines.map((l) => l.weightLb));
 
 // Row-lock the product so two concurrent checkouts can't both pass the
 // stock check and oversell the last unit.
@@ -243,7 +251,7 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
     for (const [sellerKey, sellerLines] of groupBySeller(resolved)) {
       const method = input.deliveryMethods[sellerKey];
       if (!method) throw new HttpError(400, `Choose how you want to get the items from ${sellerLines[0].sellerName}`);
-      const isleDash = isleDashQuoteFor(sellerLines[0].seller, isleDashPricing, pin);
+      const isleDash = isleDashQuoteFor(sellerLines[0].seller, isleDashPricing, pin, weightOf(sellerLines));
       const rate = requireRate(sellerLines[0].seller, method, isleDash);
       if (method !== 'PICKUP' && !deliveryAddress) throw new HttpError(400, 'Enter a delivery address');
 
@@ -279,6 +287,7 @@ async function placeCheckout(customerId: string, input: CheckoutInput) {
             deliveryLatitude: method === 'PICKUP' || !pin ? null : pin.latitude.toFixed(6),
             deliveryLongitude: method === 'PICKUP' || !pin ? null : pin.longitude.toFixed(6),
             deliveryDistanceMiles: method === 'ISLEDASH' && isleDash.distanceMiles ? isleDash.distanceMiles.toFixed(2) : null,
+            deliveryWeightLb: method === 'ISLEDASH' ? weightOf(lines).toFixed(2) : null,
             checkoutGroupId,
             items: {
               create: lines.map((l) => ({
@@ -363,8 +372,9 @@ ordersRouter.post('/quote', async (req, res, next) => {
 
     const available = resolved.filter((r, i): r is ResolvedLine => r !== null && lines[i].available);
     const sellers = [...groupBySeller(resolved.filter((r): r is ResolvedLine => r !== null))].map(([key, group]) => {
-      const units = unitsOf(available.filter((r) => r.sellerKey === key));
-      const isleDash = isleDashQuoteFor(group[0].seller, isleDashPricing, deliveryLocation ?? null);
+      const sellerAvailable = available.filter((r) => r.sellerKey === key);
+      const units = unitsOf(sellerAvailable);
+      const isleDash = isleDashQuoteFor(group[0].seller, isleDashPricing, deliveryLocation ?? null, weightOf(sellerAvailable));
       return {
         key,
         name: group[0].sellerName,
