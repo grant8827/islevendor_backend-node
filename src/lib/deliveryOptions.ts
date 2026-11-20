@@ -87,6 +87,8 @@ export interface DeliveryOption {
   needsAddress: boolean;
   /** IsleDash only: the road miles it was priced for; null when charged the fallback fee. */
   distanceMiles: string | null;
+  /** IsleDash only: the total pounds it was priced for. */
+  weightLb: string | null;
 }
 
 export function pickupLocationOf(seller: DeliverySettings): string {
@@ -94,8 +96,8 @@ export function pickupLocationOf(seller: DeliverySettings): string {
 }
 
 /** What IsleDash costs from this seller to a buyer at `buyerPin`. */
-export function isleDashQuoteFor(seller: DeliverySettings, pricing: IsleDashPricing, buyerPin: MapPin | null): IsleDashQuote {
-  return isleDashQuote(pricing, sellerPin(seller), buyerPin);
+export function isleDashQuoteFor(seller: DeliverySettings, pricing: IsleDashPricing, buyerPin: MapPin | null, weightLb?: Decimal): IsleDashQuote {
+  return isleDashQuote(pricing, sellerPin(seller), buyerPin, weightLb);
 }
 
 /** The rate for `method` from this seller, or null if it doesn't offer it (or IsleDash can't reach the buyer). */
@@ -123,9 +125,10 @@ export function requireRate(seller: DeliverySettings, method: DeliveryMethod, is
 /** What the customer is told under the IsleDash option. */
 function isleDashDetail(quote: IsleDashQuote): string | null {
   if (!quote.available) return null;
-  if (quote.distanceMiles) return `${quote.distanceMiles.toFixed(1)} mi from the seller`;
-  if (quote.missingPin === 'buyer') return 'Standard fee — add a map pin to your address to price it by distance';
-  return 'Standard fee';
+  const weight = quote.weightFeeJmd.greaterThan(0) ? ` · ${quote.weightLb.toDecimalPlaces(1).toString()} lb (+J$${quote.weightFeeJmd.toFixed(0)} for weight)` : '';
+  if (quote.distanceMiles) return `${quote.distanceMiles.toFixed(1)} mi from the seller${weight}`;
+  if (quote.missingPin === 'buyer') return `Standard fee${weight} — add a map pin to your address to price it by distance`;
+  return `Standard fee${weight}`;
 }
 
 /** Every option this business currently offers for `units` items, in the order a customer should see them. */
@@ -142,6 +145,7 @@ export function deliveryOptionsFor(seller: DeliverySettings, isleDash: IsleDashQ
       detail,
       needsAddress: method !== 'PICKUP',
       distanceMiles: method === 'ISLEDASH' && isleDash.distanceMiles ? isleDash.distanceMiles.toFixed(1) : null,
+      weightLb: method === 'ISLEDASH' ? isleDash.weightLb.toFixed(1) : null,
     };
   };
   const where = pickupLocationOf(seller);

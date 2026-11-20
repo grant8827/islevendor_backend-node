@@ -131,6 +131,8 @@ const createProductSchema = z.object({
   // instructions, etc.
   productDetails: z.string().max(4000).optional(),
   stockQuantity: z.number().int().min(0).default(0),
+  // Pounds per unit, for IsleDash weight pricing; left out counts as 0.
+  weightLb: z.number().min(0).max(10_000).nullable().optional(),
   // images[0] is the main photo; the rest are gallery-only. SKU is no
   // longer taken from the seller — it's generated server-side below.
   images: z.array(imageUrlSchema).min(1),
@@ -160,6 +162,7 @@ warehouseRouter.post('/products', requireAuth, requireRole(UserRole.WAREHOUSE, U
           condition: input.condition,
           productDetails: input.productDetails,
           stockQuantity: input.stockQuantity,
+          weightLb: input.weightLb ?? null,
           imageUrl: input.images[0],
           images: input.images,
         },
@@ -188,6 +191,7 @@ const updateProductSchema = z.object({
   condition: z.enum(['NEW', 'USED']).optional(),
   productDetails: z.string().max(4000).nullable().optional(),
   stockQuantity: z.number().int().min(0).optional(),
+  weightLb: z.number().min(0).max(10_000).nullable().optional(),
   images: z.array(imageUrlSchema).min(1).optional(),
   isActive: z.boolean().optional(),
 });

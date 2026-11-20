@@ -15,6 +15,9 @@ const pricing: IsleDashPricing = {
   extraItemPercent: 50,
   fallbackFeeJmd: new Decimal(400),
   roadAdjustPercent: 30,
+  includedWeightLb: new Decimal(0),
+  perPoundJmd: new Decimal(0),
+  maxWeightLb: null,
 };
 
 // Half Way Tree, Kingston and Spanish Town — about 10.6 straight-line miles apart.

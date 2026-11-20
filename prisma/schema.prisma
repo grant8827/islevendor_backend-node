@@ -379,6 +379,9 @@ model MasterProduct {
   // flexible field rather than several narrow ones.
   productDetails    String?          @map("product_details")
   stockQuantity     Int              @default(0) @map("stock_quantity")
+  // Shipping weight of one unit, in pounds, for IsleDash weight pricing.
+  // Null: not entered, counted as 0.
+  weightLb          Decimal?         @map("weight_lb") @db.Decimal(7, 2)
   // imageUrl is always images[0] — kept as its own column so every existing
   // read site (ProductCard, cart, etc.) can keep reading a single field
   // without knowing about the gallery. images[] holds the full gallery,
@@ -637,6 +640,8 @@ model ShopProduct {
   discountPercent Int      @default(0) @map("discount_percent")
   isFeatured      Boolean  @default(false) @map("is_featured")
   stockQuantity   Int      @default(0) @map("stock_quantity")
+  // See MasterProduct.weightLb.
+  weightLb        Decimal? @map("weight_lb") @db.Decimal(7, 2)
   // See MasterProduct.imageUrl/images for why both exist.
   imageUrl        String?  @map("image_url")
   images          String[] @default([])
@@ -845,6 +850,8 @@ model Order {
   // Road miles an IsleDash order was priced for (lib/isleDashPricing.ts).
   // Null: charged the fallback fee, or not an IsleDash order.
   deliveryDistanceMiles   Decimal?              @map("delivery_distance_miles") @db.Decimal(7, 2)
+  // Total pounds an IsleDash order was priced for. Null: not IsleDash.
+  deliveryWeightLb        Decimal?              @map("delivery_weight_lb") @db.Decimal(9, 2)
   status                  OrderStatus           @default(AWAITING_PAYMENT)
   deliveryAddress         String                @map("delivery_address")
   proofOfDeliveryImageUrl String?               @map("proof_of_delivery_image_url")
@@ -1233,6 +1240,13 @@ model PlatformSetting {
   isleDashMaxMiles          Decimal? @map("isledash_max_miles") @db.Decimal(6, 2)
   isleDashFallbackFeeJmd    Decimal  @default(300) @map("isledash_fallback_fee_jmd") @db.Decimal(12, 2)
   isleDashRoadAdjustPercent Int      @default(30) @map("isledash_road_adjust_percent")
+  // Weight: everything one seller sends in a delivery, weighed together.
+  // Each pound over includedWeight adds perPound to the fee; when perPound
+  // is set it replaces the extra-item charge. Heavier than maxWeight (null:
+  // no limit), IsleDash isn't offered.
+  isleDashIncludedWeightLb  Decimal  @default(0) @map("isledash_included_weight_lb") @db.Decimal(7, 2)
+  isleDashPerPoundJmd       Decimal  @default(0) @map("isledash_per_pound_jmd") @db.Decimal(12, 2)
+  isleDashMaxWeightLb       Decimal? @map("isledash_max_weight_lb") @db.Decimal(7, 2)
   // How long a withdrawal usually takes to reach the owner's bank once
   // requested, in business days. Payouts are sent by hand (see the admin
   // Payouts queue), so this is IsleVendor's own promise, not a provider's.
